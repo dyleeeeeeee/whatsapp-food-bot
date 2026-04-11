@@ -48,13 +48,25 @@ export async function createMenuItem(item, env) {
   return result.meta.last_row_id;
 }
 
+// Columns that are permitted to be updated via updateMenuItem
+const ALLOWED_ITEM_COLUMNS = new Set([
+  'name', 'description', 'price', 'image_url', 'is_available', 'category_id',
+]);
+
 export async function updateMenuItem(id, fields, env) {
   const setClauses = [];
   const values = [];
+
   for (const [k, v] of Object.entries(fields)) {
+    if (!ALLOWED_ITEM_COLUMNS.has(k)) {
+      throw new Error(`updateMenuItem: column "${k}" is not allowed`);
+    }
     setClauses.push(`${k} = ?`);
     values.push(v);
   }
+
+  if (!setClauses.length) throw new Error('updateMenuItem: no fields to update');
+
   values.push(id);
   await env.DB.prepare(
     `UPDATE MenuItems SET ${setClauses.join(', ')} WHERE id = ?`
@@ -79,6 +91,14 @@ export async function getCategories(env) {
 export async function createOrder(order, env) {
   const { userPhone, totalPrice, address, notes } = order;
 
+  // D1 batch executes as a single transaction — if any statement fails,
+  // the entire batch is rolled back. We use a two-phase batch:
+  // 1. INSERT the order, 2. INSERT all items.
+  // Because we need the auto-generated order ID for the items, we can't
+  // batch the parent INSERT with the children directly. Instead we rely on
+  // the fact that D1 batch() is atomic: if the items batch fails we catch
+  // the error and manually delete the orphaned order.
+
   const orderResult = await env.DB.prepare(
     `INSERT INTO Orders (user_phone, total_price, address, notes)
      VALUES (?, ?, ?, ?)`
@@ -86,15 +106,20 @@ export async function createOrder(order, env) {
 
   const orderId = orderResult.meta.last_row_id;
 
-  // Insert all order items in a batch
-  const stmts = order.items.map(item =>
-    env.DB.prepare(
-      `INSERT INTO OrderItems (order_id, menu_item_id, name, quantity, unit_price, notes)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).bind(orderId, item.itemId, item.name, item.qty, item.unitPrice, item.notes || '')
-  );
+  try {
+    const stmts = order.items.map(item =>
+      env.DB.prepare(
+        `INSERT INTO OrderItems (order_id, menu_item_id, name, quantity, unit_price, notes)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(orderId, item.itemId, item.name, item.qty, item.unitPrice, item.notes || '')
+    );
 
-  await env.DB.batch(stmts);
+    await env.DB.batch(stmts);
+  } catch (err) {
+    // Rollback: delete the orphaned order so we don't leave zombie records
+    await env.DB.prepare('DELETE FROM Orders WHERE id = ?').bind(orderId).run().catch(() => {});
+    throw err;  // Re-throw so the caller sees the failure
+  }
 
   return orderId;
 }

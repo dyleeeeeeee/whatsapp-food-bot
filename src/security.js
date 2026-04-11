@@ -43,6 +43,8 @@ export async function verifyWebhookSignature(request, rawBody, env) {
 }
 
 function hexToBytes(hex) {
+  // Odd-length hex is malformed — return empty so verification fails safely
+  if (hex.length % 2 !== 0) return new Uint8Array(0);
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
     bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
@@ -51,21 +53,36 @@ function hexToBytes(hex) {
 }
 
 /**
- * Sanitize a string input — strip control chars, limit length.
+ * Sanitize a string input — strip ASCII + Unicode control chars, limit length.
  */
 export function sanitize(input, maxLen = 500) {
   if (typeof input !== 'string') return '';
-  return input.replace(/[\x00-\x1F\x7F]/g, '').trim().slice(0, maxLen);
+  // Strip ASCII control chars, DEL, and Unicode line/paragraph separators
+  return input
+    .replace(/[\x00-\x1F\x7F\u0085\u2028\u2029]/g, '')
+    .trim()
+    .slice(0, maxLen);
 }
 
 /**
  * Check if a phone number is an admin.
+ * Cached in KV for 60s to avoid a D1 read on every single message.
  */
 export async function isAdmin(phone, env) {
+  const cacheKey = `admin:${phone}`;
+
+  // Check KV cache first
+  const cached = await env.SESSION_KV.get(cacheKey);
+  if (cached !== null) return cached === '1';
+
   const row = await env.DB.prepare(
     'SELECT phone_number FROM AdminUsers WHERE phone_number = ?'
   )
     .bind(phone)
     .first();
-  return !!row;
+
+  const result = !!row;
+  // Cache for 60 seconds — short enough to reflect revoked admins quickly
+  await env.SESSION_KV.put(cacheKey, result ? '1' : '0', { expirationTtl: 60 });
+  return result;
 }

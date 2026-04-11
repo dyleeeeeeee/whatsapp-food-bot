@@ -17,7 +17,7 @@ import {
   sendText, sendButtons, sendList, sendImage
 } from '../whatsapp.js';
 import {
-  getSession, saveSession, clearSession,
+  getSession, saveSession,
   addToCart, cartSummary, cartTotal, clearCart,
 } from '../session.js';
 import {
@@ -70,27 +70,30 @@ export async function handleUserMessage(phone, msg, env) {
 function isGlobalCommand(msg) {
   const t = (msg.text || msg.id || '').toUpperCase();
   return (
-    t === 'MENU' || t === 'START' || t === 'HI' || t === 'HELLO' ||
-    t === 'CART' || t === 'ORDERS' || t === 'CANCEL' ||
-    msg.id === 'cmd_menu' || msg.id === 'cmd_cart' || msg.id === 'cmd_cancel'
+    t === 'MENU'   || t === 'START'  || t === 'HI' || t === 'HELLO' ||
+    t === 'CART'   || t === 'ORDERS' || t === 'CANCEL' ||
+    // Button reply IDs from the welcome screen
+    msg.id === 'cmd_menu'   || msg.id === 'cmd_cart' ||
+    msg.id === 'cmd_cancel' || msg.id === 'cmd_orders'
   );
 }
 
 async function handleGlobalCommand(phone, msg, session, env) {
-  const t = (msg.text || msg.id || '').toUpperCase();
+  const t    = (msg.text || '').toUpperCase().trim();
+  const id   = msg.id || '';
 
-  if (t === 'CANCEL' || msg.id === 'cmd_cancel') {
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
     clearCart(session);
     session.state = 'idle';
     await saveSession(phone, session, env);
     return sendText(phone, '🚫 Order cancelled. Send *MENU* to start again.', env);
   }
 
-  if (t === 'CART' || msg.id === 'cmd_cart') {
+  if (t === 'CART' || id === 'cmd_cart') {
     return showCart(phone, session, env);
   }
 
-  if (t === 'ORDERS') {
+  if (t === 'ORDERS' || id === 'cmd_orders') {
     return showOrderHistory(phone, env);
   }
 
@@ -133,7 +136,11 @@ async function handleItemDetail(phone, msg, session, env) {
     await saveSession(phone, session, env);
     return sendText(phone, '🔢 How many would you like? (Enter a number, max 20)', env);
   }
-  if (msg.id === 'btn_back_menu') return showMenuCategories(phone, session, env);
+  if (msg.id === 'btn_back_menu') {
+    session.tempItemId = null;  // clear stale item reference
+    await saveSession(phone, session, env);
+    return showMenuCategories(phone, session, env);
+  }
   if (msg.id === 'btn_checkout') return showCart(phone, session, env);
   return showItemDetail(phone, session.tempItemId, session, env);
 }
@@ -158,6 +165,13 @@ async function handleEnteringNotes(phone, msg, session, env) {
   const notes =
     msg.id === 'notes_none' ? '' : sanitize(msg.text || '', 200);
 
+  // Guard against corrupted session state
+  if (!session.tempItemId || !session.tempQty) {
+    session.state = 'idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Something went wrong. Please start over.', env);
+  }
+
   const item = await getMenuItem(session.tempItemId, env);
   if (!item) {
     session.state = 'idle';
@@ -173,9 +187,9 @@ async function handleEnteringNotes(phone, msg, session, env) {
     notes,
   });
 
-  session.state    = 'cart_review';
+  session.state      = 'cart_review';
   session.tempItemId = null;
-  session.tempQty  = null;
+  session.tempQty    = null;
   await saveSession(phone, session, env);
 
   return showCart(phone, session, env);
@@ -237,28 +251,42 @@ async function handleCheckoutConfirm(phone, msg, session, env) {
   }
 
   if (msg.id === 'btn_place_order') {
-    const orderId = await createOrder(
-      {
-        userPhone:  phone,
-        totalPrice: cartTotal(session.cart),
-        address:    session.tempAddress || '',
-        items:      session.cart,
-      },
-      env
-    );
+    try {
+      const orderId = await createOrder(
+        {
+          userPhone:  phone,
+          totalPrice: cartTotal(session.cart),
+          address:    session.tempAddress || '',
+          items:      session.cart,
+        },
+        env
+      );
 
-    clearCart(session);
-    session.state = 'idle';
-    delete session.tempAddress;
-    await saveSession(phone, session, env);
+      clearCart(session);
+      session.state = 'idle';
+      delete session.tempAddress;
+      await saveSession(phone, session, env);
 
-    return sendButtons(
-      phone,
-      `🎉 *Order #${orderId} placed!*\n\nWe've received your order and will start preparing it shortly.\n\nYou'll receive status updates here. Track with *ORDERS*.`,
-      [{ id: 'cmd_menu', title: '🍔 Order Again' }],
-      env,
-      'Order Confirmed!'
-    );
+      return sendButtons(
+        phone,
+        `🎉 *Order #${orderId} placed!*\n\nWe've received your order and will start preparing it shortly.\n\nYou'll receive status updates here. Track with *ORDERS*.`,
+        [{ id: 'cmd_menu', title: '🍔 Order Again' }],
+        env,
+        'Order Confirmed!'
+      );
+    } catch (err) {
+      console.error('[Checkout] createOrder failed:', err);
+      // Session unchanged — user stays in checkout_confirm so they can retry
+      return sendButtons(
+        phone,
+        `⚠️ We couldn't place your order right now due to a system error. Please try again.`,
+        [
+          { id: 'btn_place_order', title: '🔄 Retry'        },
+          { id: 'cmd_cancel',      title: '❌ Cancel Order'  },
+        ],
+        env
+      );
+    }
   }
 
   return showCart(phone, session, env);
@@ -315,7 +343,7 @@ async function showItemsForCategory(phone, categoryId, categoryName, session, en
   const rows = items.map(item => ({
     id:          `item_${item.id}`,
     title:       item.name,
-    description: `$${item.price.toFixed(2)} — ${item.description.slice(0, 60)}`,
+    description: `$${item.price.toFixed(2)} — ${(item.description || '').slice(0, 60)}`,
   }));
 
   session.state = 'selecting_item';

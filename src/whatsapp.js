@@ -118,14 +118,28 @@ export function imagePayload(imageUrl, caption = '') {
 }
 
 /**
- * Mark a message as read (improves UX — removes "delivered" tick)
+ * Mark a message as read.
+ * Uses the status update endpoint — NOT the messages endpoint.
+ * The `to` field must be omitted entirely for status updates.
  */
 export async function markRead(messageId, env) {
-  await sendWhatsAppMessage(
-    null,
-    { status: 'read', message_id: messageId },
-    env
-  ).catch(() => {}); // best-effort
+  const url = `${BASE}/${env.PHONE_NUMBER_ID}/messages`;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${env.WHATSAPP_TOKEN}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        status: 'read',
+        message_id: messageId,
+      }),
+    });
+  } catch {
+    // best-effort — never throw on read receipts
+  }
 }
 
 // ─────────────────────────────────────────────────────────────

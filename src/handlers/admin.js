@@ -30,7 +30,6 @@ import {
   getFullMenu, getMenuItem, getCategories,
   createMenuItem, updateMenuItem, deleteMenuItem,
   getPendingOrders, getOrder, updateOrderStatus,
-  addAdmin,
 } from '../db.js';
 import { sanitize } from '../security.js';
 
@@ -42,6 +41,9 @@ const VALID_STATUSES = ['pending','confirmed','preparing','ready','delivered','c
 
 export async function handleAdminMessage(phone, msg, env) {
   const session = await getSession(phone, env);
+
+  // Ensure adminCtx always exists — old sessions may lack it
+  session.adminCtx = session.adminCtx || {};
 
   // ADMIN command always resets to admin_idle
   const text = (msg.text || '').toUpperCase().trim();
@@ -77,6 +79,8 @@ export async function handleAdminMessage(phone, msg, env) {
       return handleDeleteItemSelect(phone, msg, session, env);
     case 'admin_delete_item_confirm':
       return handleDeleteItemConfirm(phone, msg, session, env);
+    case 'admin_toggle_item_select':        // ← was missing entirely
+      return handleToggleItemSelect(phone, msg, session, env);
     case 'admin_orders_list':
       return handleAdminOrdersList(phone, msg, session, env);
     case 'admin_update_status_id':
@@ -220,6 +224,12 @@ async function handleAddItemCategory(phone, msg, session, env) {
   if (!msg.id?.startsWith('acat_')) {
     return sendText(phone, '⚠️ Please select a category from the list.', env);
   }
+  // Guard: newItem must exist (corrupted session recovery)
+  if (!session.adminCtx.newItem) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
   const catId = parseInt(msg.id.replace('acat_', ''), 10);
   session.adminCtx.newItem.categoryId = catId;
   session.state = 'admin_add_item_price';
@@ -351,6 +361,14 @@ async function handleEditItemField(phone, msg, session, env) {
 
 async function handleEditItemValue(phone, msg, session, env) {
   const { editItemId, editField } = session.adminCtx;
+
+  // Guard against corrupted/replayed session
+  if (!editItemId || !editField) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
+
   let value = sanitize(msg.text || '', 500);
 
   if (editField === 'price') {
@@ -444,21 +462,65 @@ async function handleDeleteItemConfirm(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function startToggleFlow(phone, session, env) {
-  const menu  = await getFullMenu(env);
+  // Query ALL items (not just available) — no need for getFullMenu here
   const allItems = await env.DB.prepare(
     'SELECT id, name, is_available FROM MenuItems ORDER BY name'
   ).all();
 
+  if (!allItems.results.length) {
+    return sendText(phone, '📭 No items in menu yet.', env);
+  }
+
   const rows = allItems.results.slice(0, 10).map(i => ({
-    id:    `tog_${i.id}`,
-    title: i.name,
+    id:          `tog_${i.id}`,
+    title:       i.name,
     description: i.is_available ? '✅ Available' : '❌ Unavailable',
   }));
 
   session.state = 'admin_toggle_item_select';
   await saveSession(phone, session, env);
 
-  return sendList(phone, '🔄 Toggle item availability:', 'Choose', [{ title: 'Items', rows }], env);
+  return sendList(
+    phone,
+    '🔄 *Toggle Availability*\nSelect an item to flip its status:',
+    'Choose Item',
+    [{ title: 'All Items', rows }],
+    env
+  );
+}
+
+async function handleToggleItemSelect(phone, msg, session, env) {
+  if (!msg.id?.startsWith('tog_')) {
+    return startToggleFlow(phone, session, env);
+  }
+
+  const itemId = parseInt(msg.id.replace('tog_', ''), 10);
+  const item   = await env.DB.prepare(
+    'SELECT id, name, is_available FROM MenuItems WHERE id = ?'
+  ).bind(itemId).first();
+
+  if (!item) {
+    return sendText(phone, '⚠️ Item not found.', env);
+  }
+
+  const newAvail = item.is_available ? 0 : 1;
+  await env.DB.prepare(
+    'UPDATE MenuItems SET is_available = ? WHERE id = ?'
+  ).bind(newAvail, itemId).run();
+
+  await bustMenuCache(env);
+
+  session.state    = 'admin_idle';
+  session.adminCtx = {};
+  await saveSession(phone, session, env);
+
+  const label = newAvail ? '✅ Available' : '❌ Unavailable';
+  return sendButtons(
+    phone,
+    `*${item.name}* is now marked *${label}*.`,
+    [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+    env
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -478,16 +540,31 @@ async function viewOrders(phone, session, env) {
     pending: '⏳', confirmed: '✅', preparing: '👨‍🍳',
   };
 
+  // WhatsApp button message body cap: 1024 chars.
+  // Build lines and truncate so we never exceed it.
   const lines = orders.map(
-    o => `• #${o.id} | ${statusEmoji[o.status]||''} ${o.status.toUpperCase()} | $${Number(o.total_price).toFixed(2)}\n  📱 ${o.user_phone}\n  📍 ${(o.address||'').slice(0,40)}`
+    o =>
+      `• #${o.id} ${statusEmoji[o.status] || ''} ${o.status.toUpperCase()}` +
+      ` $${Number(o.total_price).toFixed(2)}\n` +
+      `  📱 ${o.user_phone}  📍 ${(o.address || '').slice(0, 30)}`
   );
+
+  const header = `📦 *Active Orders* (${orders.length})\n\n`;
+  let body = header;
+  for (const line of lines) {
+    if ((body + line).length > 950) {   // 950 gives buffer for WhatsApp overhead
+      body += `\n_...and ${orders.length - lines.indexOf(line)} more_`;
+      break;
+    }
+    body += line + '\n\n';
+  }
 
   session.state = 'admin_orders_list';
   await saveSession(phone, session, env);
 
   return sendButtons(
     phone,
-    `📦 *Active Orders* (${orders.length})\n\n${lines.join('\n\n')}`,
+    body.trim(),
     [
       { id: 'admin_update_status', title: '✏️ Update Status' },
       { id: 'admin_home',          title: '🔧 Admin Menu'   },
@@ -539,13 +616,28 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
   }
 
   const newStatus = msg.id.replace('status_', '');
+
+  // Whitelist check — never trust user-supplied IDs for DB writes
+  if (!VALID_STATUSES.includes(newStatus)) {
+    return sendText(phone, '⚠️ Invalid status selected.', env);
+  }
+
   const { updateOrderId, orderPhone } = session.adminCtx;
+
+  // Guard against missing context
+  if (!updateOrderId || !orderPhone) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
 
   await updateOrderStatus(updateOrderId, newStatus, env);
 
-  // Notify customer
+  // Notify customer — best effort, never throw
   const customerMsg = statusMessage(updateOrderId, newStatus);
-  await sendText(orderPhone, customerMsg, env).catch(() => {});
+  await sendText(orderPhone, customerMsg, env).catch(err =>
+    console.error('[Admin] Failed to notify customer:', err)
+  );
 
   session.state    = 'admin_idle';
   session.adminCtx = {};
