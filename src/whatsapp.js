@@ -1,11 +1,24 @@
 /**
  * src/whatsapp.js — WhatsApp Cloud API Client
  *
- * All outbound message types in one place.
- * Uses native fetch — zero dependencies.
+ * BUG-19: buttonPayload now enforces the 3-button maximum internally.
+ * BUG-22: Graph API version is read from env (GRAPH_API_VERSION) with
+ *         a safe fallback, so it can be updated without code changes.
+ *
+ * WhatsApp Cloud API limits (enforced here):
+ *   - Button message: max 3 buttons, body ≤ 1024 chars, header ≤ 60 chars
+ *   - List message: max 10 sections, max 10 rows/section
+ *   - Button reply ID: max 256 chars
+ *   - Button title: max 20 chars
+ *   - List row title: max 24 chars
+ *   - List row description: max 72 chars
  */
 
-const BASE = 'https://graph.facebook.com/v19.0';
+function graphBase(env) {
+  // BUG-22 FIX: version from env, not hardcoded
+  const version = env.GRAPH_API_VERSION || 'v21.0';
+  return `https://graph.facebook.com/${version}`;
+}
 
 // ─────────────────────────────────────────────────────────────
 // Core sender
@@ -13,12 +26,12 @@ const BASE = 'https://graph.facebook.com/v19.0';
 
 /**
  * Send any WhatsApp message payload.
- * @param {string} to   - E.164 phone number (e.g. "15551234567")
- * @param {object} payload - Message body object
- * @param {object} env  - Worker env bindings
+ * @param {string} to      - E.164 phone number without leading +
+ * @param {object} payload - Message body object (type + content)
+ * @param {object} env     - Worker env bindings
  */
 export async function sendWhatsAppMessage(to, payload, env) {
-  const url = `${BASE}/${env.PHONE_NUMBER_ID}/messages`;
+  const url = `${graphBase(env)}/${env.PHONE_NUMBER_ID}/messages`;
 
   const body = {
     messaging_product: 'whatsapp',
@@ -37,8 +50,8 @@ export async function sendWhatsAppMessage(to, payload, env) {
   });
 
   if (!res.ok) {
-    const err = await res.text();
-    console.error('[WhatsApp] Send error:', res.status, err);
+    const errText = await res.text();
+    console.error('[WhatsApp] Send error:', res.status, errText);
     throw new Error(`WhatsApp API error: ${res.status}`);
   }
 
@@ -46,7 +59,7 @@ export async function sendWhatsAppMessage(to, payload, env) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Message type helpers
+// Message payload builders
 // ─────────────────────────────────────────────────────────────
 
 /** Plain text message */
@@ -55,51 +68,61 @@ export function textPayload(text) {
 }
 
 /**
- * Interactive button message (max 3 buttons)
- * @param {string} body  - Body text
- * @param {Array}  btns  - [{ id, title }]
- * @param {string} [header]
- * @param {string} [footer]
+ * Interactive button message.
+ *
+ * BUG-19 FIX: Enforces the 3-button maximum internally via .slice(0, 3).
+ * Callers no longer need to manage this — the API will never receive >3.
+ *
+ * @param {string}      bodyText - Message body (≤ 1024 chars)
+ * @param {Array}       btns     - [{ id, title }]
+ * @param {string|null} header   - Optional header text (≤ 60 chars)
+ * @param {string|null} footer   - Optional footer text (≤ 60 chars)
  */
-export function buttonPayload(body, btns, header = null, footer = null) {
+export function buttonPayload(bodyText, btns, header = null, footer = null) {
   const msg = {
     type: 'interactive',
     interactive: {
       type: 'button',
-      body: { text: body },
+      body: { text: bodyText },
       action: {
-        buttons: btns.map(b => ({
+        // BUG-19 FIX: slice(0, 3) enforced here, not on callers
+        buttons: btns.slice(0, 3).map(b => ({
           type: 'reply',
-          reply: { id: b.id, title: b.title.slice(0, 20) },
+          reply: {
+            id:    String(b.id).slice(0, 256),
+            title: String(b.title).slice(0, 20),
+          },
         })),
       },
     },
   };
-  if (header) msg.interactive.header = { type: 'text', text: header };
-  if (footer) msg.interactive.footer = { text: footer };
+  if (header) msg.interactive.header = { type: 'text', text: String(header).slice(0, 60) };
+  if (footer) msg.interactive.footer = { text: String(footer).slice(0, 60) };
   return msg;
 }
 
 /**
- * Interactive list message (max 10 sections / 10 rows each)
- * @param {string} body     - Body text
- * @param {string} btnLabel - Button label (e.g. "Browse")
- * @param {Array}  sections - [{ title, rows: [{ id, title, description }] }]
+ * Interactive list message.
+ * Max 10 sections, max 10 rows per section.
+ *
+ * @param {string} bodyText  - Body text
+ * @param {string} btnLabel  - Button label (≤ 20 chars)
+ * @param {Array}  sections  - [{ title, rows: [{ id, title, description }] }]
  */
-export function listPayload(body, btnLabel, sections) {
+export function listPayload(bodyText, btnLabel, sections) {
   return {
     type: 'interactive',
     interactive: {
       type: 'list',
-      body: { text: body },
+      body: { text: bodyText },
       action: {
-        button: btnLabel.slice(0, 20),
-        sections: sections.map(s => ({
-          title: s.title.slice(0, 24),
-          rows: s.rows.slice(0, 10).map(r => ({
-            id: r.id,
-            title: r.title.slice(0, 24),
-            description: (r.description || '').slice(0, 72),
+        button: String(btnLabel).slice(0, 20),
+        sections: sections.slice(0, 10).map(s => ({
+          title: String(s.title).slice(0, 24),
+          rows:  (s.rows || []).slice(0, 10).map(r => ({
+            id:          String(r.id).slice(0, 256),
+            title:       String(r.title).slice(0, 24),
+            description: String(r.description || '').slice(0, 72),
           })),
         })),
       },
@@ -108,7 +131,26 @@ export function listPayload(body, btnLabel, sections) {
 }
 
 /**
- * Image message with optional caption
+ * Interactive button message with an image header.
+ * Used for item details — delivers image + buttons as a single message.
+ *
+ * BUG-28 FIX: This replaces the two-message pattern (sendImage + sendButtons)
+ * with a single interactive message, halving API calls for item details.
+ *
+ * @param {string}      bodyText - Message body
+ * @param {Array}       btns     - [{ id, title }]
+ * @param {string}      imageUrl - HTTPS URL to image
+ * @param {string|null} footer   - Optional footer
+ */
+export function imageButtonPayload(bodyText, btns, imageUrl, footer = null) {
+  const msg = buttonPayload(bodyText, btns, null, footer);
+  msg.interactive.header = { type: 'image', image: { link: imageUrl } };
+  return msg;
+}
+
+/**
+ * Standalone image message with optional caption.
+ * Still used for best-effort image-only sends.
  */
 export function imagePayload(imageUrl, caption = '') {
   return {
@@ -119,11 +161,10 @@ export function imagePayload(imageUrl, caption = '') {
 
 /**
  * Mark a message as read.
- * Uses the status update endpoint — NOT the messages endpoint.
- * The `to` field must be omitted entirely for status updates.
+ * Uses the same /messages endpoint with a status payload (no `to` field).
  */
 export async function markRead(messageId, env) {
-  const url = `${BASE}/${env.PHONE_NUMBER_ID}/messages`;
+  const url = `${graphBase(env)}/${env.PHONE_NUMBER_ID}/messages`;
   try {
     await fetch(url, {
       method: 'POST',
@@ -150,12 +191,16 @@ export async function sendText(to, text, env) {
   return sendWhatsAppMessage(to, textPayload(text), env);
 }
 
-export async function sendButtons(to, body, btns, env, header, footer) {
-  return sendWhatsAppMessage(to, buttonPayload(body, btns, header, footer), env);
+export async function sendButtons(to, bodyText, btns, env, header, footer) {
+  return sendWhatsAppMessage(to, buttonPayload(bodyText, btns, header, footer), env);
 }
 
-export async function sendList(to, body, btnLabel, sections, env) {
-  return sendWhatsAppMessage(to, listPayload(body, btnLabel, sections), env);
+export async function sendList(to, bodyText, btnLabel, sections, env) {
+  return sendWhatsAppMessage(to, listPayload(bodyText, btnLabel, sections), env);
+}
+
+export async function sendImageButtons(to, bodyText, btns, imageUrl, env, footer) {
+  return sendWhatsAppMessage(to, imageButtonPayload(bodyText, btns, imageUrl, footer), env);
 }
 
 export async function sendImage(to, imageUrl, caption, env) {

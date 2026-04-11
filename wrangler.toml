@@ -2,26 +2,27 @@
 # wrangler.toml — WhatsApp Food Bot
 # ============================================================
 
-name       = "whatsapp-food-bot"
-main       = "src/index.js"
+name               = "whatsapp-food-bot"
+main               = "src/index.js"
 compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
+# nodejs_compat intentionally removed — codebase uses zero Node APIs.
+# Adding it only bloats the bundle and increases cold-start time.
 
 # ─── KV Namespaces ───────────────────────────────────────────
 [[kv_namespaces]]
-binding  = "SESSION_KV"
-id       = "REPLACE_WITH_YOUR_KV_ID"
+binding    = "SESSION_KV"
+id         = "REPLACE_WITH_YOUR_KV_ID"
 preview_id = "REPLACE_WITH_YOUR_PREVIEW_KV_ID"
 
 # ─── D1 Database ─────────────────────────────────────────────
 [[d1_databases]]
-binding      = "DB"
+binding       = "DB"
 database_name = "food-bot-db"
-database_id  = "REPLACE_WITH_YOUR_D1_ID"
+database_id   = "REPLACE_WITH_YOUR_D1_ID"
 
 # ─── R2 Bucket (optional, for menu images) ───────────────────
 # [[r2_buckets]]
-# binding    = "IMAGES"
+# binding     = "IMAGES"
 # bucket_name = "food-bot-images"
 
 # ─── Environment Variables ───────────────────────────────────
@@ -29,16 +30,15 @@ database_id  = "REPLACE_WITH_YOUR_D1_ID"
 # Never commit real values here.
 
 [vars]
-ENVIRONMENT = "production"
-MENU_CACHE_TTL = "300"          # seconds to cache menu in KV
+ENVIRONMENT      = "production"
+MENU_CACHE_TTL   = "300"       # seconds to cache menu in KV
+GRAPH_API_VERSION = "v21.0"   # BUG-22: configurable, not hardcoded
 
-# ─── Production Environment ──────────────────────────────────
-[env.production]
-name = "whatsapp-food-bot"
-
-# ─── Staging Environment ─────────────────────────────────────
+# ─── Staging ─────────────────────────────────────────────────
 [env.staging]
 name = "whatsapp-food-bot-staging"
 
 [env.staging.vars]
-ENVIRONMENT = "staging"
+ENVIRONMENT       = "staging"
+GRAPH_API_VERSION = "v21.0"
+MENU_CACHE_TTL    = "60"

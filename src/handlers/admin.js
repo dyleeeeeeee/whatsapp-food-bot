@@ -1,39 +1,50 @@
 /**
  * src/handlers/admin.js — Admin Command State Machine
  *
- * Admin states (stored in session.state):
- *   admin_idle                 → command menu
- *   admin_add_category         → entering category name
- *   admin_add_item_name        → item name input
- *   admin_add_item_category    → choose category
- *   admin_add_item_price       → price input
- *   admin_add_item_description → description input
- *   admin_add_item_image       → image URL (optional)
- *   admin_edit_item_select     → pick item to edit
- *   admin_edit_item_field      → pick field to change
- *   admin_edit_item_value      → enter new value
- *   admin_delete_item_select   → pick item to delete
- *   admin_delete_item_confirm  → confirm deletion
- *   admin_orders_list          → view pending orders
- *   admin_update_status_id     → enter order ID
- *   admin_update_status_value  → choose new status
+ * BUG-04 FIX: Edit, delete, and toggle flows now use getAllMenuItems()
+ *             which returns ALL items regardless of availability, so
+ *             unavailable items are still manageable by admins.
+ *
+ * BUG-05 FIX: Guards added to handleAddItemPrice, handleAddItemDescription,
+ *             handleAddItemImage to prevent TypeError on corrupted sessions.
+ *
+ * BUG-09 FIX: viewOrders truncation uses loop index (i), not indexOf(),
+ *             which returned the wrong count when lines were textually identical.
+ *
+ * BUG-10 FIX: Image URL validated as HTTPS before being stored.
+ *
+ * BUG-12 FIX: Order ID parsing uses a strict /^\d+$/ regex check so
+ *             "5abc" cannot silently be accepted as order 5.
+ *
+ * BUG-20 FIX: handleAddCategory inspects error message to differentiate
+ *             a UNIQUE constraint violation from a D1 connectivity error.
+ *
+ * BUG-21:     Lists hard-cap at 10 rows; a "showing X of N" note is added
+ *             when items are truncated so admins know more exist.
+ *
+ * States:
+ *   admin_idle | admin_add_category
+ *   admin_add_item_{name,category,price,description,image}
+ *   admin_edit_item_{select,field,value}
+ *   admin_delete_item_{select,confirm}
+ *   admin_toggle_item_select
+ *   admin_orders_list | admin_update_status_{id,value}
  */
 
 import {
   sendText, sendButtons, sendList,
 } from '../whatsapp.js';
 import {
-  getSession, saveSession,
-  bustMenuCache,
+  getSession, saveSession, bustMenuCache,
 } from '../session.js';
 import {
-  getFullMenu, getMenuItem, getCategories,
+  getAllMenuItems, getMenuItem, getCategories,
   createMenuItem, updateMenuItem, deleteMenuItem,
   getPendingOrders, getOrder, updateOrderStatus,
 } from '../db.js';
-import { sanitize } from '../security.js';
+import { sanitize, isValidHttpsUrl } from '../security.js';
 
-const VALID_STATUSES = ['pending','confirmed','preparing','ready','delivered','cancelled'];
+const VALID_STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'delivered', 'cancelled'];
 
 // ─────────────────────────────────────────────────────────────
 // Entry point
@@ -42,10 +53,10 @@ const VALID_STATUSES = ['pending','confirmed','preparing','ready','delivered','c
 export async function handleAdminMessage(phone, msg, env) {
   const session = await getSession(phone, env);
 
-  // Ensure adminCtx always exists — old sessions may lack it
+  // Ensure adminCtx always exists — old sessions may predate this field
   session.adminCtx = session.adminCtx || {};
 
-  // ADMIN command always resets to admin_idle
+  // "ADMIN" or the admin_home button always resets to the admin menu
   const text = (msg.text || '').toUpperCase().trim();
   if (text === 'ADMIN' || msg.id === 'admin_home') {
     session.state    = 'admin_idle';
@@ -55,38 +66,22 @@ export async function handleAdminMessage(phone, msg, env) {
   }
 
   switch (session.state) {
-    case 'admin_idle':
-      return handleAdminIdle(phone, msg, session, env);
-    case 'admin_add_category':
-      return handleAddCategory(phone, msg, session, env);
-    case 'admin_add_item_name':
-      return handleAddItemName(phone, msg, session, env);
-    case 'admin_add_item_category':
-      return handleAddItemCategory(phone, msg, session, env);
-    case 'admin_add_item_price':
-      return handleAddItemPrice(phone, msg, session, env);
-    case 'admin_add_item_description':
-      return handleAddItemDescription(phone, msg, session, env);
-    case 'admin_add_item_image':
-      return handleAddItemImage(phone, msg, session, env);
-    case 'admin_edit_item_select':
-      return handleEditItemSelect(phone, msg, session, env);
-    case 'admin_edit_item_field':
-      return handleEditItemField(phone, msg, session, env);
-    case 'admin_edit_item_value':
-      return handleEditItemValue(phone, msg, session, env);
-    case 'admin_delete_item_select':
-      return handleDeleteItemSelect(phone, msg, session, env);
-    case 'admin_delete_item_confirm':
-      return handleDeleteItemConfirm(phone, msg, session, env);
-    case 'admin_toggle_item_select':        // ← was missing entirely
-      return handleToggleItemSelect(phone, msg, session, env);
-    case 'admin_orders_list':
-      return handleAdminOrdersList(phone, msg, session, env);
-    case 'admin_update_status_id':
-      return handleUpdateStatusId(phone, msg, session, env);
-    case 'admin_update_status_value':
-      return handleUpdateStatusValue(phone, msg, session, env);
+    case 'admin_idle':                return handleAdminIdle(phone, msg, session, env);
+    case 'admin_add_category':        return handleAddCategory(phone, msg, session, env);
+    case 'admin_add_item_name':       return handleAddItemName(phone, msg, session, env);
+    case 'admin_add_item_category':   return handleAddItemCategory(phone, msg, session, env);
+    case 'admin_add_item_price':      return handleAddItemPrice(phone, msg, session, env);
+    case 'admin_add_item_description':return handleAddItemDescription(phone, msg, session, env);
+    case 'admin_add_item_image':      return handleAddItemImage(phone, msg, session, env);
+    case 'admin_edit_item_select':    return handleEditItemSelect(phone, msg, session, env);
+    case 'admin_edit_item_field':     return handleEditItemField(phone, msg, session, env);
+    case 'admin_edit_item_value':     return handleEditItemValue(phone, msg, session, env);
+    case 'admin_delete_item_select':  return handleDeleteItemSelect(phone, msg, session, env);
+    case 'admin_delete_item_confirm': return handleDeleteItemConfirm(phone, msg, session, env);
+    case 'admin_toggle_item_select':  return handleToggleItemSelect(phone, msg, session, env);
+    case 'admin_orders_list':         return handleAdminOrdersList(phone, msg, session, env);
+    case 'admin_update_status_id':    return handleUpdateStatusId(phone, msg, session, env);
+    case 'admin_update_status_value': return handleUpdateStatusValue(phone, msg, session, env);
     default:
       session.state = 'admin_idle';
       await saveSession(phone, session, env);
@@ -107,18 +102,18 @@ async function showAdminMenu(phone, env) {
       {
         title: 'Menu Management',
         rows: [
-          { id: 'admin_add_item',    title: 'Add Item',         description: 'Add a new menu item'          },
-          { id: 'admin_edit_item',   title: 'Edit Item',        description: 'Update price, name, etc.'     },
-          { id: 'admin_delete_item', title: 'Delete Item',      description: 'Remove item from menu'        },
-          { id: 'admin_add_cat',     title: 'Add Category',     description: 'Create a new menu category'   },
-          { id: 'admin_toggle_item', title: 'Toggle Avail.',    description: 'Mark item available/unavail.' },
+          { id: 'admin_add_item',    title: 'Add Item',      description: 'Add a new menu item'          },
+          { id: 'admin_edit_item',   title: 'Edit Item',     description: 'Update price, name, etc.'     },
+          { id: 'admin_delete_item', title: 'Delete Item',   description: 'Remove item from menu'        },
+          { id: 'admin_add_cat',     title: 'Add Category',  description: 'Create a new menu category'   },
+          { id: 'admin_toggle_item', title: 'Toggle Avail.', description: 'Mark item available/unavail.' },
         ],
       },
       {
         title: 'Orders',
         rows: [
-          { id: 'admin_view_orders',    title: 'View Orders',     description: 'See pending/active orders'  },
-          { id: 'admin_update_status',  title: 'Update Status',   description: 'Change an order status'     },
+          { id: 'admin_view_orders',   title: 'View Orders',   description: 'See pending/active orders' },
+          { id: 'admin_update_status', title: 'Update Status', description: 'Change an order status'    },
         ],
       },
     ],
@@ -135,36 +130,21 @@ async function handleAdminIdle(phone, msg, session, env) {
     await saveSession(phone, session, env);
     return sendText(phone, '➕ *Add New Item*\n\nEnter the item *name*:', env);
   }
-
   if (id === 'admin_add_cat') {
     session.state = 'admin_add_category';
     await saveSession(phone, session, env);
     return sendText(phone, '📂 Enter the new *category name*:', env);
   }
-
-  if (id === 'admin_edit_item') {
-    return startEditFlow(phone, session, env);
-  }
-
-  if (id === 'admin_delete_item') {
-    return startDeleteFlow(phone, session, env);
-  }
-
-  if (id === 'admin_toggle_item') {
-    return startToggleFlow(phone, session, env);
-  }
-
-  if (id === 'admin_view_orders') {
-    return viewOrders(phone, session, env);
-  }
-
+  if (id === 'admin_edit_item')   return startEditFlow(phone, session, env);
+  if (id === 'admin_delete_item') return startDeleteFlow(phone, session, env);
+  if (id === 'admin_toggle_item') return startToggleFlow(phone, session, env);
+  if (id === 'admin_view_orders') return viewOrders(phone, session, env);
   if (id === 'admin_update_status') {
     session.state = 'admin_update_status_id';
     await saveSession(phone, session, env);
     return sendText(phone, '📦 Enter the *Order ID* to update:', env);
   }
 
-  // Fallback
   return showAdminMenu(phone, env);
 }
 
@@ -191,8 +171,14 @@ async function handleAddCategory(phone, msg, session, env) {
       [{ id: 'admin_home', title: '🔧 Admin Menu' }],
       env
     );
-  } catch {
-    return sendText(phone, `⚠️ Category "${name}" may already exist.`, env);
+  } catch (err) {
+    // BUG-20 FIX: Inspect error to distinguish duplicate-name from DB failure
+    const msg2 = err?.message || '';
+    if (msg2.includes('UNIQUE') || msg2.includes('unique')) {
+      return sendText(phone, `⚠️ Category *${name}* already exists. Choose a different name.`, env);
+    }
+    console.error('[Admin] createCategory DB error:', err);
+    return sendText(phone, '⚠️ Failed to create category. Please try again.', env);
   }
 }
 
@@ -202,15 +188,22 @@ async function handleAddCategory(phone, msg, session, env) {
 
 async function handleAddItemName(phone, msg, session, env) {
   const name = sanitize(msg.text || '', 100);
-  if (name.length < 2) return sendText(phone, '⚠️ Name must be at least 2 characters.', env);
+  if (name.length < 2) {
+    return sendText(phone, '⚠️ Name must be at least 2 characters.', env);
+  }
 
   session.adminCtx.newItem = { name };
   session.state = 'admin_add_item_category';
   await saveSession(phone, session, env);
 
   const cats = await getCategories(env);
-  const rows = cats.map(c => ({ id: `acat_${c.id}`, title: c.name }));
+  if (!cats.length) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ No categories exist yet. Create one first via Add Category.', env);
+  }
 
+  const rows = cats.map(c => ({ id: `acat_${c.id}`, title: c.name }));
   return sendList(
     phone,
     `📂 Choose a *category* for "${name}":`,
@@ -224,8 +217,8 @@ async function handleAddItemCategory(phone, msg, session, env) {
   if (!msg.id?.startsWith('acat_')) {
     return sendText(phone, '⚠️ Please select a category from the list.', env);
   }
-  // Guard: newItem must exist (corrupted session recovery)
-  if (!session.adminCtx.newItem) {
+  // BUG-05 FIX: guard corrupted session
+  if (!session.adminCtx?.newItem) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
     return sendText(phone, '⚠️ Session lost. Please start over.', env);
@@ -238,6 +231,12 @@ async function handleAddItemCategory(phone, msg, session, env) {
 }
 
 async function handleAddItemPrice(phone, msg, session, env) {
+  // BUG-05 FIX: guard corrupted session
+  if (!session.adminCtx?.newItem) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
   const price = parseFloat(msg.text || '');
   if (isNaN(price) || price < 0) {
     return sendText(phone, '⚠️ Enter a valid price (e.g. 9.99).', env);
@@ -254,22 +253,48 @@ async function handleAddItemPrice(phone, msg, session, env) {
 }
 
 async function handleAddItemDescription(phone, msg, session, env) {
+  // BUG-05 FIX: guard corrupted session
+  if (!session.adminCtx?.newItem) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
   const desc = msg.id === 'skip_desc' ? '' : sanitize(msg.text || '', 300);
   session.adminCtx.newItem.description = desc;
   session.state = 'admin_add_item_image';
   await saveSession(phone, session, env);
   return sendButtons(
     phone,
-    '🖼️ Enter an *image URL* for this item (or skip):',
+    '🖼️ Enter an *image URL* (must be https://) or skip:',
     [{ id: 'skip_img', title: 'Skip' }],
     env
   );
 }
 
 async function handleAddItemImage(phone, msg, session, env) {
-  const imageUrl = msg.id === 'skip_img' ? '' : sanitize(msg.text || '', 500);
-  const item     = session.adminCtx.newItem;
-  item.imageUrl  = imageUrl;
+  // BUG-05 FIX: guard corrupted session
+  if (!session.adminCtx?.newItem) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
+
+  let imageUrl = '';
+  if (msg.id !== 'skip_img') {
+    const raw = sanitize(msg.text || '', 500);
+    // BUG-10 FIX: validate HTTPS before storing
+    if (!isValidHttpsUrl(raw)) {
+      return sendText(
+        phone,
+        '⚠️ Image URL must start with *https://*\n\nPlease enter a valid URL or tap Skip.',
+        env
+      );
+    }
+    imageUrl = raw;
+  }
+
+  const item = session.adminCtx.newItem;
+  item.imageUrl = imageUrl;
 
   const id = await createMenuItem(item, env);
   await bustMenuCache(env);
@@ -291,21 +316,35 @@ async function handleAddItemImage(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function startEditFlow(phone, session, env) {
-  const menu  = await getFullMenu(env);
-  const items = Object.values(menu.itemsByCategory).flat();
+  // BUG-04 FIX: use getAllMenuItems so unavailable items are still editable
+  const items = await getAllMenuItems(env);
 
-  if (!items.length) return sendText(phone, '📭 No items in menu yet.', env);
+  if (!items.length) {
+    return sendText(phone, '📭 No items in menu yet.', env);
+  }
 
-  const rows = items.slice(0, 10).map(i => ({
-    id:    `edit_${i.id}`,
-    title: i.name,
-    description: `$${i.price.toFixed(2)}`,
+  // BUG-21: show count when truncated
+  const visible = items.slice(0, 10);
+  const rows = visible.map(i => ({
+    id:          `edit_${i.id}`,
+    title:       i.name,
+    description: `$${i.price.toFixed(2)}${i.is_available ? '' : ' (unavail)'}`,
   }));
+
+  const footer = items.length > 10
+    ? `Showing 10 of ${items.length} items`
+    : null;
 
   session.state = 'admin_edit_item_select';
   await saveSession(phone, session, env);
 
-  return sendList(phone, '✏️ *Edit Item*\nSelect item to edit:', 'Choose', [{ title: 'Items', rows }], env);
+  return sendList(
+    phone,
+    `✏️ *Edit Item*\nSelect an item to edit:${footer ? `\n_${footer}_` : ''}`,
+    'Choose',
+    [{ title: 'Items', rows }],
+    env
+  );
 }
 
 async function handleEditItemSelect(phone, msg, session, env) {
@@ -321,15 +360,15 @@ async function handleEditItemSelect(phone, msg, session, env) {
 
   return sendList(
     phone,
-    `✏️ Editing *${item.name}*\nCurrent price: $${item.price.toFixed(2)}\n\nWhich field to update?`,
+    `✏️ Editing *${item.name}* ($${item.price.toFixed(2)})\nWhich field to update?`,
     'Edit Field',
     [{
       title: 'Fields',
       rows: [
-        { id: 'ef_name',        title: 'Name',        description: `Current: ${item.name}`                 },
-        { id: 'ef_price',       title: 'Price',       description: `Current: $${item.price.toFixed(2)}`   },
-        { id: 'ef_description', title: 'Description', description: `Current: ${(item.description||'').slice(0,40)}` },
-        { id: 'ef_image_url',   title: 'Image URL',   description: `Current: ${item.image_url||'none'}`   },
+        { id: 'ef_name',        title: 'Name',        description: `Current: ${item.name}` },
+        { id: 'ef_price',       title: 'Price',       description: `Current: $${item.price.toFixed(2)}` },
+        { id: 'ef_description', title: 'Description', description: `Current: ${(item.description || '').slice(0, 40)}` },
+        { id: 'ef_image_url',   title: 'Image URL',   description: `Current: ${item.image_url || 'none'}` },
       ],
     }],
     env
@@ -354,7 +393,7 @@ async function handleEditItemField(phone, msg, session, env) {
     name:        'Enter the new *name*:',
     price:       'Enter the new *price* (e.g. 12.99):',
     description: 'Enter the new *description*:',
-    image_url:   'Enter the new *image URL*:',
+    image_url:   'Enter the new *image URL* (must be https://):',
   };
   return sendText(phone, prompts[field], env);
 }
@@ -362,7 +401,6 @@ async function handleEditItemField(phone, msg, session, env) {
 async function handleEditItemValue(phone, msg, session, env) {
   const { editItemId, editField } = session.adminCtx;
 
-  // Guard against corrupted/replayed session
   if (!editItemId || !editField) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
@@ -373,8 +411,15 @@ async function handleEditItemValue(phone, msg, session, env) {
 
   if (editField === 'price') {
     const p = parseFloat(value);
-    if (isNaN(p) || p < 0) return sendText(phone, '⚠️ Enter a valid price.', env);
+    if (isNaN(p) || p < 0) {
+      return sendText(phone, '⚠️ Enter a valid price (e.g. 12.99).', env);
+    }
     value = p;
+  }
+
+  // BUG-10 FIX: validate HTTPS on image URL edits
+  if (editField === 'image_url' && value && !isValidHttpsUrl(value)) {
+    return sendText(phone, '⚠️ Image URL must start with *https://*. Please try again.', env);
   }
 
   await updateMenuItem(editItemId, { [editField]: value }, env);
@@ -397,21 +442,35 @@ async function handleEditItemValue(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function startDeleteFlow(phone, session, env) {
-  const menu  = await getFullMenu(env);
-  const items = Object.values(menu.itemsByCategory).flat();
+  // BUG-04 FIX: use getAllMenuItems so unavailable items can still be deleted
+  const items = await getAllMenuItems(env);
 
-  if (!items.length) return sendText(phone, '📭 No items to delete.', env);
+  if (!items.length) {
+    return sendText(phone, '📭 No items to delete.', env);
+  }
 
-  const rows = items.slice(0, 10).map(i => ({
-    id:    `del_${i.id}`,
-    title: i.name,
-    description: `$${i.price.toFixed(2)}`,
+  // BUG-21: show count when truncated
+  const visible = items.slice(0, 10);
+  const rows = visible.map(i => ({
+    id:          `del_${i.id}`,
+    title:       i.name,
+    description: `$${i.price.toFixed(2)}${i.is_available ? '' : ' (unavail)'}`,
   }));
+
+  const footer = items.length > 10
+    ? `Showing 10 of ${items.length} items`
+    : null;
 
   session.state = 'admin_delete_item_select';
   await saveSession(phone, session, env);
 
-  return sendList(phone, '🗑️ *Delete Item*\nSelect item to delete:', 'Choose', [{ title: 'Items', rows }], env);
+  return sendList(
+    phone,
+    `🗑️ *Delete Item*\nSelect item to delete:${footer ? `\n_${footer}_` : ''}`,
+    'Choose',
+    [{ title: 'Items', rows }],
+    env
+  );
 }
 
 async function handleDeleteItemSelect(phone, msg, session, env) {
@@ -421,7 +480,7 @@ async function handleDeleteItemSelect(phone, msg, session, env) {
   const item   = await getMenuItem(itemId, env);
   if (!item) return sendText(phone, '⚠️ Item not found.', env);
 
-  session.adminCtx.deleteItemId = itemId;
+  session.adminCtx.deleteItemId   = itemId;
   session.adminCtx.deleteItemName = item.name;
   session.state = 'admin_delete_item_confirm';
   await saveSession(phone, session, env);
@@ -439,50 +498,62 @@ async function handleDeleteItemSelect(phone, msg, session, env) {
 
 async function handleDeleteItemConfirm(phone, msg, session, env) {
   if (msg.id === 'confirm_delete') {
-    await deleteMenuItem(session.adminCtx.deleteItemId, env);
+    const { deleteItemId, deleteItemName } = session.adminCtx;
+    if (!deleteItemId) {
+      session.state = 'admin_idle';
+      await saveSession(phone, session, env);
+      return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    }
+
+    await deleteMenuItem(deleteItemId, env);
     await bustMenuCache(env);
-    const name = session.adminCtx.deleteItemName;
+
     session.state    = 'admin_idle';
     session.adminCtx = {};
     await saveSession(phone, session, env);
+
     return sendButtons(
       phone,
-      `✅ *${name}* deleted from menu.`,
+      `✅ *${deleteItemName}* deleted from menu.`,
       [{ id: 'admin_home', title: '🔧 Admin Menu' }],
       env
     );
   }
+
   session.state = 'admin_idle';
   await saveSession(phone, session, env);
   return showAdminMenu(phone, env);
 }
 
 // ─────────────────────────────────────────────────────────────
-// Toggle availability
+// Toggle Availability
 // ─────────────────────────────────────────────────────────────
 
 async function startToggleFlow(phone, session, env) {
-  // Query ALL items (not just available) — no need for getFullMenu here
-  const allItems = await env.DB.prepare(
-    'SELECT id, name, is_available FROM MenuItems ORDER BY name'
-  ).all();
+  // BUG-04 FIX: getAllMenuItems — must see unavailable items to re-enable them
+  const items = await getAllMenuItems(env);
 
-  if (!allItems.results.length) {
+  if (!items.length) {
     return sendText(phone, '📭 No items in menu yet.', env);
   }
 
-  const rows = allItems.results.slice(0, 10).map(i => ({
+  const visible = items.slice(0, 10);
+  const rows = visible.map(i => ({
     id:          `tog_${i.id}`,
     title:       i.name,
     description: i.is_available ? '✅ Available' : '❌ Unavailable',
   }));
+
+  const footer = items.length > 10
+    ? `Showing 10 of ${items.length} items`
+    : null;
 
   session.state = 'admin_toggle_item_select';
   await saveSession(phone, session, env);
 
   return sendList(
     phone,
-    '🔄 *Toggle Availability*\nSelect an item to flip its status:',
+    `🔄 *Toggle Availability*\nTap an item to flip its status:${footer ? `\n_${footer}_` : ''}`,
     'Choose Item',
     [{ title: 'All Items', rows }],
     env
@@ -490,24 +561,19 @@ async function startToggleFlow(phone, session, env) {
 }
 
 async function handleToggleItemSelect(phone, msg, session, env) {
-  if (!msg.id?.startsWith('tog_')) {
-    return startToggleFlow(phone, session, env);
-  }
+  if (!msg.id?.startsWith('tog_')) return startToggleFlow(phone, session, env);
 
   const itemId = parseInt(msg.id.replace('tog_', ''), 10);
   const item   = await env.DB.prepare(
     'SELECT id, name, is_available FROM MenuItems WHERE id = ?'
   ).bind(itemId).first();
 
-  if (!item) {
-    return sendText(phone, '⚠️ Item not found.', env);
-  }
+  if (!item) return sendText(phone, '⚠️ Item not found.', env);
 
   const newAvail = item.is_available ? 0 : 1;
-  await env.DB.prepare(
-    'UPDATE MenuItems SET is_available = ? WHERE id = ?'
-  ).bind(newAvail, itemId).run();
-
+  await env.DB.prepare('UPDATE MenuItems SET is_available = ? WHERE id = ?')
+    .bind(newAvail, itemId)
+    .run();
   await bustMenuCache(env);
 
   session.state    = 'admin_idle';
@@ -517,7 +583,7 @@ async function handleToggleItemSelect(phone, msg, session, env) {
   const label = newAvail ? '✅ Available' : '❌ Unavailable';
   return sendButtons(
     phone,
-    `*${item.name}* is now marked *${label}*.`,
+    `*${item.name}* is now *${label}*.`,
     [{ id: 'admin_home', title: '🔧 Admin Menu' }],
     env
   );
@@ -536,27 +602,25 @@ async function viewOrders(phone, session, env) {
     return sendText(phone, '📭 No pending orders right now.', env);
   }
 
-  const statusEmoji = {
-    pending: '⏳', confirmed: '✅', preparing: '👨‍🍳',
-  };
+  const statusEmoji = { pending: '⏳', confirmed: '✅', preparing: '👨‍🍳' };
 
-  // WhatsApp button message body cap: 1024 chars.
-  // Build lines and truncate so we never exceed it.
+  // BUG-09 FIX: use loop index `i` instead of indexOf(line) which returns
+  // the position of the FIRST occurrence — wrong when lines are identical.
   const lines = orders.map(
     o =>
-      `• #${o.id} ${statusEmoji[o.status] || ''} ${o.status.toUpperCase()}` +
-      ` $${Number(o.total_price).toFixed(2)}\n` +
+      `• #${o.id} ${statusEmoji[o.status] || ''} ${o.status.toUpperCase()} $${Number(o.total_price).toFixed(2)}\n` +
       `  📱 ${o.user_phone}  📍 ${(o.address || '').slice(0, 30)}`
   );
 
   const header = `📦 *Active Orders* (${orders.length})\n\n`;
   let body = header;
-  for (const line of lines) {
-    if ((body + line).length > 950) {   // 950 gives buffer for WhatsApp overhead
-      body += `\n_...and ${orders.length - lines.indexOf(line)} more_`;
+
+  for (let i = 0; i < lines.length; i++) {
+    if ((body + lines[i]).length > 950) {
+      body += `_...and ${orders.length - i} more_`;
       break;
     }
-    body += line + '\n\n';
+    body += lines[i] + '\n\n';
   }
 
   session.state = 'admin_orders_list';
@@ -567,7 +631,7 @@ async function viewOrders(phone, session, env) {
     body.trim(),
     [
       { id: 'admin_update_status', title: '✏️ Update Status' },
-      { id: 'admin_home',          title: '🔧 Admin Menu'   },
+      { id: 'admin_home',          title: '🔧 Admin Menu'    },
     ],
     env
   );
@@ -589,11 +653,22 @@ async function handleAdminOrdersList(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function handleUpdateStatusId(phone, msg, session, env) {
-  const orderId = parseInt(msg.text || '', 10);
-  if (isNaN(orderId)) return sendText(phone, '⚠️ Enter a valid order ID number.', env);
+  const raw = (msg.text || '').trim();
+
+  // BUG-12 FIX: strict integer parse — parseInt('5abc') returns 5, which is wrong.
+  // /^\d+$/ ensures only pure digit strings are accepted.
+  if (!/^\d+$/.test(raw)) {
+    return sendText(phone, '⚠️ Enter a valid order ID number (digits only).', env);
+  }
+  const orderId = parseInt(raw, 10);
+  if (orderId <= 0) {
+    return sendText(phone, '⚠️ Order ID must be a positive number.', env);
+  }
 
   const order = await getOrder(orderId, env);
-  if (!order) return sendText(phone, `⚠️ Order #${orderId} not found.`, env);
+  if (!order) {
+    return sendText(phone, `⚠️ Order #${orderId} not found.`, env);
+  }
 
   session.adminCtx.updateOrderId = orderId;
   session.adminCtx.orderPhone    = order.user_phone;
@@ -603,7 +678,7 @@ async function handleUpdateStatusId(phone, msg, session, env) {
   const rows = VALID_STATUSES.map(s => ({ id: `status_${s}`, title: s.toUpperCase() }));
   return sendList(
     phone,
-    `📦 Order #${orderId} — Current status: *${order.status.toUpperCase()}*\n\nSelect new status:`,
+    `📦 Order #${orderId} — Current: *${order.status.toUpperCase()}*\n\nSelect new status:`,
     'Choose Status',
     [{ title: 'Order Statuses', rows }],
     env
@@ -616,15 +691,11 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
   }
 
   const newStatus = msg.id.replace('status_', '');
-
-  // Whitelist check — never trust user-supplied IDs for DB writes
   if (!VALID_STATUSES.includes(newStatus)) {
-    return sendText(phone, '⚠️ Invalid status selected.', env);
+    return sendText(phone, '⚠️ Invalid status.', env);
   }
 
   const { updateOrderId, orderPhone } = session.adminCtx;
-
-  // Guard against missing context
   if (!updateOrderId || !orderPhone) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
@@ -633,11 +704,10 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
 
   await updateOrderStatus(updateOrderId, newStatus, env);
 
-  // Notify customer — best effort, never throw
+  // Notify customer — best effort
   const customerMsg = statusMessage(updateOrderId, newStatus);
-  await sendText(orderPhone, customerMsg, env).catch(err =>
-    console.error('[Admin] Failed to notify customer:', err)
-  );
+  await sendText(orderPhone, customerMsg, env)
+    .catch(err => console.error('[Admin] Failed to notify customer:', err));
 
   session.state    = 'admin_idle';
   session.adminCtx = {};
@@ -645,7 +715,7 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
 
   return sendButtons(
     phone,
-    `✅ Order #${updateOrderId} updated to *${newStatus.toUpperCase()}*.\nCustomer notified.`,
+    `✅ Order #${updateOrderId} → *${newStatus.toUpperCase()}*.\nCustomer notified.`,
     [{ id: 'admin_home', title: '🔧 Admin Menu' }],
     env
   );
@@ -653,11 +723,11 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
 
 function statusMessage(orderId, status) {
   const messages = {
-    confirmed:  `✅ Your Order #${orderId} has been *confirmed*! We're getting it ready.`,
-    preparing:  `👨‍🍳 Your Order #${orderId} is now being *prepared*!`,
-    ready:      `📦 Your Order #${orderId} is *ready* and on its way!`,
-    delivered:  `🎉 Your Order #${orderId} has been *delivered*! Enjoy your meal!`,
-    cancelled:  `❌ Your Order #${orderId} has been *cancelled*. Contact us for help.`,
+    confirmed: `✅ Order #${orderId} *confirmed*! We're getting it ready.`,
+    preparing: `👨‍🍳 Order #${orderId} is being *prepared*!`,
+    ready:     `📦 Order #${orderId} is *ready* and on its way!`,
+    delivered: `🎉 Order #${orderId} *delivered*! Enjoy your meal!`,
+    cancelled: `❌ Order #${orderId} *cancelled*. Contact us if you have questions.`,
   };
-  return messages[status] || `📦 Your Order #${orderId} status: *${status.toUpperCase()}*`;
+  return messages[status] || `📦 Order #${orderId} status: *${status.toUpperCase()}*`;
 }
