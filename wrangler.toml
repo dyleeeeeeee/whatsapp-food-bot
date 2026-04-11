@@ -1,0 +1,44 @@
+# ============================================================
+# wrangler.toml — WhatsApp Food Bot
+# ============================================================
+
+name       = "whatsapp-food-bot"
+main       = "src/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# ─── KV Namespaces ───────────────────────────────────────────
+[[kv_namespaces]]
+binding  = "SESSION_KV"
+id       = "REPLACE_WITH_YOUR_KV_ID"
+preview_id = "REPLACE_WITH_YOUR_PREVIEW_KV_ID"
+
+# ─── D1 Database ─────────────────────────────────────────────
+[[d1_databases]]
+binding      = "DB"
+database_name = "food-bot-db"
+database_id  = "REPLACE_WITH_YOUR_D1_ID"
+
+# ─── R2 Bucket (optional, for menu images) ───────────────────
+# [[r2_buckets]]
+# binding    = "IMAGES"
+# bucket_name = "food-bot-images"
+
+# ─── Environment Variables ───────────────────────────────────
+# Set secrets via: wrangler secret put WHATSAPP_TOKEN
+# Never commit real values here.
+
+[vars]
+ENVIRONMENT = "production"
+MENU_CACHE_TTL = "300"          # seconds to cache menu in KV
+
+# ─── Production Environment ──────────────────────────────────
+[env.production]
+name = "whatsapp-food-bot"
+
+# ─── Staging Environment ─────────────────────────────────────
+[env.staging]
+name = "whatsapp-food-bot-staging"
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
