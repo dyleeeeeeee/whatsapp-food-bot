@@ -15,6 +15,19 @@
 
 const SESSION_TTL = 60 * 60 * 2; // 2 hours in seconds
 
+// Currency configuration
+export const CURRENCY_SYMBOL = '₦';
+export const MAX_PRICE = 999.99; // Maximum allowed price for items
+
+/**
+ * Format a price amount with the currency symbol.
+ * @param {number} amount - Price amount
+ * @returns {string} Formatted price like "₦9.99"
+ */
+export function formatPrice(amount) {
+  return `${CURRENCY_SYMBOL}${Number(amount).toFixed(2)}`;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Session helpers
 // ─────────────────────────────────────────────────────────────
@@ -86,14 +99,22 @@ export function cartSummary(cart) {
   if (!cart.length) return '_Your cart is empty._';
   const lines = cart.map(i => {
     const displayName = i.name.length > 40 ? i.name.slice(0, 37) + '…' : i.name;
-    return `• ${displayName} ×${i.qty}  $${(Math.round(i.unitPrice * 100) * i.qty / 100).toFixed(2)}`;
+    return `• ${displayName} ×${i.qty}  ${formatPrice(Math.round(i.unitPrice * 100) * i.qty / 100)}`;
   });
-  lines.push(`\n*Total: $${cartTotal(cart).toFixed(2)}*`);
+  lines.push(`\n*Total: ${formatPrice(cartTotal(cart))}*`);
   return lines.join('\n');
 }
 
+/**
+ * Add item to cart. Items with the same ID but DIFFERENT notes are kept
+ * separate to allow "Burger with no onions" and "Burger with extra cheese".
+ *
+ * CRITICAL FIX: Previously merged by itemId only, losing different notes.
+ */
 export function addToCart(cart, item) {
-  const existing = cart.find(i => i.itemId === item.itemId);
+  const existing = cart.find(
+    i => i.itemId === item.itemId && i.notes === item.notes
+  );
   if (existing) {
     existing.qty += item.qty;
   } else {

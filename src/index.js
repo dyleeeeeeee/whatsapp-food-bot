@@ -9,6 +9,7 @@
 
 import { verifyWebhookSignature } from './security.js';
 import { handleWebhookGet, handleWebhookPost } from './webhook.js';
+import { handlePaystackWebhook } from './paystack_handler.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -16,7 +17,9 @@ export default {
 
     try {
       if (url.pathname === '/health') {
-        return json({ status: 'ok', ts: Date.now() });
+        return new Response(JSON.stringify({ status: 'ok', ts: Date.now() }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
 
       if (url.pathname === '/webhook') {
@@ -38,6 +41,10 @@ export default {
           ctx.waitUntil(handleWebhookPost(body, env));
           return new Response('OK', { status: 200 });
         }
+      }
+
+      if (url.pathname === '/paystack/webhook' && request.method === 'POST') {
+        return handlePaystackWebhook(request, env, ctx);
       }
 
       return new Response('Not Found', { status: 404 });

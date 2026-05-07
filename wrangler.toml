@@ -10,15 +10,15 @@ compatibility_date = "2024-09-23"
 
 # ─── KV Namespaces ───────────────────────────────────────────
 [[kv_namespaces]]
-binding    = "SESSION_KV"
-id         = "REPLACE_WITH_YOUR_KV_ID"
-preview_id = "REPLACE_WITH_YOUR_PREVIEW_KV_ID"
+binding = "SESSION_KV"
+id = "023f47a2c967435a930ce36e15473282"
+preview_id = "31a1d3e96d1c441a95c30dee3fd6f23d"
 
 # ─── D1 Database ─────────────────────────────────────────────
 [[d1_databases]]
 binding       = "DB"
 database_name = "food-bot-db"
-database_id   = "REPLACE_WITH_YOUR_D1_ID"
+database_id   = "0bcc31a6-ed24-4874-8cd8-ddf800c3e825"
 
 # ─── R2 Bucket (optional, for menu images) ───────────────────
 # [[r2_buckets]]
@@ -42,3 +42,18 @@ name = "whatsapp-food-bot-staging"
 ENVIRONMENT       = "staging"
 GRAPH_API_VERSION = "v21.0"
 MENU_CACHE_TTL    = "60"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1

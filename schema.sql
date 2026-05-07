@@ -38,19 +38,30 @@ CREATE INDEX IF NOT EXISTS idx_items_available ON MenuItems(is_available);
 -- Orders
 -- ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS Orders (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_phone  TEXT    NOT NULL,
-  total_price REAL    NOT NULL DEFAULT 0,
-  status      TEXT    NOT NULL DEFAULT 'pending'
-                      CHECK(status IN ('pending','confirmed','preparing','ready','delivered','cancelled')),
-  address     TEXT    NOT NULL DEFAULT '',
-  notes       TEXT    NOT NULL DEFAULT '',
-  created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-  updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_phone   TEXT    NOT NULL,
+  total_price  REAL    NOT NULL DEFAULT 0,
+  status       TEXT    NOT NULL DEFAULT 'pending'
+                       CHECK(status IN ('pending','confirmed','preparing','ready','delivered','cancelled')),
+  address      TEXT    NOT NULL DEFAULT '',
+  notes        TEXT    NOT NULL DEFAULT '',
+  
+  -- Payment Fields
+  payment_status      TEXT    NOT NULL DEFAULT 'unpaid'
+                              CHECK(payment_status IN ('unpaid','pending','paid','failed')),
+  payment_reference   TEXT    UNIQUE,
+  payment_url         TEXT,
+  payment_access_code TEXT,
+  paid_at             TEXT,
+
+  created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_phone  ON Orders(user_phone);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON Orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_payment_ref ON Orders(payment_reference);
+CREATE INDEX IF NOT EXISTS idx_orders_payment_status ON Orders(payment_status);
 
 -- ─────────────────────────────────────────
 -- Order Items
@@ -75,6 +86,28 @@ CREATE TABLE IF NOT EXISTS AdminUsers (
   name         TEXT NOT NULL DEFAULT 'Admin',
   added_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ─────────────────────────────────────────
+-- Bulk Action Logs
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS BulkActionLogs (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  admin_phone          TEXT NOT NULL,
+  action_type          TEXT NOT NULL, -- 'set_status', 'set_availability', etc.
+  target_type          TEXT NOT NULL, -- 'orders', 'menu_items', etc.
+  target_value         TEXT NOT NULL DEFAULT '',
+  selected_ids_json    TEXT NOT NULL, -- list of IDs
+  success_count        INTEGER NOT NULL DEFAULT 0,
+  failure_count        INTEGER NOT NULL DEFAULT 0,
+  skipped_count        INTEGER NOT NULL DEFAULT 0,
+  failure_details_json TEXT NOT NULL DEFAULT '[]',
+  notify_customers     INTEGER NOT NULL DEFAULT 0, -- boolean
+  cancellation_reason  TEXT NOT NULL DEFAULT '',
+  created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_bulk_logs_admin ON BulkActionLogs(admin_phone);
+CREATE INDEX IF NOT EXISTS idx_bulk_logs_created ON BulkActionLogs(created_at);
 
 -- ─────────────────────────────────────────
 -- Seed Data (safe to re-run)

@@ -1,4 +1,4 @@
-# WhatsApp Food Bot — Deployment Guide
+# FastChow — Deployment Guide
 
 A production-ready food ordering bot built on Cloudflare Workers + WhatsApp Cloud API.
 
@@ -68,6 +68,22 @@ wrangler d1 execute food-bot-db --file=schema.sql
    - **Phone Number ID**
    - **WhatsApp Business Account ID**
 4. Generate a **Temporary Access Token** (use a permanent System User token for prod)
+5. **Register your phone number** (required if status shows "Pending"):
+
+   ```bash
+   curl -X POST \
+     "https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/register" \
+     -H "Authorization: Bearer {ACCESS_TOKEN}" \
+     -H "Content-Type: application/json" \
+     -d '{ "messaging_product": "whatsapp", "pin": "123456" }'
+   ```
+
+   Or use the helper script:
+   ```bash
+   node scripts/register-phone.js {PHONE_NUMBER_ID} {ACCESS_TOKEN} {PIN}
+   ```
+
+   The PIN is a 6-digit code you create for two-step verification. Save it securely.
 
 ---
 
@@ -172,7 +188,7 @@ User sends any message
         │ "Add to Cart"                       │
         ▼                                     │
  ┌──────────────────┐                         │
- │entering_quantity │                         │
+ │entering_quantity │◄────────────────────────┤
  └──────────────────┘                         │
         │ enter number                        │
         ▼                                     │
@@ -184,16 +200,21 @@ User sends any message
  ┌─────────────┐     keep shopping            │
  │ cart_review │─────────────────────────┐    │
  └─────────────┘                         │    │
-        │ checkout                        │    │
-        ▼                                 ▼    │
+        │ checkout                       │    │
+        ▼                                ▼    │
  ┌──────────────────┐          ┌──────────────┐│
  │checkout_address  │          │browsing_menu ││
  └──────────────────┘          └──────────────┘│
-        │ enter address                        │
-        ▼                                      │
- ┌──────────────────┐                          │
- │checkout_confirm  │                          │
- └──────────────────┘                          │
+        │ enter address                       │
+        ▼                                     │
+ ┌────────────────────────┐                   │
+ │checkout_delivery_notes │                   │
+ └────────────────────────┘                   │
+        │ enter notes/skip                    │
+        ▼                                     │
+ ┌──────────────────┐                         │
+ │checkout_confirm  │                         │
+ └──────────────────┘                         │
         │ "Place Order" → save to D1           │
         └──────────────────────────────────────┘
 ```
