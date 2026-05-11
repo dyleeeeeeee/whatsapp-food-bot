@@ -115,7 +115,7 @@ async function handleGlobalCommand(phone, msg, session, env) {
   }
 
   if (t === 'ORDERS' || id === 'cmd_orders') {
-    return showOrderHistory(phone, env);
+    return showOrderHistory(phone, session, env);
   }
 
   if (t === 'HELP' || id === 'cmd_help') {
@@ -135,7 +135,11 @@ async function handleGlobalCommand(phone, msg, session, env) {
     );
   }
 
-  // MENU / START / HI / HELLO / cmd_menu
+  if (t === 'MENU' || id === 'cmd_menu') {
+    return showMenuCategories(phone, session, env);
+  }
+
+  // START / HI / HELLO (welcome greeting)
   session.state = 'idle';
   await saveSession(phone, session, env);
   return showWelcome(phone, env);
@@ -295,6 +299,11 @@ async function handleCartReview(phone, msg, session, env) {
       title: `${item.name} (x${item.qty})`,
       description: `Notes: ${item.notes || 'None'}`
     }));
+    rows.push({
+      id: 'cart_clear_all',
+      title: '🧹 Clear Entire Cart',
+      description: 'Remove all items from cart'
+    });
 
     return sendList(
       phone,
@@ -322,6 +331,20 @@ async function handleCartReview(phone, msg, session, env) {
 }
 
 async function handleCartManage(phone, msg, session, env) {
+  if (msg.type === 'list_reply' && msg.id === 'cart_clear_all') {
+    session.state = 'confirm_cancel';
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      '❓ *Clear your entire cart?*',
+      [
+        { id: 'confirm_cancel_yes', title: 'Yes, Clear' },
+        { id: 'confirm_cancel_no',  title: 'No, Keep it' },
+      ],
+      env
+    );
+  }
+
   if (msg.type === 'list_reply' && msg.id?.startsWith('cart_idx_')) {
     const idx = parseInt(msg.id.replace('cart_idx_', ''), 10);
     const item = session.cart[idx];
@@ -586,12 +609,11 @@ async function handleConfirmCancel(phone, msg, session, env) {
 async function showWelcome(phone, env) {
   return sendButtons(
     phone,
-    `👋 Welcome to *FastChow*! 🍔🍕🥤\n\nOrder fresh food delivered to your door.\n\nWhat would you like to do?`,
+    `👋 Welcome to *FastChow*! 🍔🍕🥤\n\nOrder fresh food delivered to your door.\n\nWhat would you like to do?\n\nNeed help? Send *HELP* anytime.`,
     [
       { id: 'cmd_menu',   title: '🍽️ View Menu'  },
       { id: 'cmd_cart',   title: '🛒 My Cart'     },
       { id: 'cmd_orders', title: '📋 My Orders'   },
-      { id: 'cmd_help',   title: '❓ Help'        },
     ],
     env,
     '🍔 FastChow',
@@ -714,7 +736,10 @@ async function showCart(phone, session, env) {
   );
 }
 
-async function showOrderHistory(phone, env) {
+async function showOrderHistory(phone, session, env) {
+  session.state = 'order_tracking';
+  await saveSession(phone, session, env);
+
   const orders = await getUserOrders(phone, env);
   if (!orders.length) {
     return sendText(phone, '📋 You have no previous orders yet.', env);
@@ -744,7 +769,7 @@ async function handleOrderTracking(phone, msg, session, env) {
   if (msg.type === 'list_reply' && msg.id?.startsWith('track_')) {
     const orderId = parseInt(msg.id.replace('track_', ''), 10);
     const order = await getOrder(orderId, env);
-    if (!order) return showOrderHistory(phone, env);
+    if (!order) return showOrderHistory(phone, session, env);
 
     const statusEmoji = {
       pending:   '⏳ Pending',
@@ -801,7 +826,7 @@ async function handleOrderTracking(phone, msg, session, env) {
     );
   }
 
-  return showOrderHistory(phone, env);
+  return showOrderHistory(phone, session, env);
 }
 
 // ─────────────────────────────────────────────────────────────
