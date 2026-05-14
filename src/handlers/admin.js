@@ -414,7 +414,9 @@ async function handleAddItemName(phone, msg, session, env) {
   await saveSession(phone, session, env);
 
   const cats = await getCategories(env);
+  console.log('[Admin] Add Item Category - categories found:', cats.length, cats);
   if (!cats.length) {
+    console.log('[Admin] Add Item Category - no categories, showing create button');
     return sendButtons(
       phone,
       '⚠️ No categories exist yet.',
@@ -424,13 +426,16 @@ async function handleAddItemName(phone, msg, session, env) {
   }
 
   const rows = cats.map(c => ({ id: `acat_${c.id}`, title: c.name }));
-  return sendList(
+  console.log('[Admin] Add Item Category - sending list with rows:', rows);
+  const response = await sendList(
     phone,
     `📂 Choose a *category* for "${name}":`,
     'Select Category',
     [{ title: 'Categories', rows }],
     env
   );
+  console.log('[Admin] Add Item Category - list response sent');
+  return response;
 }
 
 async function handleAddItemCategory(phone, msg, session, env) {
