@@ -90,6 +90,7 @@ export async function handleAdminMessage(phone, msg, env) {
   switch (session.state) {
     case 'admin_idle':                return handleAdminIdle(phone, msg, session, env);
     case 'admin_add_category':        return handleAddCategory(phone, msg, session, env);
+    case 'admin_view_categories':     return handleViewCategories(phone, msg, session, env);
     case 'admin_add_item_name':       return handleAddItemName(phone, msg, session, env);
     case 'admin_add_item_category':   return handleAddItemCategory(phone, msg, session, env);
     case 'admin_add_item_price':      return handleAddItemPrice(phone, msg, session, env);
@@ -139,6 +140,7 @@ async function showAdminMenu(phone, env) {
           { id: 'admin_edit_item',   title: 'Edit Item',     description: 'Update price, name, etc.'     },
           { id: 'admin_delete_item', title: 'Delete Item',   description: 'Remove item from menu'        },
           { id: 'admin_add_cat',     title: 'Add Category',  description: 'Create a new menu category'   },
+          { id: 'admin_view_cats',   title: 'View Categories', description: 'List all categories'         },
           { id: 'admin_toggle_item', title: 'Toggle Avail.', description: 'Mark item available/unavail.' },
         ],
       },
@@ -173,6 +175,11 @@ async function handleAdminIdle(phone, msg, session, env) {
     session.state = 'admin_add_category';
     await saveSession(phone, session, env);
     return sendText(phone, '📂 Enter the new *category name*:', env);
+  }
+  if (id === 'admin_view_cats') {
+    session.state = 'admin_view_categories';
+    await saveSession(phone, session, env);
+    return showCategoriesList(phone, session, env);
   }
   if (id === 'admin_edit_item')   return startEditFlow(phone, session, env);
   if (id === 'admin_delete_item') return startDeleteFlow(phone, session, env);
@@ -250,6 +257,75 @@ async function handleBackNavigation(phone, session, env) {
   }
 
   return sendText(phone, backInfo.prompt + '\n\nSend *CANCEL* to abort.', env);
+}
+
+// ─────────────────────────────────────────────────────────────
+// View Categories
+// ─────────────────────────────────────────────────────────────
+
+async function showCategoriesList(phone, session, env) {
+  const categories = await getCategories(env);
+  const menu = await getFullMenu(env);
+
+  if (!categories.length) {
+    return sendText(phone, '📭 No categories exist yet. Create one via Add Category.', env);
+  }
+
+  const rows = categories.map(cat => ({
+    id: `cat_${cat.id}`,
+    title: cat.name,
+    description: `${(menu.itemsByCategory[cat.id] || []).length} items`
+  }));
+
+  return sendList(
+    phone,
+    '📂 *Categories*\nSelect a category to view its items:',
+    'Categories',
+    [{ title: 'All Categories', rows }],
+    env
+  );
+}
+
+async function handleViewCategories(phone, msg, session, env) {
+  if (msg.id === 'admin_home' || (msg.text || '').toUpperCase() === 'CANCEL') {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return showAdminMenu(phone, env);
+  }
+
+  if (msg.type === 'list_reply' && msg.id?.startsWith('cat_')) {
+    const categoryId = parseInt(msg.id.replace('cat_', ''), 10);
+    const menu = await getFullMenu(env);
+    const category = await env.DB.prepare(
+      'SELECT id, name FROM MenuCategories WHERE id = ?'
+    ).bind(categoryId).first();
+
+    if (!category) {
+      return sendText(phone, '⚠️ Category not found.', env);
+    }
+
+    const items = menu.itemsByCategory[categoryId] || [];
+    if (!items.length) {
+      return sendText(phone, `😕 No items in *${category.name}* yet.`, env);
+    }
+
+    const itemText = items.map(i =>
+      `• *${i.name}*\n  ₦${i.price.toFixed(2)}${i.is_available ? '' : ' (unavailable)'}`
+    ).join('\n\n');
+
+    return sendButtons(
+      phone,
+      `📂 *${category.name}*\n\n${itemText}`,
+      [
+        { id: 'admin_view_cats', title: '📂 View Other Categories' },
+        { id: 'admin_home', title: '🔧 Admin Menu' },
+      ],
+      env,
+      category.name
+    );
+  }
+
+  return showCategoriesList(phone, session, env);
 }
 
 // ─────────────────────────────────────────────────────────────
