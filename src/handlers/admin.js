@@ -415,9 +415,12 @@ async function handleAddItemName(phone, msg, session, env) {
 
   const cats = await getCategories(env);
   if (!cats.length) {
-    session.state = 'admin_idle';
-    await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ No categories exist yet. Create one first via Add Category.', env);
+    return sendButtons(
+      phone,
+      '⚠️ No categories exist yet.',
+      [{ id: 'admin_add_cat', title: '➕ Create Category' }],
+      env
+    );
   }
 
   const rows = cats.map(c => ({ id: `acat_${c.id}`, title: c.name }));
@@ -672,7 +675,10 @@ async function handleEditItemValue(phone, msg, session, env) {
     return sendButtons(
       phone,
       '❌ Edit cancelled.',
-      [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+      [
+        { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+        { id: 'admin_home', title: '🔧 Admin Menu' },
+      ],
       env
     );
   }
@@ -796,19 +802,19 @@ async function handleDeleteItemConfirm(phone, msg, session, env) {
     await deleteMenuItem(deleteItemId, env);
     await bustMenuCache(env);
 
-    session.state    = 'admin_idle';
-    session.adminCtx = {};
-    await saveSession(phone, session, env);
-
     return sendButtons(
       phone,
       `✅ *${deleteItemName}* deleted from menu.`,
-      [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+      [
+        { id: 'admin_delete_item', title: '🗑️ Delete Another Item' },
+        { id: 'admin_home', title: '🔧 Admin Menu' },
+      ],
       env
     );
   }
 
   session.state = 'admin_idle';
+  session.adminCtx = {};
   await saveSession(phone, session, env);
   return showAdminMenu(phone, env);
 }
@@ -864,15 +870,14 @@ async function handleToggleItemSelect(phone, msg, session, env) {
     .run();
   await bustMenuCache(env);
 
-  session.state    = 'admin_idle';
-  session.adminCtx = {};
-  await saveSession(phone, session, env);
-
   const label = newAvail ? '✅ Available' : '❌ Unavailable';
   return sendButtons(
     phone,
     `*${item.name}* is now *${label}*.`,
-    [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+    [
+      { id: 'admin_toggle_item', title: '🔄 Toggle Another Item' },
+      { id: 'admin_home', title: '🔧 Admin Menu' },
+    ],
     env
   );
 }
@@ -885,9 +890,12 @@ async function viewOrders(phone, session, env) {
   const orders = await getPendingOrders(env);
 
   if (!orders.length) {
-    session.state = 'admin_idle';
-    await saveSession(phone, session, env);
-    return sendText(phone, '📭 No pending orders right now.', env);
+    return sendButtons(
+      phone,
+      '📭 No pending orders right now.',
+      [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+      env
+    );
   }
 
   const statusEmoji = { pending: '⏳', confirmed: '✅', preparing: '👨‍🍳' };
@@ -953,11 +961,15 @@ async function handleUpdateStatusId(phone, msg, session, env) {
   // Allow CANCEL to abort
   if (text === 'CANCEL') {
     session.state = 'admin_idle';
+    session.adminCtx = {};
     await saveSession(phone, session, env);
     return sendButtons(
       phone,
       '❌ Status update cancelled.',
-      [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+      [
+        { id: 'admin_update_status', title: '📦 Update Another Status' },
+        { id: 'admin_home', title: '🔧 Admin Menu' },
+      ],
       env
     );
   }
@@ -1057,14 +1069,13 @@ async function performStatusUpdate(phone, session, env) {
   await sendText(orderPhone, customerMsg, env)
     .catch(err => console.error('[Admin] Failed to notify customer:', err));
 
-  session.state    = 'admin_idle';
-  session.adminCtx = {};
-  await saveSession(phone, session, env);
-
   return sendButtons(
     phone,
-    `✅ Order #${updateOrderId} → *${newStatus.toUpperCase()}*.\nCustomer notified.`,
-    [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+    `✅ Order #${updateOrderId} status updated to *${newStatus.toUpperCase()}*.\n\nCustomer notified.`,
+    [
+      { id: 'admin_update_status', title: '📦 Update Another Status' },
+      { id: 'admin_home', title: '🔧 Admin Menu' },
+    ],
     env
   );
 }
@@ -1361,7 +1372,10 @@ async function executeBulkOrders(phone, session, env) {
   return sendButtons(
     phone,
     summary,
-    [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+    [
+      { id: 'admin_bulk_menu', title: '📦 Bulk Actions' },
+      { id: 'admin_home', title: '🔧 Admin Menu' },
+    ],
     env
   );
 }
@@ -1506,7 +1520,10 @@ async function handleBulkItemsConfirm(phone, msg, session, env) {
       return sendButtons(
         phone,
         `✅ *Bulk Update Complete*\n\n${bulk.selectedIds.length} items marked ${isAvail ? 'AVAILABLE' : 'UNAVAILABLE'}.\n\nLog ID: ${logId}`,
-        [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+        [
+          { id: 'admin_bulk_menu', title: '📦 Bulk Actions' },
+          { id: 'admin_home', title: '🔧 Admin Menu' },
+        ],
         env
       );
     } catch (err) {
