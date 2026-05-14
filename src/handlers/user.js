@@ -315,7 +315,8 @@ async function handleCartReview(phone, msg, session, env) {
   }
 
   if (msg.id === 'btn_clear_cart') {
-    session.state = 'confirm_cancel'; // Reuse confirm_cancel for clearing cart
+    session.state = 'confirm_cancel';
+    session.confirmCancelType = 'cart_clear';
     await saveSession(phone, session, env);
     return sendButtons(
       phone,
@@ -333,6 +334,7 @@ async function handleCartReview(phone, msg, session, env) {
 async function handleCartManage(phone, msg, session, env) {
   if (msg.type === 'list_reply' && msg.id === 'cart_clear_all') {
     session.state = 'confirm_cancel';
+    session.confirmCancelType = 'cart_clear';
     await saveSession(phone, session, env);
     return sendButtons(
       phone,
@@ -585,19 +587,40 @@ async function handleCheckoutConfirm(phone, msg, session, env) {
     }
   }
 
-  return showCart(phone, session, env);
+  // Unknown input — re-prompt with action buttons (don't clobber session state)
+  return sendButtons(
+    phone,
+    '⚠️ Tap a button below to continue with your order.',
+    [
+      { id: 'btn_place_order', title: '✅ Place Order' },
+      { id: 'btn_edit_cart',   title: '✏️ Edit Order'  },
+    ],
+    env,
+    'Confirm Your Order'
+  );
 }
 
 async function handleConfirmCancel(phone, msg, session, env) {
   if (msg.id === 'confirm_cancel_yes') {
+    const isCartClear = session.confirmCancelType === 'cart_clear';
     clearCart(session);
     session.state = 'idle';
+    delete session.confirmCancelType;
     await saveSession(phone, session, env);
-    return sendText(phone, '🚫 Order cancelled. Send *MENU* to start again.', env);
+    const doneMsg = isCartClear
+      ? '🧹 Cart cleared!'
+      : '🚫 Order cancelled.';
+    return sendButtons(
+      phone,
+      `${doneMsg}\n\nWhat would you like to do next?`,
+      [{ id: 'cmd_menu', title: '🍽️ Browse Menu' }],
+      env
+    );
   }
 
-  // No or any other input — return to where they were
-  session.state = 'cart_review'; // Fallback to cart review if we lost exact state
+  // No or any other input — return to cart
+  delete session.confirmCancelType;
+  session.state = 'cart_review';
   await saveSession(phone, session, env);
   return showCart(phone, session, env);
 }
@@ -653,7 +676,12 @@ async function showItemsForCategory(phone, categoryId, categoryName, session, en
   const items = menu.itemsByCategory[categoryId] || [];
 
   if (!items.length) {
-    return sendText(phone, `😕 No items available in ${categoryName} right now.`, env);
+    return sendButtons(
+      phone,
+      `😕 No items available in *${categoryName}* right now.`,
+      [{ id: 'cmd_menu', title: '⬅️ Back to Categories' }],
+      env
+    );
   }
 
   const rows = items.map(item => {
@@ -742,7 +770,14 @@ async function showOrderHistory(phone, session, env) {
 
   const orders = await getUserOrders(phone, env);
   if (!orders.length) {
-    return sendText(phone, '📋 You have no previous orders yet.', env);
+    session.state = 'idle';
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      '📋 You have no previous orders yet.\n\nStart by browsing our menu!',
+      [{ id: 'cmd_menu', title: '🍽️ Browse Menu' }],
+      env
+    );
   }
 
   const statusEmoji = {

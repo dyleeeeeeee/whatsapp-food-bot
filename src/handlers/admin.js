@@ -38,7 +38,7 @@ import {
   getSession, saveSession, bustMenuCache, formatPrice, MAX_PRICE, CURRENCY_SYMBOL,
 } from '../session.js';
 import {
-  getAllMenuItems, getMenuItem, getCategories,
+  getAllMenuItems, getMenuItem, getCategories, getFullMenu,
   createMenuItem, updateMenuItem, deleteMenuItem,
   getPendingOrders, getOrder, updateOrderStatus,
   bulkUpdateOrderStatus, bulkUpdateMenuAvailability,
@@ -161,32 +161,22 @@ async function handleAdminIdle(phone, msg, session, env) {
   const id = msg.id || '';
 
   if (id === 'admin_add_item') {
-    console.log('[Admin] Starting Add Item flow');
     session.state    = 'admin_add_item_name';
     session.adminCtx = {};
     await saveSession(phone, session, env);
-    return sendText(phone, '➕ *Add New Item*\n\nEnter the item *name*:', env);
+    return sendText(phone, '➕ *Add New Item*\n\nEnter the item *name*:\n\nSend *CANCEL* to abort.', env);
   }
-  if (id === 'admin_add_cat') {
-    console.log('[Admin] Starting Add Category flow');
+  if (id === 'admin_add_cat' || id === 'admin_add_another_cat') {
     session.state = 'admin_add_category';
     await saveSession(phone, session, env);
-    return sendText(phone, '📂 Enter the new *category name*:', env);
-  }
-  if (id === 'admin_add_another_cat') {
-    console.log('[Admin] Starting Add Another Category flow');
-    session.state = 'admin_add_category';
-    await saveSession(phone, session, env);
-    return sendText(phone, '📂 Enter the new *category name*:', env);
+    return sendText(phone, '📂 Enter the new *category name*:\n\nSend *CANCEL* to abort.', env);
   }
   if (id === 'admin_view_cats') {
-    console.log('[Admin] Starting View Categories flow');
     session.state = 'admin_view_categories';
     await saveSession(phone, session, env);
     return showCategoriesList(phone, session, env);
   }
   if (id === 'admin_edit_item') {
-    console.log('[Admin] Starting Edit Item flow');
     return startEditFlow(phone, session, env);
   }
   if (id === 'admin_delete_item') return startDeleteFlow(phone, session, env);
@@ -238,15 +228,7 @@ async function handleBackNavigation(phone, session, env) {
 
   // Special handling for states that show lists
   if (state === 'admin_add_item_price') {
-    const cats = await getCategories(env);
-    const rows = cats.map(c => ({ id: `acat_${c.id}`, title: c.name }));
-    return sendList(
-      phone,
-      `📂 Choose a *category* for "${adminCtx?.newItem?.name || 'this item'}":`,
-      'Select Category',
-      [{ title: 'Categories', rows }],
-      env
-    );
+    return showCategoryListForItem(phone, adminCtx?.newItem?.name, env);
   }
 
   if (state === 'admin_add_item_image') {
@@ -275,7 +257,12 @@ async function showCategoriesList(phone, session, env) {
   const menu = await getFullMenu(env);
 
   if (!categories.length) {
-    return sendText(phone, '📭 No categories exist yet. Create one via Add Category.', env);
+    return sendButtons(
+      phone,
+      '📭 No categories yet.',
+      [{ id: 'admin_add_cat', title: '➕ Add Category' }],
+      env
+    );
   }
 
   const rows = categories.map(cat => ({
@@ -340,6 +327,11 @@ async function handleViewCategories(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function handleAddCategory(phone, msg, session, env) {
+  // Button press while already in add-category state — re-prompt
+  if (msg.id === 'admin_add_another_cat' || msg.type === 'button_reply' || msg.type === 'list_reply') {
+    return sendText(phone, '📂 Enter the new *category name*:\n\nSend *CANCEL* to abort.', env);
+  }
+
   const name = sanitize(msg.text || '', 50);
   if (name.length < 2) {
     return sendText(
@@ -354,20 +346,31 @@ async function handleAddCategory(phone, msg, session, env) {
     const result = await env.DB.prepare(
       'INSERT INTO MenuCategories (name) VALUES (?)'
     ).bind(name).run();
-    console.log('[Admin] Category created:', name, 'meta:', result.meta);
+    console.log('[Admin] Category created:', name, 'DB id:', result.meta?.last_row_id);
     await bustMenuCache(env);
+
+    // If admin came from the add-item flow (no categories existed), send them back there
+    if (session.adminCtx.returnFlow === 'add_item' && session.adminCtx.newItem) {
+      delete session.adminCtx.returnFlow;
+      session.state = 'admin_add_item_category';
+      await saveSession(phone, session, env);
+      return sendText(
+        phone,
+        `✅ Category *${name}* created!\n\nNow choose a category for *${session.adminCtx.newItem.name}*:`,
+        env
+      ).then(() => showCategoryListForItem(phone, session.adminCtx.newItem.name, env));
+    }
+
     // Keep state as admin_add_category to allow adding multiple categories
-    const response = await sendButtons(
+    return sendButtons(
       phone,
       `✅ Category *${name}* created!`,
       [
-        { id: 'admin_add_another_cat', title: '➕ Add Another Category' },
+        { id: 'admin_add_another_cat', title: '➕ Add Another' },
         { id: 'admin_home', title: '🔧 Admin Menu' },
       ],
       env
     );
-    console.log('[Admin] Confirmation sent for category:', name);
-    return response;
   } catch (err) {
     // BUG-20 FIX: Inspect error to distinguish duplicate-name from DB failure
     const msg2 = err?.message || '';
@@ -413,46 +416,61 @@ async function handleAddItemName(phone, msg, session, env) {
   session.state = 'admin_add_item_category';
   await saveSession(phone, session, env);
 
+  return showCategoryListForItem(phone, name, env);
+}
+
+async function showCategoryListForItem(phone, itemName, env) {
   const cats = await getCategories(env);
-  console.log('[Admin] Add Item Category - categories found:', cats.length, cats);
   if (!cats.length) {
-    console.log('[Admin] Add Item Category - no categories, showing create button');
     return sendButtons(
       phone,
-      '⚠️ No categories exist yet.',
+      '⚠️ No categories exist yet.\n\nCreate one first, then continue adding your item.',
       [{ id: 'admin_add_cat', title: '➕ Create Category' }],
       env
     );
   }
-
   const rows = cats.map(c => ({ id: `acat_${c.id}`, title: c.name }));
-  console.log('[Admin] Add Item Category - sending list with rows:', rows);
-  const response = await sendList(
+  return sendList(
     phone,
-    `📂 Choose a *category* for "${name}":`,
+    `📂 Choose a *category* for *${itemName || 'this item'}*:\n\nSend *CANCEL* to abort.`,
     'Select Category',
     [{ title: 'Categories', rows }],
     env
   );
-  console.log('[Admin] Add Item Category - list response sent');
-  return response;
 }
 
 async function handleAddItemCategory(phone, msg, session, env) {
-  if (!msg.id?.startsWith('acat_')) {
-    return sendText(phone, '⚠️ Please select a category from the list.', env);
-  }
   // BUG-05 FIX: guard corrupted session
   if (!session.adminCtx?.newItem) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
     return sendText(phone, '⚠️ Session lost. Please start over.', env);
   }
+
+  // Admin wants to create a new category while mid-way through add-item
+  if (msg.id === 'admin_add_cat') {
+    session.adminCtx.returnFlow = 'add_item';
+    session.state = 'admin_add_category';
+    await saveSession(phone, session, env);
+    return sendText(phone, '📂 Enter the new *category name*:\n\nSend *CANCEL* to abort.', env);
+  }
+
+  if (!msg.id?.startsWith('acat_')) {
+    // Re-render the list instead of a text-only warning
+    return showCategoryListForItem(phone, session.adminCtx.newItem.name, env);
+  }
+
   const catId = parseInt(msg.id.replace('acat_', ''), 10);
+  // Verify category exists
+  const cat = await getCategories(env).then(cats => cats.find(c => c.id === catId));
+  if (!cat) {
+    return showCategoryListForItem(phone, session.adminCtx.newItem.name, env);
+  }
+
   session.adminCtx.newItem.categoryId = catId;
   session.state = 'admin_add_item_price';
   await saveSession(phone, session, env);
-  return sendText(phone, '💰 Enter the *price* (e.g. 9.99):', env);
+  return sendText(phone, '💰 Enter the *price* (e.g. 9.99):\n\nSend *BACK* to choose a different category.', env);
 }
 
 async function handleAddItemPrice(phone, msg, session, env) {
@@ -554,6 +572,7 @@ async function handleAddItemImage(phone, msg, session, env) {
 
   const id = await createMenuItem(item, env);
   await bustMenuCache(env);
+  console.log('[Admin] Item created:', item.name, 'ID:', id);
 
   session.state    = 'admin_idle';
   session.adminCtx = {};
@@ -561,8 +580,11 @@ async function handleAddItemImage(phone, msg, session, env) {
 
   return sendButtons(
     phone,
-    `✅ *${item.name}* added to menu! (ID: ${id})\n💰 ₦${item.price.toFixed(2)}`,
-    [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+    `✅ *${item.name}* added to menu!\n💰 ₦${item.price.toFixed(2)}`,
+    [
+      { id: 'admin_add_item',  title: '➕ Add Another Item' },
+      { id: 'admin_home',      title: '🔧 Admin Menu'       },
+    ],
     env
   );
 }
@@ -576,7 +598,12 @@ async function startEditFlow(phone, session, env) {
   const items = await getAllMenuItems(env);
 
   if (!items.length) {
-    return sendText(phone, '📭 No items in menu yet.', env);
+    return sendButtons(
+      phone,
+      '📭 No items in menu yet. Add one first.',
+      [{ id: 'admin_add_item', title: '➕ Add Item' }],
+      env
+    );
   }
 
   // BUG-21: show count when truncated
@@ -614,6 +641,7 @@ async function handleEditItemSelect(phone, msg, session, env) {
   session.state = 'admin_edit_item_field';
   await saveSession(phone, session, env);
 
+  const availLabel = item.is_available ? '✅ Available' : '❌ Unavailable';
   return sendList(
     phone,
     `✏️ Editing *${item.name}* (₦${item.price.toFixed(2)})\nWhich field to update?`,
@@ -621,10 +649,12 @@ async function handleEditItemSelect(phone, msg, session, env) {
     [{
       title: 'Fields',
       rows: [
-        { id: 'ef_name',        title: 'Name',        description: `Current: ${item.name}` },
-        { id: 'ef_price',       title: 'Price',       description: `Current: ₦${item.price.toFixed(2)}` },
-        { id: 'ef_description', title: 'Description', description: `Current: ${(item.description || '').slice(0, 40)}` },
-        { id: 'ef_image_url',   title: 'Image URL',   description: `Current: ${item.image_url || 'none'}` },
+        { id: 'ef_name',         title: 'Name',         description: `Current: ${item.name.slice(0, 40)}` },
+        { id: 'ef_price',        title: 'Price',        description: `Current: ₦${item.price.toFixed(2)}` },
+        { id: 'ef_description',  title: 'Description',  description: `Current: ${(item.description || '(none)').slice(0, 40)}` },
+        { id: 'ef_image_url',    title: 'Image URL',    description: `Current: ${(item.image_url || '(none)').slice(0, 40)}` },
+        { id: 'ef_availability', title: 'Availability', description: `Currently ${availLabel}` },
+        { id: 'ef_category',     title: 'Category',     description: 'Move to a different category' },
       ],
     }],
     env
@@ -638,13 +668,74 @@ async function handleEditItemField(phone, msg, session, env) {
     ef_description: 'description',
     ef_image_url:   'image_url',
   };
+
+  // Availability: toggle immediately, no value step needed
+  if (msg.id === 'ef_availability') {
+    const item = await getMenuItem(session.adminCtx.editItemId, env);
+    if (!item) return sendText(phone, '⚠️ Item not found.', env);
+    const newVal = item.is_available ? 0 : 1;
+    await updateMenuItem(item.id, { is_available: newVal }, env);
+    await bustMenuCache(env);
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    const label = newVal ? '✅ Available' : '❌ Unavailable';
+    return sendButtons(
+      phone,
+      `✅ *${item.name}* is now *${label}*.`,
+      [
+        { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+        { id: 'admin_home',      title: '🔧 Admin Menu'        },
+      ],
+      env
+    );
+  }
+
+  // Category: show category list, process selection in admin_edit_item_value
+  if (msg.id === 'ef_category') {
+    session.adminCtx.editField = 'category_id';
+    session.state = 'admin_edit_item_value';
+    await saveSession(phone, session, env);
+    const cats = await getCategories(env);
+    if (!cats.length) {
+      return sendButtons(
+        phone,
+        '⚠️ No categories exist yet.',
+        [{ id: 'admin_add_cat', title: '➕ Create Category' }],
+        env
+      );
+    }
+    const rows = cats.map(c => ({ id: `ecat_${c.id}`, title: c.name }));
+    return sendList(
+      phone,
+      '📂 Choose a new *category*:',
+      'Select Category',
+      [{ title: 'Categories', rows }],
+      env
+    );
+  }
+
   const field = fieldMap[msg.id];
   if (!field) {
-    // User typed text instead of selecting from list - show helpful message
-    return sendText(
+    // User typed text instead of selecting from list — re-show field picker
+    const item = await getMenuItem(session.adminCtx.editItemId, env);
+    if (!item) return sendText(phone, '⚠️ Item not found.', env);
+    const availLabel = item.is_available ? '✅ Available' : '❌ Unavailable';
+    return sendList(
       phone,
-      '⚠️ Please tap a button above to choose which field to edit.\n\n' +
-      'Send *CANCEL* to abort.',
+      `✏️ Editing *${item.name}*\nPlease tap a field to edit:\n\nSend *CANCEL* to abort.`,
+      'Edit Field',
+      [{
+        title: 'Fields',
+        rows: [
+          { id: 'ef_name',         title: 'Name',         description: `Current: ${item.name.slice(0, 40)}` },
+          { id: 'ef_price',        title: 'Price',        description: `Current: ₦${item.price.toFixed(2)}` },
+          { id: 'ef_description',  title: 'Description',  description: `Current: ${(item.description || '(none)').slice(0, 40)}` },
+          { id: 'ef_image_url',    title: 'Image URL',    description: `Current: ${(item.image_url || '(none)').slice(0, 40)}` },
+          { id: 'ef_availability', title: 'Availability', description: `Currently ${availLabel}` },
+          { id: 'ef_category',     title: 'Category',     description: 'Move to a different category' },
+        ],
+      }],
       env
     );
   }
@@ -654,10 +745,10 @@ async function handleEditItemField(phone, msg, session, env) {
   await saveSession(phone, session, env);
 
   const prompts = {
-    name:        'Enter the new *name*:',
-    price:       'Enter the new *price* (e.g. 12.99):',
-    description: 'Enter the new *description*:',
-    image_url:   'Enter the new *image URL* (must be https://):',
+    name:        'Enter the new *name*:\n\nSend *CANCEL* to abort.',
+    price:       'Enter the new *price* (e.g. 12.99):\n\nSend *CANCEL* to abort.',
+    description: 'Enter the new *description*:\n\nSend *CANCEL* to abort.',
+    image_url:   'Enter the new *image URL* (must start with https://):\n\nSend *CANCEL* to abort.',
   };
   return sendText(phone, prompts[field], env);
 }
@@ -669,6 +760,33 @@ async function handleEditItemValue(phone, msg, session, env) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
     return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
+
+  // Category edit: handle list_reply from the category picker
+  if (editField === 'category_id') {
+    if (msg.id?.startsWith('ecat_')) {
+      const catId = parseInt(msg.id.replace('ecat_', ''), 10);
+      const cat = await getCategories(env).then(cats => cats.find(c => c.id === catId));
+      if (!cat) return sendText(phone, '⚠️ Category not found. Please select again.', env);
+      await updateMenuItem(editItemId, { category_id: catId }, env);
+      await bustMenuCache(env);
+      session.state    = 'admin_idle';
+      session.adminCtx = {};
+      await saveSession(phone, session, env);
+      return sendButtons(
+        phone,
+        `✅ Category updated → *${cat.name}*`,
+        [
+          { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+          { id: 'admin_home',      title: '🔧 Admin Menu'        },
+        ],
+        env
+      );
+    }
+    // Invalid reply — re-show category list
+    const cats = await getCategories(env);
+    const rows = cats.map(c => ({ id: `ecat_${c.id}`, title: c.name }));
+    return sendList(phone, '📂 Choose a new *category*:', 'Select Category', [{ title: 'Categories', rows }], env);
   }
 
   // Handle CANCEL
@@ -728,10 +846,14 @@ async function handleEditItemValue(phone, msg, session, env) {
   session.adminCtx = {};
   await saveSession(phone, session, env);
 
+  const displayVal = editField === 'price' ? `₦${Number(value).toFixed(2)}` : String(value).slice(0, 40);
   return sendButtons(
     phone,
-    `✅ Item updated! *${editField}* → ${value}`,
-    [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+    `✅ *${editField}* updated → ${displayVal}`,
+    [
+      { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+      { id: 'admin_home',      title: '🔧 Admin Menu'        },
+    ],
     env
   );
 }
@@ -745,7 +867,12 @@ async function startDeleteFlow(phone, session, env) {
   const items = await getAllMenuItems(env);
 
   if (!items.length) {
-    return sendText(phone, '📭 No items to delete.', env);
+    return sendButtons(
+      phone,
+      '📭 No items to delete. Add one first.',
+      [{ id: 'admin_add_item', title: '➕ Add Item' }],
+      env
+    );
   }
 
   // BUG-21: show count when truncated
@@ -833,7 +960,12 @@ async function startToggleFlow(phone, session, env) {
   const items = await getAllMenuItems(env);
 
   if (!items.length) {
-    return sendText(phone, '📭 No items in menu yet.', env);
+    return sendButtons(
+      phone,
+      '📭 No items in menu yet. Add one first.',
+      [{ id: 'admin_add_item', title: '➕ Add Item' }],
+      env
+    );
   }
 
   const visible = items.slice(0, 10);
@@ -950,7 +1082,8 @@ async function handleAdminOrdersList(phone, msg, session, env) {
     return sendText(phone, '📦 Enter the *Order ID* to update:', env);
   }
 
-  session.state = 'admin_idle';
+  session.state    = 'admin_idle';
+  session.adminCtx = {};
   await saveSession(phone, session, env);
   return showAdminMenu(phone, env);
 }
@@ -1303,6 +1436,9 @@ async function handleBulkOrdersConfirm(phone, msg, session, env) {
     return executeBulkOrders(phone, session, env);
   }
 
+  session.state    = 'admin_idle';
+  session.adminCtx = {};
+  await saveSession(phone, session, env);
   return showAdminMenu(phone, env);
 }
 
