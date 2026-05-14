@@ -169,6 +169,11 @@ async function handleAdminIdle(phone, msg, session, env) {
     await saveSession(phone, session, env);
     return sendText(phone, '📂 Enter the new *category name*:', env);
   }
+  if (id === 'admin_add_another_cat') {
+    session.state = 'admin_add_category';
+    await saveSession(phone, session, env);
+    return sendText(phone, '📂 Enter the new *category name*:', env);
+  }
   if (id === 'admin_edit_item')   return startEditFlow(phone, session, env);
   if (id === 'admin_delete_item') return startDeleteFlow(phone, session, env);
   if (id === 'admin_toggle_item') return startToggleFlow(phone, session, env);
@@ -267,12 +272,14 @@ async function handleAddCategory(phone, msg, session, env) {
       'INSERT INTO MenuCategories (name) VALUES (?)'
     ).bind(name).run();
     await bustMenuCache(env);
-    session.state = 'admin_idle';
-    await saveSession(phone, session, env);
+    // Keep state as admin_add_category to allow adding multiple categories
     return sendButtons(
       phone,
       `✅ Category *${name}* created!`,
-      [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+      [
+        { id: 'admin_add_another_cat', title: '➕ Add Another Category' },
+        { id: 'admin_home', title: '🔧 Admin Menu' },
+      ],
       env
     );
   } catch (err) {
