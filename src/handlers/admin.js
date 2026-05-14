@@ -161,27 +161,34 @@ async function handleAdminIdle(phone, msg, session, env) {
   const id = msg.id || '';
 
   if (id === 'admin_add_item') {
+    console.log('[Admin] Starting Add Item flow');
     session.state    = 'admin_add_item_name';
     session.adminCtx = {};
     await saveSession(phone, session, env);
     return sendText(phone, '➕ *Add New Item*\n\nEnter the item *name*:', env);
   }
   if (id === 'admin_add_cat') {
+    console.log('[Admin] Starting Add Category flow');
     session.state = 'admin_add_category';
     await saveSession(phone, session, env);
     return sendText(phone, '📂 Enter the new *category name*:', env);
   }
   if (id === 'admin_add_another_cat') {
+    console.log('[Admin] Starting Add Another Category flow');
     session.state = 'admin_add_category';
     await saveSession(phone, session, env);
     return sendText(phone, '📂 Enter the new *category name*:', env);
   }
   if (id === 'admin_view_cats') {
+    console.log('[Admin] Starting View Categories flow');
     session.state = 'admin_view_categories';
     await saveSession(phone, session, env);
     return showCategoriesList(phone, session, env);
   }
-  if (id === 'admin_edit_item')   return startEditFlow(phone, session, env);
+  if (id === 'admin_edit_item') {
+    console.log('[Admin] Starting Edit Item flow');
+    return startEditFlow(phone, session, env);
+  }
   if (id === 'admin_delete_item') return startDeleteFlow(phone, session, env);
   if (id === 'admin_toggle_item') return startToggleFlow(phone, session, env);
   if (id === 'admin_view_orders') return viewOrders(phone, session, env);
