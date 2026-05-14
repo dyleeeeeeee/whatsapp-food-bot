@@ -268,12 +268,13 @@ async function handleAddCategory(phone, msg, session, env) {
   }
 
   try {
-    await env.DB.prepare(
+    const result = await env.DB.prepare(
       'INSERT INTO MenuCategories (name) VALUES (?)'
     ).bind(name).run();
+    console.log('[Admin] Category created:', name, 'meta:', result.meta);
     await bustMenuCache(env);
     // Keep state as admin_add_category to allow adding multiple categories
-    return sendButtons(
+    const response = await sendButtons(
       phone,
       `✅ Category *${name}* created!`,
       [
@@ -282,6 +283,8 @@ async function handleAddCategory(phone, msg, session, env) {
       ],
       env
     );
+    console.log('[Admin] Confirmation sent for category:', name);
+    return response;
   } catch (err) {
     // BUG-20 FIX: Inspect error to distinguish duplicate-name from DB failure
     const msg2 = err?.message || '';
