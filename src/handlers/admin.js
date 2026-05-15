@@ -44,6 +44,11 @@ import {
   bulkUpdateOrderStatus, bulkUpdateMenuAvailability,
   getMenuItemsPaginated, getActiveOrdersPaginated,
   logBulkAction,
+  bulkDeleteMenuItems, bulkCreateMenuItems, bulkEditMenuItems,
+  getCategoryById, updateCategory,
+  bulkCreateCategories, bulkDeleteCategoriesWithItems,
+  moveAllItemsFromCategory, bulkMoveItemsToCategory,
+  getItemCountsByCategory,
 } from '../db.js';
 import { sanitize, isValidHttpsUrl } from '../security.js';
 
@@ -107,14 +112,37 @@ export async function handleAdminMessage(phone, msg, env) {
     case 'admin_update_status_value': return handleUpdateStatusValue(phone, msg, session, env);
     case 'admin_update_status_confirm': return handleUpdateStatusConfirm(phone, msg, session, env);
     
-    // Bulk Actions
-    case 'admin_bulk_menu':           return handleBulkMenu(phone, msg, session, env);
-    case 'admin_bulk_orders_action':  return handleBulkOrdersAction(phone, msg, session, env);
-    case 'admin_bulk_orders_select':  return handleBulkOrdersSelect(phone, msg, session, env);
-    case 'admin_bulk_orders_confirm': return handleBulkOrdersConfirm(phone, msg, session, env);
-    case 'admin_bulk_items_action':   return handleBulkItemsAction(phone, msg, session, env);
-    case 'admin_bulk_items_select':   return handleBulkItemsSelect(phone, msg, session, env);
-    case 'admin_bulk_items_confirm':  return handleBulkItemsConfirm(phone, msg, session, env);
+    // Bulk Actions — Orders
+    case 'admin_bulk_menu':                  return handleBulkMenu(phone, msg, session, env);
+    case 'admin_bulk_orders_action':         return handleBulkOrdersAction(phone, msg, session, env);
+    case 'admin_bulk_orders_select':         return handleBulkOrdersSelect(phone, msg, session, env);
+    case 'admin_bulk_orders_confirm':        return handleBulkOrdersConfirm(phone, msg, session, env);
+    // Bulk Actions — Items (legacy availability toggle)
+    case 'admin_bulk_items_action':          return handleBulkItemsAction(phone, msg, session, env);
+    case 'admin_bulk_items_select':          return handleBulkItemsSelect(phone, msg, session, env);
+    case 'admin_bulk_items_confirm':         return handleBulkItemsConfirm(phone, msg, session, env);
+    // Bulk Actions — Items (add/remove/edit)
+    case 'admin_bulk_items_add_paste':       return handleBulkItemsAddPaste(phone, msg, session, env);
+    case 'admin_bulk_items_add_review':      return handleBulkItemsAddReview(phone, msg, session, env);
+    case 'admin_bulk_items_remove_select':   return handleBulkItemsRemoveSelect(phone, msg, session, env);
+    case 'admin_bulk_items_remove_confirm':  return handleBulkItemsRemoveConfirm(phone, msg, session, env);
+    case 'admin_bulk_items_edit_action':     return handleBulkItemsEditAction(phone, msg, session, env);
+    case 'admin_bulk_items_edit_value':      return handleBulkItemsEditValue(phone, msg, session, env);
+    case 'admin_bulk_items_edit_select':     return handleBulkItemsEditSelect(phone, msg, session, env);
+    case 'admin_bulk_items_edit_confirm':    return handleBulkItemsEditConfirm(phone, msg, session, env);
+    // Bulk Actions — Categories
+    case 'admin_bulk_cats_type':             return handleBulkCatsType(phone, msg, session, env);
+    case 'admin_bulk_cats_add_paste':        return handleBulkCatsAddPaste(phone, msg, session, env);
+    case 'admin_bulk_cats_add_review':       return handleBulkCatsAddReview(phone, msg, session, env);
+    case 'admin_bulk_cats_rename_select':    return handleBulkCatsRenameSelect(phone, msg, session, env);
+    case 'admin_bulk_cats_rename_value':     return handleBulkCatsRenameValue(phone, msg, session, env);
+    case 'admin_bulk_cats_delete_select':    return handleBulkCatsDeleteSelect(phone, msg, session, env);
+    case 'admin_bulk_cats_delete_mode':      return handleBulkCatsDeleteMode(phone, msg, session, env);
+    case 'admin_bulk_cats_delete_target':    return handleBulkCatsDeleteTarget(phone, msg, session, env);
+    case 'admin_bulk_cats_delete_confirm':   return handleBulkCatsDeleteConfirm(phone, msg, session, env);
+    case 'admin_bulk_cats_move_source':      return handleBulkCatsMoveSource(phone, msg, session, env);
+    case 'admin_bulk_cats_move_target':      return handleBulkCatsMoveTarget(phone, msg, session, env);
+    case 'admin_bulk_cats_move_confirm':     return handleBulkCatsMoveConfirm(phone, msg, session, env);
 
     default:
       session.state = 'admin_idle';
@@ -189,6 +217,11 @@ async function handleAdminIdle(phone, msg, session, env) {
   }
   if (id === 'admin_bulk_menu') {
     return showBulkMenu(phone, session, env);
+  }
+
+  // Route any bulk_* re-entry buttons (from success screens) through handleBulkMenu
+  if (id.startsWith('bulk_')) {
+    return handleBulkMenu(phone, msg, session, env);
   }
 
   return showAdminMenu(phone, env);
@@ -1235,57 +1268,122 @@ function statusMessage(orderId, status) {
 
 async function showBulkMenu(phone, session, env) {
   session.state = 'admin_bulk_menu';
-  session.adminCtx.bulk = {}; // Clear context
+  session.adminCtx.bulk = {};
   await saveSession(phone, session, env);
 
   return sendList(
     phone,
-    '🏗️ *Bulk Actions*\nChoose a domain to manage in bulk:',
-    'Choose Domain',
-    [{
-      title: 'Bulk Domains',
-      rows: [
-        { id: 'bulk_orders', title: 'Bulk Orders', description: 'Update status of multiple orders' },
-        { id: 'bulk_items',  title: 'Bulk Menu',   description: 'Toggle availability of multiple items' },
-      ]
-    }],
+    '🏗️ *Bulk Actions*\nChoose an action to perform on multiple records:',
+    'Choose Action',
+    [
+      {
+        title: 'Menu Items',
+        rows: [
+          { id: 'bulk_items_add',    title: '➕ Add Items',       description: 'Paste multiple items at once' },
+          { id: 'bulk_items_remove', title: '🗑️ Remove Items',    description: 'Delete multiple items' },
+          { id: 'bulk_items_edit',   title: '✏️ Edit Items',      description: 'Price, category, availability…' },
+        ],
+      },
+      {
+        title: 'Categories',
+        rows: [
+          { id: 'bulk_cats_add',    title: '📂 Add Categories', description: 'Create multiple categories' },
+          { id: 'bulk_cats_rename', title: '✏️ Rename Category', description: 'Change a category name' },
+          { id: 'bulk_cats_delete', title: '🗑️ Delete Category', description: 'Remove with item safety' },
+          { id: 'bulk_cats_move',   title: '🔀 Move Items',      description: 'Move items between categories' },
+        ],
+      },
+      {
+        title: 'Orders',
+        rows: [
+          { id: 'bulk_orders', title: '📦 Update Status', description: 'Set status on multiple orders' },
+        ],
+      },
+    ],
     env
   );
 }
 
 async function handleBulkMenu(phone, msg, session, env) {
-  if (msg.id === 'bulk_orders') {
-    session.state = 'admin_bulk_orders_action';
-    session.adminCtx.bulk = { type: 'orders', selectedIds: [], page: 0 };
-    await saveSession(phone, session, env);
+  const id = msg.id;
 
-    const rows = VALID_STATUSES.map(s => ({ id: `ba_os_${s}`, title: s.toUpperCase() }));
-    return sendList(
-      phone,
-      '📦 *Bulk Orders*\nWhich status do you want to apply to multiple orders?',
-      'Choose Status',
-      [{ title: 'Statuses', rows }],
-      env
-    );
+  // ── Items: Add ──────────────────────────────────────────────
+  if (id === 'bulk_items_add') {
+    session.state = 'admin_bulk_items_add_paste';
+    session.adminCtx.bulk = { type: 'menu_items', action: 'add' };
+    await saveSession(phone, session, env);
+    return showBulkItemAddTemplate(phone, env);
   }
 
-  if (msg.id === 'bulk_items') {
+  // ── Items: Remove ────────────────────────────────────────────
+  if (id === 'bulk_items_remove') {
+    session.state = 'admin_bulk_items_remove_select';
+    session.adminCtx.bulk = { type: 'menu_items', action: 'remove', selectedIds: [], page: 0 };
+    await saveSession(phone, session, env);
+    return showBulkItemsRemoveList(phone, session, env);
+  }
+
+  // ── Items: Edit ──────────────────────────────────────────────
+  if (id === 'bulk_items_edit') {
+    session.state = 'admin_bulk_items_edit_action';
+    session.adminCtx.bulk = { type: 'menu_items', action: 'edit', selectedIds: [], page: 0 };
+    await saveSession(phone, session, env);
+    return showBulkItemsEditActionMenu(phone, env);
+  }
+
+  // ── Legacy: availability-only shortcut ───────────────────────
+  if (id === 'bulk_items') {
     session.state = 'admin_bulk_items_action';
     session.adminCtx.bulk = { type: 'menu_items', selectedIds: [], page: 0 };
     await saveSession(phone, session, env);
-
-    return sendButtons(
-      phone,
-      '🍽️ *Bulk Menu*\nWhat do you want to do with multiple items?',
-      [
-        { id: 'ba_mi_avail', title: 'Mark Available' },
-        { id: 'ba_mi_unavail', title: 'Mark Unavail.' },
-        { id: 'admin_home', title: '❌ Cancel' }
-      ],
-      env
-    );
+    return sendButtons(phone, '🍽️ *Bulk Menu*\nWhat do you want to do?',
+      [{ id: 'ba_mi_avail', title: 'Mark Available' }, { id: 'ba_mi_unavail', title: 'Mark Unavail.' }, { id: 'admin_home', title: '❌ Cancel' }], env);
   }
 
+  // ── Categories ───────────────────────────────────────────────
+  if (id === 'bulk_cats_add') {
+    session.state = 'admin_bulk_cats_add_paste';
+    session.adminCtx.bulk = { type: 'categories', action: 'add' };
+    await saveSession(phone, session, env);
+    return showBulkCatAddTemplate(phone, env);
+  }
+  if (id === 'bulk_cats_rename') {
+    session.state = 'admin_bulk_cats_rename_select';
+    session.adminCtx.bulk = { type: 'categories', action: 'rename' };
+    await saveSession(phone, session, env);
+    return showBulkCatsRenameList(phone, env);
+  }
+  if (id === 'bulk_cats_delete') {
+    session.state = 'admin_bulk_cats_delete_select';
+    session.adminCtx.bulk = { type: 'categories', action: 'delete', selectedIds: [] };
+    await saveSession(phone, session, env);
+    return showBulkCatsDeleteList(phone, session, env);
+  }
+  if (id === 'bulk_cats_move') {
+    session.state = 'admin_bulk_cats_move_source';
+    session.adminCtx.bulk = { type: 'categories', action: 'move' };
+    await saveSession(phone, session, env);
+    return showBulkCatsMoveSourceList(phone, env);
+  }
+
+  // ── Orders ────────────────────────────────────────────────────
+  if (id === 'bulk_orders') {
+    session.state = 'admin_bulk_orders_action';
+    session.adminCtx.bulk = { type: 'orders', selectedIds: [], page: 0 };
+    await saveSession(phone, session, env);
+    const rows = VALID_STATUSES.map(s => ({ id: `ba_os_${s}`, title: s.toUpperCase() }));
+    return sendList(phone, '📦 *Bulk Orders*\nWhich status to apply?', 'Choose Status', [{ title: 'Statuses', rows }], env);
+  }
+
+  // ── admin_bulk_menu re-entry button ───────────────────────────
+  if (id === 'admin_bulk_menu') return showBulkMenu(phone, session, env);
+
+  return showBulkMenu(phone, session, env);
+}
+
+// Stub dispatcher: used by existing handleAdminIdle for admin_bulk_menu button
+// (already handled above — kept for clarity)
+async function handleBulkCatsType(phone, msg, session, env) {
   return showBulkMenu(phone, session, env);
 }
 
@@ -1644,7 +1742,6 @@ async function handleBulkItemsConfirm(phone, msg, session, env) {
       await bulkUpdateMenuAvailability(bulk.selectedIds, isAvail, env);
       await bustMenuCache(env);
 
-      // Audit Log
       const logId = await logBulkAction({
         adminPhone: phone,
         actionType: 'set_availability',
@@ -1674,4 +1771,1168 @@ async function handleBulkItemsConfirm(phone, msg, session, env) {
   }
 
   return showBulkItemsList(phone, session, env);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Parser Helpers
+// ─────────────────────────────────────────────────────────────
+
+function parseBulkItemPaste(rawText, categories, existingNames) {
+  const catByName = {};
+  for (const c of categories) catByName[c.name.toLowerCase()] = c;
+  const existingLower = new Set((existingNames || []).map(n => n.toLowerCase()));
+  const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const valid = [];
+  const errors = [];
+  const seenNames = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const parts = lines[i].split('|').map(p => p.trim());
+    const lineNum = i + 1;
+    const rowErrors = [];
+    const name = sanitize(parts[0] || '', 100);
+    const categoryRaw = parts[1] || '';
+    const priceRaw = parts[2] || '';
+    const description = sanitize(parts[3] || '', 300);
+    const imageUrl = (parts[4] || '').trim();
+    const availableRaw = (parts[5] || 'yes').trim().toLowerCase();
+
+    if (name.length < 2) rowErrors.push('name must be ≥2 chars');
+    const cat = catByName[categoryRaw.toLowerCase()];
+    if (!categoryRaw) rowErrors.push('category required');
+    else if (!cat) rowErrors.push(`category "${categoryRaw.slice(0, 20)}" not found`);
+    const price = parseFloat(priceRaw);
+    if (!priceRaw) rowErrors.push('price required');
+    else if (isNaN(price) || price < 0) rowErrors.push('invalid price');
+    else if (price > MAX_PRICE) rowErrors.push(`price exceeds max`);
+    if (imageUrl && !isValidHttpsUrl(imageUrl)) rowErrors.push('image URL must be https://');
+    if (name.length >= 2 && existingLower.has(name.toLowerCase())) rowErrors.push('already exists in menu');
+    if (name.length >= 2 && seenNames.has(name.toLowerCase())) rowErrors.push('duplicate in paste');
+    seenNames.add(name.toLowerCase());
+
+    const isAvailable = !['no', 'false', '0', 'unavailable'].includes(availableRaw);
+    if (rowErrors.length > 0) {
+      errors.push({ line: lineNum, text: lines[i].slice(0, 50), reasons: rowErrors });
+    } else {
+      valid.push({ name, categoryId: cat.id, categoryName: cat.name, price, description, imageUrl, isAvailable });
+    }
+  }
+  return { valid, errors, total: lines.length };
+}
+
+function parseBulkCategoryPaste(rawText, existingCategories) {
+  const existingLower = new Set(existingCategories.map(c => c.name.toLowerCase()));
+  const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const valid = [];
+  const errors = [];
+  const seenNames = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const parts = lines[i].split('|').map(p => p.trim());
+    const lineNum = i + 1;
+    const rowErrors = [];
+    const name = sanitize(parts[0] || '', 50);
+    const sortOrderRaw = parts[1] ? parts[1].trim() : '';
+    const sortOrder = sortOrderRaw ? parseInt(sortOrderRaw, 10) : 0;
+
+    if (name.length < 2) rowErrors.push('name must be ≥2 chars');
+    if (sortOrderRaw && isNaN(sortOrder)) rowErrors.push('sort order must be a number');
+    if (name.length >= 2 && existingLower.has(name.toLowerCase())) rowErrors.push('already exists');
+    if (name.length >= 2 && seenNames.has(name.toLowerCase())) rowErrors.push('duplicate in paste');
+    seenNames.add(name.toLowerCase());
+
+    if (rowErrors.length > 0) {
+      errors.push({ line: lineNum, text: lines[i].slice(0, 50), reasons: rowErrors });
+    } else {
+      valid.push({ name, sortOrder: isNaN(sortOrder) ? 0 : sortOrder });
+    }
+  }
+  return { valid, errors, total: lines.length };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Items — Add (paste flow)
+// ─────────────────────────────────────────────────────────────
+
+async function showBulkItemAddTemplate(phone, env) {
+  return sendText(
+    phone,
+    '📋 *Bulk Add Items*\n\n' +
+    'Paste items below, one per line:\n' +
+    '*Format:* Name | Category | Price | Description | Image URL | Available\n\n' +
+    '*Examples:*\n' +
+    'Jollof Rice | Main Dishes | 1500 | Rich tomato rice\n' +
+    'Fried Chicken | Main | 2000 | Crispy | | no\n' +
+    'Suya | Grills | 800\n\n' +
+    '*Rules:*\n' +
+    '• Name & Category are required\n' +
+    '• Category must already exist\n' +
+    '• Price: number (e.g. 850 or 1200.50)\n' +
+    '• Available: yes/no (default: yes)\n' +
+    '• Image URL must start with https://\n\n' +
+    'Send *CANCEL* to abort.',
+    env
+  );
+}
+
+async function handleBulkItemsAddPaste(phone, msg, session, env) {
+  if (!msg.text || msg.type === 'button_reply' || msg.type === 'list_reply') {
+    return showBulkItemAddTemplate(phone, env);
+  }
+  const rawText = msg.text.trim();
+  if (rawText.length < 3) return showBulkItemAddTemplate(phone, env);
+
+  const [categories, allItems] = await Promise.all([getCategories(env), getAllMenuItems(env)]);
+  const existingNames = allItems.map(i => i.name);
+  const parsed = parseBulkItemPaste(rawText, categories, existingNames);
+
+  if (parsed.total === 0) return showBulkItemAddTemplate(phone, env);
+
+  session.adminCtx.bulk.parsedItems = parsed.valid;
+  session.adminCtx.bulk.parseErrors = parsed.errors;
+  session.state = 'admin_bulk_items_add_review';
+  await saveSession(phone, session, env);
+
+  let previewMsg = `📋 *Bulk Add Preview*\n\nTotal lines: ${parsed.total} | ✅ ${parsed.valid.length} valid | ❌ ${parsed.errors.length} invalid\n\n`;
+
+  if (parsed.valid.length > 0) {
+    const preview = parsed.valid.slice(0, 5).map(i => `• *${i.name}* (${i.categoryName}, ₦${i.price.toFixed(2)})`).join('\n');
+    previewMsg += `*Items to add:*\n${preview}`;
+    if (parsed.valid.length > 5) previewMsg += `\n_…and ${parsed.valid.length - 5} more_`;
+  }
+
+  if (parsed.errors.length > 0) {
+    const errPreview = parsed.errors.slice(0, 3).map(e => `Line ${e.line}: ${e.reasons[0]}`).join('\n');
+    previewMsg += `\n\n*Skipped lines:*\n${errPreview}`;
+    if (parsed.errors.length > 3) previewMsg += `\n_…and ${parsed.errors.length - 3} more_`;
+  }
+
+  if (previewMsg.length > 900) previewMsg = previewMsg.slice(0, 897) + '…';
+
+  if (parsed.valid.length === 0) {
+    return sendButtons(
+      phone,
+      previewMsg + '\n\n⚠️ No valid items found. Fix errors and re-paste.',
+      [
+        { id: 'bulk_repaste', title: '🔄 Re-paste' },
+        { id: 'admin_bulk_menu', title: '⬅️ Bulk Menu' },
+      ],
+      env
+    );
+  }
+
+  return sendButtons(
+    phone,
+    previewMsg,
+    [
+      { id: 'bulk_items_add_confirm', title: `✅ Add ${parsed.valid.length} Items` },
+      { id: 'bulk_repaste',           title: '🔄 Re-paste'                         },
+    ],
+    env
+  );
+}
+
+async function handleBulkItemsAddReview(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bulk_repaste' || msg.text) {
+    session.state = 'admin_bulk_items_add_paste';
+    await saveSession(phone, session, env);
+    return showBulkItemAddTemplate(phone, env);
+  }
+
+  if (msg.id === 'bulk_items_add_confirm') {
+    const items = bulk.parsedItems || [];
+    if (!items.length) {
+      session.state = 'admin_bulk_items_add_paste';
+      await saveSession(phone, session, env);
+      return showBulkItemAddTemplate(phone, env);
+    }
+
+    let successCount = 0;
+    let failureCount = 0;
+    const failureDetails = [];
+
+    for (const item of items) {
+      try {
+        const dup = await env.DB.prepare('SELECT id FROM MenuItems WHERE LOWER(name) = LOWER(?)').bind(item.name).first();
+        if (dup) {
+          failureDetails.push({ name: item.name, error: 'duplicate' });
+          failureCount++;
+        } else {
+          await createMenuItem({ categoryId: item.categoryId, name: item.name, description: item.description, price: item.price, imageUrl: item.imageUrl }, env);
+          successCount++;
+        }
+      } catch (err) {
+        failureCount++;
+        failureDetails.push({ name: item.name, error: err.message?.slice(0, 40) });
+      }
+    }
+
+    if (successCount > 0) await bustMenuCache(env);
+
+    const logId = await logBulkAction({
+      adminPhone: phone, actionType: 'bulk_add', targetType: 'menu_items',
+      selectedIds: [], successCount, failureCount, skippedCount: 0, failureDetails,
+    }, env);
+
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+
+    let summary = `✅ *Bulk Add Complete*\n\nAdded: ${successCount}\nFailed: ${failureCount}\nLog ID: ${logId}`;
+    if (failureDetails.length) summary += `\n\n*Failures:*\n` + failureDetails.slice(0, 3).map(f => `• ${f.name}: ${f.error}`).join('\n');
+    if (summary.length > 900) summary = summary.slice(0, 897) + '…';
+
+    return sendButtons(
+      phone, summary,
+      [
+        { id: 'bulk_items_add', title: '➕ Add More Items' },
+        { id: 'admin_bulk_menu', title: '📦 Bulk Actions'  },
+      ],
+      env
+    );
+  }
+
+  const n = (bulk.parsedItems || []).length;
+  return sendButtons(
+    phone,
+    `📋 Ready to add *${n}* valid items. Confirm or re-paste.`,
+    [
+      { id: 'bulk_items_add_confirm', title: `✅ Add ${n} Items` },
+      { id: 'bulk_repaste',           title: '🔄 Re-paste'       },
+    ],
+    env
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Items — Remove (paginated selection)
+// ─────────────────────────────────────────────────────────────
+
+const BULK_PAGE_SIZE = 7; // 7 items + up to 3 control rows = ≤10 per section
+
+async function showBulkItemsRemoveList(phone, session, env) {
+  const { bulk } = session.adminCtx;
+  const offset = bulk.page * BULK_PAGE_SIZE;
+  const { items, total } = await getMenuItemsPaginated(env, BULK_PAGE_SIZE, offset);
+
+  if (!items.length && bulk.page === 0) {
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(phone, '📭 No menu items to remove.', [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  }
+
+  const rows = items.map(i => ({
+    id: `bsr_${i.id}`,
+    title: `${bulk.selectedIds.includes(i.id) ? '✅' : '⬜'} ${i.name}`.slice(0, 24),
+    description: `${i.is_available ? 'Available' : 'Unavailable'} | ₦${i.price.toFixed(2)}`,
+  }));
+
+  if (bulk.page > 0) rows.push({ id: 'bulk_page_prev', title: '⬅️ Prev Page' });
+  if (offset + BULK_PAGE_SIZE < total) rows.push({ id: 'bulk_page_next', title: '➡️ Next Page' });
+  rows.push({ id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length} sel.)`, description: 'Proceed to review' });
+
+  const footer = `Page ${bulk.page + 1}/${Math.ceil(total / BULK_PAGE_SIZE)} | ${bulk.selectedIds.length} selected`;
+  return sendList(phone, `🗑️ *Remove Items*\nTap to select/deselect.\n${footer}`, 'Select Items', [{ title: 'Menu Items', rows }], env);
+}
+
+async function handleBulkItemsRemoveSelect(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bulk_page_next') { bulk.page++; await saveSession(phone, session, env); return showBulkItemsRemoveList(phone, session, env); }
+  if (msg.id === 'bulk_page_prev') { bulk.page = Math.max(0, bulk.page - 1); await saveSession(phone, session, env); return showBulkItemsRemoveList(phone, session, env); }
+
+  if (msg.id?.startsWith('bsr_')) {
+    const itemId = parseInt(msg.id.replace('bsr_', ''), 10);
+    const idx = bulk.selectedIds.indexOf(itemId);
+    if (idx > -1) bulk.selectedIds.splice(idx, 1); else bulk.selectedIds.push(itemId);
+    await saveSession(phone, session, env);
+    return showBulkItemsRemoveList(phone, session, env);
+  }
+
+  if (msg.id === 'bulk_review') {
+    if (!bulk.selectedIds.length) return sendText(phone, '⚠️ Select at least one item first.', env);
+    const allItems = await getAllMenuItems(env);
+    const selectedItems = allItems.filter(i => bulk.selectedIds.includes(i.id));
+    const nameList = selectedItems.map(i => `• ${i.name}`).slice(0, 8).join('\n');
+    const more = selectedItems.length > 8 ? `\n_…and ${selectedItems.length - 8} more_` : '';
+    session.state = 'admin_bulk_items_remove_confirm';
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `🗑️ *Confirm Delete*\n\nDelete ${selectedItems.length} items? *This cannot be undone.*\n\n${nameList}${more}`,
+      [
+        { id: 'bulk_remove_confirm', title: '🗑️ Yes, Delete All' },
+        { id: 'bulk_back_select',    title: '⬅️ Back'            },
+      ],
+      env
+    );
+  }
+
+  return sendButtons(
+    phone,
+    `${bulk.selectedIds.length} items selected. Tap items to select, then tap Done.`,
+    [
+      { id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length})` },
+      { id: 'admin_home',  title: '❌ Cancel'                            },
+    ],
+    env
+  );
+}
+
+async function handleBulkItemsRemoveConfirm(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bulk_back_select') {
+    session.state = 'admin_bulk_items_remove_select';
+    await saveSession(phone, session, env);
+    return showBulkItemsRemoveList(phone, session, env);
+  }
+
+  if (msg.id === 'bulk_remove_confirm') {
+    if (!bulk.selectedIds.length) {
+      session.state = 'admin_idle'; session.adminCtx = {};
+      await saveSession(phone, session, env);
+      return sendText(phone, '⚠️ No items selected.', env);
+    }
+
+    const deleted = await bulkDeleteMenuItems(bulk.selectedIds, env);
+    if (deleted > 0) await bustMenuCache(env);
+
+    const logId = await logBulkAction({
+      adminPhone: phone, actionType: 'bulk_delete', targetType: 'menu_items',
+      selectedIds: bulk.selectedIds, successCount: deleted,
+      failureCount: bulk.selectedIds.length - deleted, skippedCount: 0, failureDetails: [],
+    }, env);
+
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+
+    return sendButtons(
+      phone,
+      `✅ *Bulk Delete Complete*\n\nDeleted: ${deleted}\nSkipped (not found): ${bulk.selectedIds.length - deleted}\nLog ID: ${logId}`,
+      [
+        { id: 'bulk_items_remove', title: '🗑️ Remove More' },
+        { id: 'admin_bulk_menu',   title: '📦 Bulk Actions' },
+      ],
+      env
+    );
+  }
+
+  return sendButtons(
+    phone,
+    `🗑️ Confirm delete of ${bulk.selectedIds.length} items?`,
+    [
+      { id: 'bulk_remove_confirm', title: '🗑️ Yes, Delete All' },
+      { id: 'bulk_back_select',    title: '⬅️ Back'            },
+    ],
+    env
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Items — Edit (action → value → select → confirm)
+// ─────────────────────────────────────────────────────────────
+
+async function showBulkItemsEditActionMenu(phone, env) {
+  return sendList(
+    phone,
+    '✏️ *Bulk Edit Items*\n\nChoose what to change across selected items:',
+    'Choose Edit',
+    [{
+      title: 'Edit Type',
+      rows: [
+        { id: 'ba_ie_set_avail',   title: 'Mark Available',   description: 'Enable all selected items' },
+        { id: 'ba_ie_set_unavail', title: 'Mark Unavailable', description: 'Disable all selected items' },
+        { id: 'ba_ie_set_price',   title: 'Set Exact Price',  description: 'Set one price for all' },
+        { id: 'ba_ie_adj_price',   title: 'Adjust Price',     description: 'Increase or decrease price' },
+        { id: 'ba_ie_move_cat',    title: 'Move to Category', description: 'Reassign to a new category' },
+        { id: 'ba_ie_set_desc',    title: 'Set Description',  description: 'Replace description text' },
+        { id: 'ba_ie_set_img',     title: 'Set Image URL',    description: 'Apply one URL to all items' },
+        { id: 'ba_ie_clear_img',   title: 'Clear Image URLs', description: 'Remove all images' },
+      ],
+    }],
+    env
+  );
+}
+
+async function handleBulkItemsEditAction(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+  const id = msg.id;
+
+  // Direct-to-select actions (no value needed)
+  if (id === 'ba_ie_set_avail' || id === 'ba_ie_set_unavail' || id === 'ba_ie_clear_img') {
+    bulk.editAction = id === 'ba_ie_set_avail' ? 'set_avail' : id === 'ba_ie_set_unavail' ? 'set_unavail' : 'clear_img';
+    bulk.selectedIds = [];
+    bulk.page = 0;
+    session.state = 'admin_bulk_items_edit_select';
+    await saveSession(phone, session, env);
+    return showBulkItemsEditList(phone, session, env);
+  }
+
+  // Actions that need a value first
+  if (id === 'ba_ie_set_price' || id === 'ba_ie_adj_price' || id === 'ba_ie_move_cat' || id === 'ba_ie_set_desc' || id === 'ba_ie_set_img') {
+    bulk.editAction = id.replace('ba_ie_', '');
+    session.state = 'admin_bulk_items_edit_value';
+    await saveSession(phone, session, env);
+
+    if (id === 'ba_ie_move_cat') {
+      const cats = await getCategories(env);
+      if (!cats.length) return sendButtons(phone, '⚠️ No categories exist yet.', [{ id: 'admin_add_cat', title: '➕ Create Category' }], env);
+      const rows = cats.map(c => ({ id: `biec_${c.id}`, title: c.name }));
+      return sendList(phone, '📂 *Move Items*\nChoose the *target category*:', 'Select Category', [{ title: 'Categories', rows }], env);
+    }
+    if (id === 'ba_ie_adj_price') {
+      return sendList(phone, '💰 *Adjust Price*\nChoose adjustment type:',
+        'Adj. Type',
+        [{ title: 'Type', rows: [
+          { id: 'ba_adj_inc_fixed', title: 'Increase by ₦', description: 'Add a fixed amount' },
+          { id: 'ba_adj_dec_fixed', title: 'Decrease by ₦', description: 'Subtract a fixed amount' },
+          { id: 'ba_adj_inc_pct',   title: 'Increase by %', description: 'Percentage increase' },
+          { id: 'ba_adj_dec_pct',   title: 'Decrease by %', description: 'Percentage decrease' },
+        ]}],
+        env
+      );
+    }
+    if (id === 'ba_ie_set_price') return sendText(phone, '💰 Enter the *new price* (e.g. 1500):\n\nSend *CANCEL* to abort.', env);
+    if (id === 'ba_ie_set_desc') return sendText(phone, '📝 Enter the *new description* for all selected items:\n\nSend *CANCEL* to abort.', env);
+    if (id === 'ba_ie_set_img') return sendText(phone, '🖼️ Enter the *image URL* (must be https://):\n\nSend *CANCEL* to abort.', env);
+  }
+
+  // Invalid input — re-show action menu
+  return showBulkItemsEditActionMenu(phone, env);
+}
+
+async function handleBulkItemsEditValue(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+  const editAction = bulk.editAction;
+
+  // Category selection
+  if (editAction === 'move_cat') {
+    if (msg.id?.startsWith('biec_')) {
+      const catId = parseInt(msg.id.replace('biec_', ''), 10);
+      const cat = await getCategoryById(catId, env);
+      if (!cat) return sendText(phone, '⚠️ Category not found. Select from the list.', env);
+      bulk.editValue = catId;
+      bulk.editValueLabel = cat.name;
+      bulk.selectedIds = [];
+      bulk.page = 0;
+      session.state = 'admin_bulk_items_edit_select';
+      await saveSession(phone, session, env);
+      return showBulkItemsEditList(phone, session, env);
+    }
+    // Re-show category list
+    const cats = await getCategories(env);
+    const rows = cats.map(c => ({ id: `biec_${c.id}`, title: c.name }));
+    return sendList(phone, '📂 Choose the *target category*:', 'Select Category', [{ title: 'Categories', rows }], env);
+  }
+
+  // Price adjustment type selection
+  if (editAction === 'adj_price' && !bulk.editPriceType) {
+    const adjTypes = { 'ba_adj_inc_fixed': 'inc_fixed', 'ba_adj_dec_fixed': 'dec_fixed', 'ba_adj_inc_pct': 'inc_pct', 'ba_adj_dec_pct': 'dec_pct' };
+    if (adjTypes[msg.id]) {
+      bulk.editPriceType = adjTypes[msg.id];
+      await saveSession(phone, session, env);
+      const isPercent = bulk.editPriceType.includes('pct');
+      return sendText(phone, `💰 Enter the *${isPercent ? 'percentage' : 'amount'}* to ${bulk.editPriceType.includes('inc') ? 'increase' : 'decrease'} by:\n\nExample: ${isPercent ? '10' : '200'}\n\nSend *CANCEL* to abort.`, env);
+    }
+    // Re-show type list
+    return sendList(phone, '💰 Choose adjustment type:', 'Adj. Type',
+      [{ title: 'Type', rows: [
+        { id: 'ba_adj_inc_fixed', title: 'Increase by ₦' },
+        { id: 'ba_adj_dec_fixed', title: 'Decrease by ₦' },
+        { id: 'ba_adj_inc_pct',   title: 'Increase by %' },
+        { id: 'ba_adj_dec_pct',   title: 'Decrease by %' },
+      ]}], env
+    );
+  }
+
+  // Text value input
+  if (!msg.text) {
+    return sendText(phone, '⚠️ Please send a text value to continue.\n\nSend *CANCEL* to abort.', env);
+  }
+
+  if (editAction === 'adj_price' && bulk.editPriceType) {
+    const val = parseFloat(msg.text.trim());
+    if (isNaN(val) || val <= 0) return sendText(phone, '⚠️ Enter a positive number.\n\nSend *CANCEL* to abort.', env);
+    bulk.editValue = val;
+    bulk.editValueLabel = `${bulk.editPriceType.includes('pct') ? val + '%' : '₦' + val.toFixed(2)} ${bulk.editPriceType.includes('inc') ? 'increase' : 'decrease'}`;
+  } else if (editAction === 'set_price') {
+    const p = parseFloat(msg.text.trim());
+    if (isNaN(p) || p < 0) return sendText(phone, '⚠️ Enter a valid price (e.g. 1500).\n\nSend *CANCEL* to abort.', env);
+    if (p > MAX_PRICE) return sendText(phone, `⚠️ Price exceeds maximum ₦${MAX_PRICE}.\n\nSend *CANCEL* to abort.`, env);
+    bulk.editValue = p;
+    bulk.editValueLabel = `₦${p.toFixed(2)}`;
+  } else if (editAction === 'set_desc') {
+    bulk.editValue = sanitize(msg.text.trim(), 300);
+    bulk.editValueLabel = bulk.editValue.slice(0, 40) + (bulk.editValue.length > 40 ? '…' : '');
+  } else if (editAction === 'set_img') {
+    const url = msg.text.trim();
+    if (!isValidHttpsUrl(url)) return sendText(phone, '⚠️ URL must start with *https://*\n\nSend *CANCEL* to abort.', env);
+    bulk.editValue = url;
+    bulk.editValueLabel = url.slice(0, 40) + '…';
+  } else {
+    return sendText(phone, '⚠️ Unexpected input. Send *CANCEL* to abort.', env);
+  }
+
+  bulk.selectedIds = [];
+  bulk.page = 0;
+  session.state = 'admin_bulk_items_edit_select';
+  await saveSession(phone, session, env);
+  return showBulkItemsEditList(phone, session, env);
+}
+
+async function showBulkItemsEditList(phone, session, env) {
+  const { bulk } = session.adminCtx;
+  const offset = bulk.page * BULK_PAGE_SIZE;
+  const { items, total } = await getMenuItemsPaginated(env, BULK_PAGE_SIZE, offset);
+
+  if (!items.length && bulk.page === 0) {
+    session.state = 'admin_idle'; session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(phone, '📭 No items in menu yet.', [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  }
+
+  const actionLabels = { set_avail: 'AVAILABLE', set_unavail: 'UNAVAILABLE', clear_img: 'CLEAR IMAGE', set_price: `price → ${bulk.editValueLabel}`, adj_price: bulk.editValueLabel, move_cat: `→ ${bulk.editValueLabel}`, set_desc: 'SET DESC', set_img: 'SET IMAGE' };
+  const actionLabel = actionLabels[bulk.editAction] || bulk.editAction;
+
+  const rows = items.map(i => ({
+    id: `bie_${i.id}`,
+    title: `${bulk.selectedIds.includes(i.id) ? '✅' : '⬜'} ${i.name}`.slice(0, 24),
+    description: `${i.is_available ? 'Avail' : 'Unavail'} | ₦${i.price.toFixed(2)}`,
+  }));
+
+  if (bulk.page > 0) rows.push({ id: 'bulk_page_prev', title: '⬅️ Prev Page' });
+  if (offset + BULK_PAGE_SIZE < total) rows.push({ id: 'bulk_page_next', title: '➡️ Next Page' });
+  rows.push({ id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length} sel.)`, description: 'Review & confirm' });
+
+  const footer = `Page ${bulk.page + 1}/${Math.ceil(total / BULK_PAGE_SIZE)} | ${bulk.selectedIds.length} selected`;
+  return sendList(phone, `✏️ *Edit: ${actionLabel}*\nTap to select items.\n${footer}`, 'Select Items', [{ title: 'Menu Items', rows }], env);
+}
+
+async function handleBulkItemsEditSelect(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bulk_page_next') { bulk.page++; await saveSession(phone, session, env); return showBulkItemsEditList(phone, session, env); }
+  if (msg.id === 'bulk_page_prev') { bulk.page = Math.max(0, bulk.page - 1); await saveSession(phone, session, env); return showBulkItemsEditList(phone, session, env); }
+
+  if (msg.id?.startsWith('bie_')) {
+    const itemId = parseInt(msg.id.replace('bie_', ''), 10);
+    const idx = bulk.selectedIds.indexOf(itemId);
+    if (idx > -1) bulk.selectedIds.splice(idx, 1); else bulk.selectedIds.push(itemId);
+    await saveSession(phone, session, env);
+    return showBulkItemsEditList(phone, session, env);
+  }
+
+  if (msg.id === 'bulk_review') {
+    if (!bulk.selectedIds.length) return sendText(phone, '⚠️ Select at least one item first.', env);
+    session.state = 'admin_bulk_items_edit_confirm';
+    await saveSession(phone, session, env);
+
+    const actionLabels = { set_avail: 'Mark AVAILABLE', set_unavail: 'Mark UNAVAILABLE', clear_img: 'Clear image URLs', set_price: `Set price to ${bulk.editValueLabel}`, adj_price: `Adjust price: ${bulk.editValueLabel}`, move_cat: `Move to category: ${bulk.editValueLabel}`, set_desc: `Set description`, set_img: `Set image URL` };
+    const actionDesc = actionLabels[bulk.editAction] || bulk.editAction;
+
+    return sendButtons(
+      phone,
+      `✏️ *Confirm Bulk Edit*\n\nAction: *${actionDesc}*\nItems: ${bulk.selectedIds.length} selected\n\nProceed?`,
+      [
+        { id: 'bulk_edit_confirm', title: '✅ Apply Changes' },
+        { id: 'bulk_back_select',  title: '⬅️ Back'         },
+      ],
+      env
+    );
+  }
+
+  return sendButtons(
+    phone,
+    `${bulk.selectedIds.length} items selected.`,
+    [
+      { id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length})` },
+      { id: 'admin_home',  title: '❌ Cancel'                            },
+    ],
+    env
+  );
+}
+
+async function handleBulkItemsEditConfirm(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bulk_back_select') {
+    session.state = 'admin_bulk_items_edit_select';
+    await saveSession(phone, session, env);
+    return showBulkItemsEditList(phone, session, env);
+  }
+
+  if (msg.id !== 'bulk_edit_confirm') {
+    return sendButtons(phone, `Apply edit to ${bulk.selectedIds.length} items?`,
+      [{ id: 'bulk_edit_confirm', title: '✅ Apply Changes' }, { id: 'bulk_back_select', title: '⬅️ Back' }], env);
+  }
+
+  // Build fields object based on action
+  let fields = {};
+  if (bulk.editAction === 'set_avail')   fields = { is_available: 1 };
+  else if (bulk.editAction === 'set_unavail') fields = { is_available: 0 };
+  else if (bulk.editAction === 'clear_img')   fields = { image_url: '' };
+  else if (bulk.editAction === 'set_price')   fields = { price: bulk.editValue };
+  else if (bulk.editAction === 'set_desc')    fields = { description: bulk.editValue };
+  else if (bulk.editAction === 'set_img')     fields = { image_url: bulk.editValue };
+  else if (bulk.editAction === 'move_cat')    fields = { category_id: bulk.editValue };
+  else if (bulk.editAction === 'adj_price') {
+    // Must fetch current prices and compute individually
+    const allItems = await getAllMenuItems(env);
+    const selected = allItems.filter(i => bulk.selectedIds.includes(i.id));
+    let successCount = 0;
+    const failureDetails = [];
+    for (const item of selected) {
+      let newPrice;
+      const v = bulk.editValue;
+      if (bulk.editPriceType === 'inc_fixed')  newPrice = item.price + v;
+      else if (bulk.editPriceType === 'dec_fixed') newPrice = item.price - v;
+      else if (bulk.editPriceType === 'inc_pct')   newPrice = item.price * (1 + v / 100);
+      else if (bulk.editPriceType === 'dec_pct')   newPrice = item.price * (1 - v / 100);
+      newPrice = Math.round(newPrice * 100) / 100;
+      if (newPrice < 0 || newPrice > MAX_PRICE) {
+        failureDetails.push({ id: item.id, name: item.name, error: `result ₦${newPrice.toFixed(2)} out of range` });
+        continue;
+      }
+      try { await updateMenuItem(item.id, { price: newPrice }, env); successCount++; }
+      catch (e) { failureDetails.push({ id: item.id, name: item.name, error: e.message?.slice(0, 30) }); }
+    }
+    if (successCount > 0) await bustMenuCache(env);
+    const logId = await logBulkAction({ adminPhone: phone, actionType: 'bulk_adj_price', targetType: 'menu_items', selectedIds: bulk.selectedIds, successCount, failureCount: failureDetails.length, skippedCount: 0, failureDetails }, env);
+    session.state = 'admin_idle'; session.adminCtx = {};
+    await saveSession(phone, session, env);
+    let summary = `✅ *Price Adjust Complete*\n\nUpdated: ${successCount}\nFailed/skipped: ${failureDetails.length}\nLog ID: ${logId}`;
+    if (failureDetails.length) summary += '\n\n*Issues:*\n' + failureDetails.slice(0, 3).map(f => `• ${f.name}: ${f.error}`).join('\n');
+    if (summary.length > 900) summary = summary.slice(0, 897) + '…';
+    return sendButtons(phone, summary, [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }, { id: 'admin_home', title: '🔧 Admin Menu' }], env);
+  }
+
+  const updatedCount = await bulkEditMenuItems(bulk.selectedIds, fields, env);
+  if (updatedCount > 0) await bustMenuCache(env);
+
+  const logId = await logBulkAction({
+    adminPhone: phone, actionType: `bulk_edit_${bulk.editAction}`, targetType: 'menu_items',
+    targetValue: String(bulk.editValue ?? ''), selectedIds: bulk.selectedIds,
+    successCount: updatedCount, failureCount: 0, skippedCount: bulk.selectedIds.length - updatedCount, failureDetails: [],
+  }, env);
+
+  session.state = 'admin_idle';
+  session.adminCtx = {};
+  await saveSession(phone, session, env);
+
+  return sendButtons(
+    phone,
+    `✅ *Bulk Edit Complete*\n\nUpdated: ${updatedCount}\nLog ID: ${logId}`,
+    [
+      { id: 'bulk_items_edit', title: '✏️ Edit More Items' },
+      { id: 'admin_bulk_menu', title: '📦 Bulk Actions'   },
+    ],
+    env
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Categories — Add (paste)
+// ─────────────────────────────────────────────────────────────
+
+async function showBulkCatAddTemplate(phone, env) {
+  return sendText(
+    phone,
+    '📂 *Bulk Add Categories*\n\n' +
+    'Paste category names below, one per line:\n' +
+    '*Format:* Name | Sort Order\n\n' +
+    '*Examples:*\n' +
+    'Burgers | 1\n' +
+    'Side Dishes | 2\n' +
+    'Drinks\n\n' +
+    '*Rules:*\n' +
+    '• Name is required (2–50 chars)\n' +
+    '• Sort Order optional (number, default 0)\n' +
+    '• Name must not already exist\n\n' +
+    'Send *CANCEL* to abort.',
+    env
+  );
+}
+
+async function handleBulkCatsAddPaste(phone, msg, session, env) {
+  if (!msg.text || msg.type === 'button_reply' || msg.type === 'list_reply') {
+    return showBulkCatAddTemplate(phone, env);
+  }
+  const rawText = msg.text.trim();
+  if (rawText.length < 2) return showBulkCatAddTemplate(phone, env);
+
+  const categories = await getCategories(env);
+  const parsed = parseBulkCategoryPaste(rawText, categories);
+
+  if (parsed.total === 0) return showBulkCatAddTemplate(phone, env);
+
+  session.adminCtx.bulk.parsedCats = parsed.valid;
+  session.adminCtx.bulk.parseErrors = parsed.errors;
+  session.state = 'admin_bulk_cats_add_review';
+  await saveSession(phone, session, env);
+
+  let previewMsg = `📂 *Bulk Add Categories Preview*\n\nTotal: ${parsed.total} | ✅ ${parsed.valid.length} valid | ❌ ${parsed.errors.length} invalid\n\n`;
+
+  if (parsed.valid.length > 0) {
+    const preview = parsed.valid.slice(0, 6).map(c => `• *${c.name}*${c.sortOrder ? ` (sort: ${c.sortOrder})` : ''}`).join('\n');
+    previewMsg += `*Categories to add:*\n${preview}`;
+    if (parsed.valid.length > 6) previewMsg += `\n_…and ${parsed.valid.length - 6} more_`;
+  }
+
+  if (parsed.errors.length > 0) {
+    const errPreview = parsed.errors.slice(0, 3).map(e => `Line ${e.line}: ${e.reasons[0]}`).join('\n');
+    previewMsg += `\n\n*Skipped lines:*\n${errPreview}`;
+    if (parsed.errors.length > 3) previewMsg += `\n_…and ${parsed.errors.length - 3} more_`;
+  }
+
+  if (previewMsg.length > 900) previewMsg = previewMsg.slice(0, 897) + '…';
+
+  if (parsed.valid.length === 0) {
+    return sendButtons(phone, previewMsg + '\n\n⚠️ No valid categories. Fix errors and re-paste.',
+      [{ id: 'bulk_cat_repaste', title: '🔄 Re-paste' }, { id: 'admin_bulk_menu', title: '⬅️ Bulk Menu' }], env);
+  }
+
+  return sendButtons(phone, previewMsg,
+    [
+      { id: 'bulk_cats_add_confirm', title: `✅ Add ${parsed.valid.length} Categories` },
+      { id: 'bulk_cat_repaste',      title: '🔄 Re-paste'                              },
+    ], env);
+}
+
+async function handleBulkCatsAddReview(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bulk_cat_repaste' || msg.text) {
+    session.state = 'admin_bulk_cats_add_paste';
+    await saveSession(phone, session, env);
+    return showBulkCatAddTemplate(phone, env);
+  }
+
+  if (msg.id === 'bulk_cats_add_confirm') {
+    const entries = bulk.parsedCats || [];
+    if (!entries.length) {
+      session.state = 'admin_bulk_cats_add_paste';
+      await saveSession(phone, session, env);
+      return showBulkCatAddTemplate(phone, env);
+    }
+
+    let successCount = 0;
+    let failureCount = 0;
+    const failureDetails = [];
+
+    for (const entry of entries) {
+      try {
+        const dup = await env.DB.prepare('SELECT id FROM MenuCategories WHERE LOWER(name) = LOWER(?)').bind(entry.name).first();
+        if (dup) {
+          failureDetails.push({ name: entry.name, error: 'duplicate' });
+          failureCount++;
+        } else {
+          await env.DB.prepare('INSERT INTO MenuCategories (name, sort_order) VALUES (?, ?)').bind(entry.name, entry.sortOrder || 0).run();
+          successCount++;
+        }
+      } catch (err) {
+        failureCount++;
+        failureDetails.push({ name: entry.name, error: err.message?.slice(0, 40) });
+      }
+    }
+
+    if (successCount > 0) await bustMenuCache(env);
+
+    const logId = await logBulkAction({
+      adminPhone: phone, actionType: 'bulk_add', targetType: 'categories',
+      selectedIds: [], successCount, failureCount, skippedCount: 0, failureDetails,
+    }, env);
+
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+
+    let summary = `✅ *Bulk Add Categories Complete*\n\nAdded: ${successCount}\nFailed: ${failureCount}\nLog ID: ${logId}`;
+    if (failureDetails.length) summary += '\n\n*Failures:*\n' + failureDetails.slice(0, 3).map(f => `• ${f.name}: ${f.error}`).join('\n');
+    if (summary.length > 900) summary = summary.slice(0, 897) + '…';
+
+    return sendButtons(phone, summary,
+      [{ id: 'bulk_cats_add', title: '📂 Add More' }, { id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  }
+
+  const n = (bulk.parsedCats || []).length;
+  return sendButtons(phone, `📂 Ready to add *${n}* categories. Confirm or re-paste.`,
+    [
+      { id: 'bulk_cats_add_confirm', title: `✅ Add ${n} Categories` },
+      { id: 'bulk_cat_repaste',      title: '🔄 Re-paste'           },
+    ], env);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Categories — Rename (single-at-a-time with list)
+// ─────────────────────────────────────────────────────────────
+
+async function showBulkCatsRenameList(phone, env) {
+  const cats = await getCategories(env);
+  if (!cats.length) {
+    return sendButtons(phone, '📭 No categories to rename.',
+      [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  }
+  const rows = cats.map(c => ({ id: `bcrn_${c.id}`, title: c.name, description: `Sort: ${c.sort_order}` }));
+  return sendList(phone, '✏️ *Rename Category*\nSelect a category to rename:', 'Select', [{ title: 'Categories', rows }], env);
+}
+
+async function handleBulkCatsRenameSelect(phone, msg, session, env) {
+  if (!msg.id?.startsWith('bcrn_')) return showBulkCatsRenameList(phone, env);
+
+  const catId = parseInt(msg.id.replace('bcrn_', ''), 10);
+  const cat = await getCategoryById(catId, env);
+  if (!cat) return sendText(phone, '⚠️ Category not found.', env);
+
+  session.adminCtx.bulk.renameCatId = catId;
+  session.adminCtx.bulk.renameCatOldName = cat.name;
+  session.state = 'admin_bulk_cats_rename_value';
+  await saveSession(phone, session, env);
+
+  return sendText(phone, `✏️ Renaming *${cat.name}*\n\nEnter the *new name*:\n\nSend *CANCEL* to abort.`, env);
+}
+
+async function handleBulkCatsRenameValue(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+  if (!bulk.renameCatId) {
+    session.state = 'admin_idle'; session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+  }
+
+  if (!msg.text || msg.type !== 'text') {
+    return sendText(phone, `✏️ Enter the *new name* for "${bulk.renameCatOldName}":\n\nSend *CANCEL* to abort.`, env);
+  }
+
+  const newName = sanitize(msg.text.trim(), 50);
+  if (newName.length < 2) return sendText(phone, '⚠️ Name must be at least 2 characters.\n\nSend *CANCEL* to abort.', env);
+
+  try {
+    const dup = await env.DB.prepare('SELECT id FROM MenuCategories WHERE LOWER(name) = LOWER(?) AND id != ?').bind(newName, bulk.renameCatId).first();
+    if (dup) return sendText(phone, `⚠️ Category "${newName}" already exists. Choose a different name.`, env);
+
+    await updateCategory(bulk.renameCatId, { name: newName }, env);
+    await bustMenuCache(env);
+
+    const logId = await logBulkAction({
+      adminPhone: phone, actionType: 'rename', targetType: 'categories',
+      targetValue: newName, selectedIds: [bulk.renameCatId], successCount: 1, failureCount: 0, skippedCount: 0, failureDetails: [],
+    }, env);
+
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+
+    return sendButtons(phone,
+      `✅ Category renamed: *${bulk.renameCatOldName}* → *${newName}*\nLog ID: ${logId}`,
+      [
+        { id: 'bulk_cats_rename', title: '✏️ Rename Another' },
+        { id: 'admin_bulk_menu',  title: '📦 Bulk Actions'   },
+      ], env);
+  } catch (err) {
+    console.error('[Admin] Category rename failed:', err);
+    return sendText(phone, '⚠️ Failed to rename category. Please try again.', env);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Categories — Delete (select → mode → [target] → confirm)
+// ─────────────────────────────────────────────────────────────
+
+async function showBulkCatsDeleteList(phone, session, env) {
+  const cats = await getCategories(env);
+  if (!cats.length) {
+    session.state = 'admin_idle'; session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(phone, '📭 No categories to delete.', [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  }
+  const itemCounts = await getItemCountsByCategory(env);
+  const { bulk } = session.adminCtx;
+  // Cap at 9 to leave room for the Done row (max 10 rows per section)
+  const pageCats = cats.slice(0, 9);
+  const rows = pageCats.map(c => ({
+    id: `bcd_${c.id}`,
+    title: `${bulk.selectedIds.includes(c.id) ? '✅' : '⬜'} ${c.name}`.slice(0, 24),
+    description: `${itemCounts[c.id] || 0} items`,
+  }));
+  rows.push({ id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length} sel.)`, description: 'Choose how to handle items' });
+  const truncNote = cats.length > 9 ? `\n_Showing 9 of ${cats.length} categories_` : '';
+  return sendList(phone, `🗑️ *Delete Categories*\nTap to select. ${bulk.selectedIds.length} selected.${truncNote}`, 'Select', [{ title: 'Categories', rows }], env);
+}
+
+async function handleBulkCatsDeleteSelect(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id?.startsWith('bcd_')) {
+    const catId = parseInt(msg.id.replace('bcd_', ''), 10);
+    const idx = bulk.selectedIds.indexOf(catId);
+    if (idx > -1) bulk.selectedIds.splice(idx, 1); else bulk.selectedIds.push(catId);
+    await saveSession(phone, session, env);
+    return showBulkCatsDeleteList(phone, session, env);
+  }
+
+  if (msg.id === 'bulk_review') {
+    if (!bulk.selectedIds.length) return sendText(phone, '⚠️ Select at least one category first.', env);
+
+    const itemCounts = await getItemCountsByCategory(env);
+    const totalItems = bulk.selectedIds.reduce((sum, id) => sum + (itemCounts[id] || 0), 0);
+    const cats = await getCategories(env);
+    const selectedCats = cats.filter(c => bulk.selectedIds.includes(c.id));
+    const catNames = selectedCats.map(c => `• ${c.name} (${itemCounts[c.id] || 0} items)`).join('\n');
+
+    session.state = 'admin_bulk_cats_delete_mode';
+    await saveSession(phone, session, env);
+
+    return sendButtons(
+      phone,
+      `🗑️ *Delete ${selectedCats.length} Categories*\n\n${catNames}\n\nTotal items affected: *${totalItems}*\n\n*How should items be handled?*`,
+      [
+        { id: 'bcd_mode_cascade', title: '🗑️ Delete Items Too' },
+        { id: 'bcd_mode_move',    title: '🔀 Move Items First' },
+      ],
+      env
+    );
+  }
+
+  return sendButtons(phone, `${bulk.selectedIds.length} categories selected.`,
+    [{ id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length})` }, { id: 'admin_home', title: '❌ Cancel' }], env);
+}
+
+async function handleBulkCatsDeleteMode(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bcd_mode_cascade') {
+    bulk.deleteMode = 'cascade';
+    session.state = 'admin_bulk_cats_delete_confirm';
+    await saveSession(phone, session, env);
+    const itemCounts = await getItemCountsByCategory(env);
+    const totalItems = bulk.selectedIds.reduce((sum, id) => sum + (itemCounts[id] || 0), 0);
+    return sendButtons(
+      phone,
+      `⚠️ *Final Confirm*\n\nDelete ${bulk.selectedIds.length} categories AND all *${totalItems} items* in them?\n\n*This cannot be undone.*`,
+      [
+        { id: 'bcd_confirm_yes', title: '⚠️ Yes, Delete All' },
+        { id: 'bcd_back',        title: '⬅️ Back'            },
+      ],
+      env
+    );
+  }
+
+  if (msg.id === 'bcd_mode_move') {
+    bulk.deleteMode = 'move';
+    session.state = 'admin_bulk_cats_delete_target';
+    await saveSession(phone, session, env);
+
+    const allCats = await getCategories(env);
+    const eligible = allCats.filter(c => !bulk.selectedIds.includes(c.id));
+    if (!eligible.length) {
+      return sendButtons(phone, '⚠️ No other categories to move items into. Delete items first or create a new category.',
+        [{ id: 'admin_add_cat', title: '➕ New Category' }, { id: 'admin_bulk_menu', title: '⬅️ Back' }], env);
+    }
+    const rows = eligible.map(c => ({ id: `bcdt_${c.id}`, title: c.name }));
+    return sendList(phone, '🔀 *Move Items To*\nSelect the target category for all items:', 'Select', [{ title: 'Categories', rows }], env);
+  }
+
+  return sendButtons(phone, '⚠️ Choose how to handle items in deleted categories:',
+    [{ id: 'bcd_mode_cascade', title: '🗑️ Delete Items Too' }, { id: 'bcd_mode_move', title: '🔀 Move Items First' }], env);
+}
+
+async function handleBulkCatsDeleteTarget(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (!msg.id?.startsWith('bcdt_')) {
+    const cats = await getCategories(env);
+    const eligible = cats.filter(c => !bulk.selectedIds.includes(c.id));
+    const rows = eligible.map(c => ({ id: `bcdt_${c.id}`, title: c.name }));
+    return sendList(phone, '🔀 Choose target category for items:', 'Select', [{ title: 'Categories', rows }], env);
+  }
+
+  const targetCatId = parseInt(msg.id.replace('bcdt_', ''), 10);
+  const target = await getCategoryById(targetCatId, env);
+  if (!target) return sendText(phone, '⚠️ Category not found.', env);
+
+  bulk.deleteTargetCatId = targetCatId;
+  bulk.deleteTargetCatName = target.name;
+  session.state = 'admin_bulk_cats_delete_confirm';
+  await saveSession(phone, session, env);
+
+  const itemCounts = await getItemCountsByCategory(env);
+  const totalItems = bulk.selectedIds.reduce((sum, id) => sum + (itemCounts[id] || 0), 0);
+
+  return sendButtons(
+    phone,
+    `⚠️ *Final Confirm*\n\nMove *${totalItems} items* to *${target.name}*, then delete ${bulk.selectedIds.length} categories?\n\n*This cannot be undone.*`,
+    [
+      { id: 'bcd_confirm_yes', title: '✅ Yes, Proceed' },
+      { id: 'bcd_back',        title: '⬅️ Back'         },
+    ],
+    env
+  );
+}
+
+async function handleBulkCatsDeleteConfirm(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bcd_back') {
+    session.state = 'admin_bulk_cats_delete_select';
+    await saveSession(phone, session, env);
+    return showBulkCatsDeleteList(phone, session, env);
+  }
+
+  if (msg.id !== 'bcd_confirm_yes') {
+    return sendButtons(phone, '⚠️ Confirm deletion?',
+      [{ id: 'bcd_confirm_yes', title: '✅ Yes, Proceed' }, { id: 'bcd_back', title: '⬅️ Back' }], env);
+  }
+
+  let deletedCats = 0;
+  let movedItems = 0;
+
+  try {
+    if (bulk.deleteMode === 'move' && bulk.deleteTargetCatId) {
+      for (const catId of bulk.selectedIds) {
+        await moveAllItemsFromCategory(catId, bulk.deleteTargetCatId, env);
+        movedItems++;
+      }
+    }
+    deletedCats = await bulkDeleteCategoriesWithItems(bulk.selectedIds, env);
+    await bustMenuCache(env);
+  } catch (err) {
+    console.error('[Admin] Bulk category delete failed:', err);
+    return sendText(phone, `⚠️ Error during deletion: ${err.message?.slice(0, 60)}`, env);
+  }
+
+  const logId = await logBulkAction({
+    adminPhone: phone, actionType: bulk.deleteMode === 'move' ? 'bulk_delete_move' : 'bulk_delete_cascade',
+    targetType: 'categories', targetValue: bulk.deleteTargetCatName || '',
+    selectedIds: bulk.selectedIds, successCount: deletedCats, failureCount: 0, skippedCount: 0, failureDetails: [],
+  }, env);
+
+  session.state = 'admin_idle';
+  session.adminCtx = {};
+  await saveSession(phone, session, env);
+
+  const modeNote = bulk.deleteMode === 'move' ? `Items moved to "${bulk.deleteTargetCatName}".` : 'Items deleted with categories.';
+  return sendButtons(phone,
+    `✅ *Bulk Delete Complete*\n\nCategories deleted: ${deletedCats}\n${modeNote}\nLog ID: ${logId}`,
+    [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }, { id: 'admin_home', title: '🔧 Admin Menu' }], env);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bulk Categories — Move Items (source → items → target → confirm)
+// ─────────────────────────────────────────────────────────────
+
+async function showBulkCatsMoveSourceList(phone, env) {
+  const cats = await getCategories(env);
+  if (!cats.length) {
+    return sendButtons(phone, '📭 No categories yet.', [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  }
+  const itemCounts = await getItemCountsByCategory(env);
+  const rows = cats.filter(c => (itemCounts[c.id] || 0) > 0).map(c => ({
+    id: `bcms_${c.id}`,
+    title: c.name,
+    description: `${itemCounts[c.id]} items`,
+  }));
+  if (!rows.length) {
+    return sendButtons(phone, '📭 No categories have items to move.', [{ id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  }
+  return sendList(phone, '🔀 *Move Items*\nSelect the *source category* to move items from:', 'Select Source', [{ title: 'Categories', rows }], env);
+}
+
+async function handleBulkCatsMoveSource(phone, msg, session, env) {
+  if (!msg.id?.startsWith('bcms_')) return showBulkCatsMoveSourceList(phone, env);
+
+  const srcId = parseInt(msg.id.replace('bcms_', ''), 10);
+  const src = await getCategoryById(srcId, env);
+  if (!src) return sendText(phone, '⚠️ Category not found.', env);
+
+  session.adminCtx.bulk.moveSourceId = srcId;
+  session.adminCtx.bulk.moveSourceName = src.name;
+  session.state = 'admin_bulk_cats_move_target';
+  await saveSession(phone, session, env);
+
+  const allCats = await getCategories(env);
+  const eligible = allCats.filter(c => c.id !== srcId);
+  if (!eligible.length) {
+    return sendButtons(phone, '⚠️ No other categories to move items into.',
+      [{ id: 'admin_add_cat', title: '➕ New Category' }, { id: 'admin_bulk_menu', title: '⬅️ Back' }], env);
+  }
+  const rows = eligible.map(c => ({ id: `bcmt_${c.id}`, title: c.name }));
+  return sendList(phone, `🔀 Moving from *${src.name}*\n\nChoose the *target category*:`, 'Select Target', [{ title: 'Categories', rows }], env);
+}
+
+async function handleBulkCatsMoveTarget(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (!msg.id?.startsWith('bcmt_')) {
+    const allCats = await getCategories(env);
+    const eligible = allCats.filter(c => c.id !== bulk.moveSourceId);
+    const rows = eligible.map(c => ({ id: `bcmt_${c.id}`, title: c.name }));
+    return sendList(phone, `🔀 Choose the *target category*:`, 'Select Target', [{ title: 'Categories', rows }], env);
+  }
+
+  const targetId = parseInt(msg.id.replace('bcmt_', ''), 10);
+  const target = await getCategoryById(targetId, env);
+  if (!target) return sendText(phone, '⚠️ Category not found.', env);
+
+  bulk.moveTargetId = targetId;
+  bulk.moveTargetName = target.name;
+  session.state = 'admin_bulk_cats_move_confirm';
+  await saveSession(phone, session, env);
+
+  const itemCounts = await getItemCountsByCategory(env);
+  const count = itemCounts[bulk.moveSourceId] || 0;
+
+  return sendButtons(
+    phone,
+    `🔀 *Confirm Move*\n\nMove *${count} items* from *${bulk.moveSourceName}* → *${target.name}*?`,
+    [
+      { id: 'bcm_confirm', title: '✅ Yes, Move All' },
+      { id: 'bcm_back',    title: '⬅️ Back'          },
+    ],
+    env
+  );
+}
+
+async function handleBulkCatsMoveConfirm(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bcm_back') {
+    session.state = 'admin_bulk_cats_move_source';
+    await saveSession(phone, session, env);
+    return showBulkCatsMoveSourceList(phone, env);
+  }
+
+  if (msg.id !== 'bcm_confirm') {
+    return sendButtons(phone, `🔀 Move items from *${bulk.moveSourceName}* → *${bulk.moveTargetName}*?`,
+      [{ id: 'bcm_confirm', title: '✅ Yes, Move All' }, { id: 'bcm_back', title: '⬅️ Back' }], env);
+  }
+
+  try {
+    await moveAllItemsFromCategory(bulk.moveSourceId, bulk.moveTargetId, env);
+    await bustMenuCache(env);
+
+    const itemCounts = await getItemCountsByCategory(env);
+    const movedCount = itemCounts[bulk.moveTargetId] || 0;
+
+    const logId = await logBulkAction({
+      adminPhone: phone, actionType: 'bulk_move_items', targetType: 'categories',
+      targetValue: String(bulk.moveTargetId), selectedIds: [bulk.moveSourceId],
+      successCount: 1, failureCount: 0, skippedCount: 0, failureDetails: [],
+    }, env);
+
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+
+    return sendButtons(phone,
+      `✅ *Move Complete*\n\nAll items moved from *${bulk.moveSourceName}* → *${bulk.moveTargetName}*\nLog ID: ${logId}`,
+      [{ id: 'bulk_cats_move', title: '🔀 Move More' }, { id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
+  } catch (err) {
+    console.error('[Admin] Move items failed:', err);
+    return sendText(phone, `⚠️ Failed to move items: ${err.message?.slice(0, 60)}`, env);
+  }
 }

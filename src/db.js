@@ -517,6 +517,100 @@ export async function bulkUpdateMenuAvailability(itemIds, isAvailable, env) {
   return env.DB.batch(stmts);
 }
 
+export async function bulkDeleteMenuItems(itemIds, env) {
+  if (!itemIds.length) return 0;
+  const stmts = itemIds.map(id => env.DB.prepare('DELETE FROM MenuItems WHERE id = ?').bind(id));
+  const results = await env.DB.batch(stmts);
+  return results.filter(r => r.meta.changes > 0).length;
+}
+
+export async function bulkCreateMenuItems(items, env) {
+  if (!items.length) return [];
+  const stmts = items.map(item =>
+    env.DB.prepare(
+      'INSERT INTO MenuItems (category_id, name, description, price, image_url, is_available) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(item.categoryId, item.name, item.description || '', item.price, item.imageUrl || '', item.isAvailable !== false ? 1 : 0)
+  );
+  const results = await env.DB.batch(stmts);
+  return results.map(r => r.meta.last_row_id);
+}
+
+export async function bulkEditMenuItems(itemIds, fields, env) {
+  if (!itemIds.length) return 0;
+  const ALLOWED = new Set(['name', 'description', 'price', 'image_url', 'is_available', 'category_id']);
+  const setClauses = [];
+  const baseValues = [];
+  for (const [k, v] of Object.entries(fields)) {
+    if (!ALLOWED.has(k)) continue;
+    setClauses.push(`${k} = ?`);
+    baseValues.push(v);
+  }
+  if (!setClauses.length) return 0;
+  const stmts = itemIds.map(id =>
+    env.DB.prepare(`UPDATE MenuItems SET ${setClauses.join(', ')} WHERE id = ?`).bind(...baseValues, id)
+  );
+  const results = await env.DB.batch(stmts);
+  return results.filter(r => r.meta.changes > 0).length;
+}
+
+export async function getCategoryById(id, env) {
+  return env.DB.prepare('SELECT id, name, sort_order FROM MenuCategories WHERE id = ?').bind(id).first();
+}
+
+export async function updateCategory(id, fields, env) {
+  const ALLOWED = new Set(['name', 'sort_order']);
+  const setClauses = [];
+  const values = [];
+  for (const [k, v] of Object.entries(fields)) {
+    if (!ALLOWED.has(k)) continue;
+    setClauses.push(`${k} = ?`);
+    values.push(v);
+  }
+  if (!setClauses.length) return;
+  values.push(id);
+  await env.DB.prepare(`UPDATE MenuCategories SET ${setClauses.join(', ')} WHERE id = ?`).bind(...values).run();
+}
+
+export async function bulkCreateCategories(entries, env) {
+  if (!entries.length) return [];
+  const stmts = entries.map(e =>
+    env.DB.prepare('INSERT OR IGNORE INTO MenuCategories (name, sort_order) VALUES (?, ?)').bind(e.name, e.sortOrder || 0)
+  );
+  const results = await env.DB.batch(stmts);
+  return results.map(r => r.meta.last_row_id);
+}
+
+export async function bulkDeleteCategoriesWithItems(categoryIds, env) {
+  if (!categoryIds.length) return 0;
+  const delItems = categoryIds.map(id => env.DB.prepare('DELETE FROM MenuItems WHERE category_id = ?').bind(id));
+  await env.DB.batch(delItems);
+  const delCats = categoryIds.map(id => env.DB.prepare('DELETE FROM MenuCategories WHERE id = ?').bind(id));
+  const results = await env.DB.batch(delCats);
+  return results.filter(r => r.meta.changes > 0).length;
+}
+
+export async function moveAllItemsFromCategory(fromCatId, toCatId, env) {
+  await env.DB.prepare('UPDATE MenuItems SET category_id = ? WHERE category_id = ?').bind(toCatId, fromCatId).run();
+}
+
+export async function bulkMoveItemsToCategory(itemIds, targetCategoryId, env) {
+  if (!itemIds.length) return 0;
+  const stmts = itemIds.map(id =>
+    env.DB.prepare('UPDATE MenuItems SET category_id = ? WHERE id = ?').bind(targetCategoryId, id)
+  );
+  const results = await env.DB.batch(stmts);
+  return results.filter(r => r.meta.changes > 0).length;
+}
+
+export async function getItemCountsByCategory(env) {
+  const result = await env.DB.prepare(
+    'SELECT category_id, COUNT(*) as count FROM MenuItems GROUP BY category_id'
+  ).all();
+  const map = {};
+  for (const row of result.results) map[row.category_id] = row.count;
+  return map;
+}
+
 export async function getMenuItemsPaginated(env, limit = 8, offset = 0) {
   const result = await env.DB.prepare(
     `SELECT id, name, price, is_available FROM MenuItems ORDER BY name LIMIT ? OFFSET ?`
