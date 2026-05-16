@@ -382,8 +382,25 @@ export async function sendText(to, text, env) {
     throw new Error('sendText: body text is empty');
   }
   if (text.length > 1024) {
-    console.error('[WhatsApp] sendText: body text exceeds 1024 chars');
-    text = text.slice(0, 1024);
+    console.error('[WhatsApp] sendText: body text exceeds 1024 chars, splitting into chunks');
+    // Split into chunks of 1024 chars, trying to break at word boundaries
+    const chunks = [];
+    let current = '';
+    const words = text.split(/\s+/);
+    for (const word of words) {
+      if ((current + ' ' + word).length > 1024) {
+        if (current) chunks.push(current.trim());
+        current = word;
+      } else {
+        current += (current ? ' ' : '') + word;
+      }
+    }
+    if (current) chunks.push(current.trim());
+    // Send all chunks sequentially
+    for (const chunk of chunks) {
+      await sendWhatsAppMessage(to, textPayload(chunk), env);
+    }
+    return;
   }
   return sendWhatsAppMessage(to, textPayload(text), env);
 
