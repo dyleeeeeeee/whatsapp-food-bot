@@ -377,7 +377,14 @@ export async function markRead(messageId, env) {
 
 
 export async function sendText(to, text, env) {
-
+  if (!text || typeof text !== 'string' || text.trim().length === 0) {
+    console.error('[WhatsApp] sendText: body text is empty');
+    throw new Error('sendText: body text is empty');
+  }
+  if (text.length > 1024) {
+    console.error('[WhatsApp] sendText: body text exceeds 1024 chars');
+    text = text.slice(0, 1024);
+  }
   return sendWhatsAppMessage(to, textPayload(text), env);
 
 }
@@ -385,7 +392,14 @@ export async function sendText(to, text, env) {
 
 
 export async function sendButtons(to, bodyText, btns, env, header, footer) {
-
+  if (!bodyText || typeof bodyText !== 'string' || bodyText.trim().length === 0) {
+    console.error('[WhatsApp] sendButtons: body text is empty');
+    throw new Error('sendButtons: body text is empty');
+  }
+  if (bodyText.length > 1024) {
+    console.error('[WhatsApp] sendButtons: body text exceeds 1024 chars');
+    bodyText = bodyText.slice(0, 1024);
+  }
   return sendWhatsAppMessage(to, buttonPayload(bodyText, btns, header, footer), env);
 
 }
@@ -393,7 +407,14 @@ export async function sendButtons(to, bodyText, btns, env, header, footer) {
 
 
 export async function sendList(to, bodyText, btnLabel, sections, env) {
-
+  if (!bodyText || typeof bodyText !== 'string' || bodyText.trim().length === 0) {
+    console.error('[WhatsApp] sendList: body text is empty');
+    throw new Error('sendList: body text is empty');
+  }
+  if (bodyText.length > 1024) {
+    console.error('[WhatsApp] sendList: body text exceeds 1024 chars');
+    bodyText = bodyText.slice(0, 1024);
+  }
   return sendWhatsAppMessage(to, listPayload(bodyText, btnLabel, sections), env);
 
 }
