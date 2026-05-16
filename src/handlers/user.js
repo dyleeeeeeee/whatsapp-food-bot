@@ -280,6 +280,37 @@ async function handleEnteringQuantity(phone, msg, session, env) {
 }
 
 async function handleEnteringNotes(phone, msg, session, env) {
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'idle';
+    delete session.tempItemId;
+    delete session.tempQty;
+    delete session.cartQtyEdit;
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return sendText(phone, '🚫 Cancelled. Send *MENU* to start over.', env);
+  }
+  if (t === 'CART' || id === 'cmd_cart') {
+    session.state = 'cart_review';
+    delete session.tempItemId;
+    delete session.tempQty;
+    delete session.cartQtyEdit;
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'MENU' || id === 'cmd_menu') {
+    session.state = 'idle';
+    delete session.tempItemId;
+    delete session.tempQty;
+    delete session.cartQtyEdit;
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return showMenuCategories(phone, session, env);
+  }
+
   const notes = msg.id === 'notes_none' ? '' : sanitize(msg.text || '', 200);
 
   // If we were editing quantity, we shouldn't even reach here, but guard just in case
@@ -424,6 +455,28 @@ async function handleCartItemEdit(phone, msg, session, env) {
     return showCart(phone, session, env);
   }
 
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'cart_review';
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'CART' || id === 'cmd_cart') {
+    session.state = 'cart_review';
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'MENU' || id === 'cmd_menu') {
+    session.state = 'idle';
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return showMenuCategories(phone, session, env);
+  }
+
   if (msg.id === 'cart_item_remove') {
     const removed = session.cart.splice(idx, 1)[0];
     session.state = 'cart_review';
@@ -453,6 +506,28 @@ async function handleCartItemEdit(phone, msg, session, env) {
 }
 
 async function handleCheckoutAddress(phone, msg, session, env) {
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'cart_review';
+    delete session.tempAddress;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'CART' || id === 'cmd_cart') {
+    session.state = 'cart_review';
+    delete session.tempAddress;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'MENU' || id === 'cmd_menu') {
+    session.state = 'idle';
+    delete session.tempAddress;
+    await saveSession(phone, session, env);
+    return showMenuCategories(phone, session, env);
+  }
+
   const address = sanitize(msg.text || '', 300);
   if (address.length < 5) {
     return sendText(
@@ -460,7 +535,7 @@ async function handleCheckoutAddress(phone, msg, session, env) {
       '⚠️ Please enter a valid delivery address (at least 5 characters).\n\n' +
       'Include your street, building number, and apartment if applicable.\n' +
       'Example: *123 Main St, Apt 4B*\n\n' +
-      'Send *CANCEL* to go back.',
+      'Send *CART* to view cart, *MENU* to browse, or *CANCEL* to abort.',
       env
     );
   }
@@ -481,6 +556,30 @@ async function handleCheckoutAddress(phone, msg, session, env) {
 
 async function handleCheckoutDeliveryNotes(phone, msg, session, env) {
   const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'cart_review';
+    delete session.tempAddress;
+    delete session.tempOrderNotes;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'CART' || id === 'cmd_cart') {
+    session.state = 'cart_review';
+    delete session.tempAddress;
+    delete session.tempOrderNotes;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'MENU' || id === 'cmd_menu') {
+    session.state = 'idle';
+    delete session.tempAddress;
+    delete session.tempOrderNotes;
+    await saveSession(phone, session, env);
+    return showMenuCategories(phone, session, env);
+  }
+
   if (t === 'BACK') {
     session.state = 'checkout_address';
     await saveSession(phone, session, env);
@@ -534,6 +633,31 @@ async function handleCheckoutDeliveryNotes(phone, msg, session, env) {
 
 async function handleCheckoutConfirm(phone, msg, session, env) {
   const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+
+  // Handle global commands to escape stuck state
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'cart_review';
+    delete session.tempAddress;
+    delete session.tempOrderNotes;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'CART' || id === 'cmd_cart') {
+    session.state = 'cart_review';
+    delete session.tempAddress;
+    delete session.tempOrderNotes;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'MENU' || id === 'cmd_menu') {
+    session.state = 'idle';
+    delete session.tempAddress;
+    delete session.tempOrderNotes;
+    await saveSession(phone, session, env);
+    return showMenuCategories(phone, session, env);
+  }
+
   if (t === 'BACK') {
     session.state = 'checkout_delivery_notes';
     await saveSession(phone, session, env);
