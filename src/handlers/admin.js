@@ -434,6 +434,16 @@ async function handleAddCategory(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function handleAddItemName(phone, msg, session, env) {
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return showAdminMenu(phone, env);
+  }
+
   const name = sanitize(msg.text || '', 100);
   if (name.length < 2) {
     return sendText(
@@ -527,13 +537,30 @@ async function handleAddItemPrice(phone, msg, session, env) {
     await saveSession(phone, session, env);
     return sendText(phone, '⚠️ Session lost. Please start over.', env);
   }
+
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return showAdminMenu(phone, env);
+  }
+  if (t === 'BACK' || id === 'cmd_back') {
+    session.state = 'admin_add_item_category';
+    delete session.adminCtx.newItem.categoryId;
+    await saveSession(phone, session, env);
+    return showCategoryListForItem(phone, session.adminCtx.newItem.name, env);
+  }
+
   const price = parseFloat(msg.text || '');
   if (isNaN(price) || price < 0) {
     return sendText(
       phone,
       '⚠️ Enter a valid price (e.g. 9.99).\n\n' +
       'Price must be a positive number.\n' +
-      'Send *CANCEL* to abort or *BACK* to change the name.',
+      'Send *CANCEL* to abort or *BACK* to change the category.',
       env
     );
   }
@@ -542,16 +569,18 @@ async function handleAddItemPrice(phone, msg, session, env) {
       phone,
       `⚠️ Price seems too high (₦${price}).\n\n` +
       `Maximum allowed is ₦${MAX_PRICE}.\n` +
-      'Send *CANCEL* to abort or *BACK* to change the name.',
+      'Send *CANCEL* to abort or *BACK* to change the category.',
       env
     );
   }
+
   session.adminCtx.newItem.price = price;
   session.state = 'admin_add_item_description';
   await saveSession(phone, session, env);
+
   return sendButtons(
     phone,
-    '📝 Enter a *description* for this item:\n\n' +
+    '📝 Enter a *description* for the item (optional):\n\n' +
     'Send *BACK* to change the price.',
     [{ id: 'skip_desc', title: 'Skip' }],
     env
@@ -565,6 +594,23 @@ async function handleAddItemDescription(phone, msg, session, env) {
     await saveSession(phone, session, env);
     return sendText(phone, '⚠️ Session lost. Please start over.', env);
   }
+
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return showAdminMenu(phone, env);
+  }
+  if (t === 'BACK' || id === 'cmd_back') {
+    session.state = 'admin_add_item_price';
+    delete session.adminCtx.newItem.price;
+    await saveSession(phone, session, env);
+    return sendText(phone, '💰 Enter the *price* (e.g. 9.99):', env);
+  }
+
   const desc = msg.id === 'skip_desc' ? '' : sanitize(msg.text || '', 300);
   session.adminCtx.newItem.description = desc;
   session.state = 'admin_add_item_image';
@@ -586,9 +632,20 @@ async function handleAddItemImage(phone, msg, session, env) {
     return sendText(phone, '⚠️ Session lost. Please start over.', env);
   }
 
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return showAdminMenu(phone, env);
+  }
+
   // Handle BACK navigation
-  if (msg.text?.toUpperCase().trim() === 'BACK') {
+  if (t === 'BACK' || id === 'cmd_back') {
     session.state = 'admin_add_item_description';
+    delete session.adminCtx.newItem.description;
     await saveSession(phone, session, env);
     return sendButtons(
       phone,
@@ -617,9 +674,9 @@ async function handleAddItemImage(phone, msg, session, env) {
   const item = session.adminCtx.newItem;
   item.imageUrl = imageUrl;
 
-  const id = await createMenuItem(item, env);
+  const itemId = await createMenuItem(item, env);
   await bustMenuCache(env);
-  console.log('[Admin] Item created:', item.name, 'ID:', id);
+  console.log('[Admin] Item created:', item.name, 'ID:', itemId);
 
   session.state    = 'admin_idle';
   session.adminCtx = {};
