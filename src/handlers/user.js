@@ -80,15 +80,29 @@ function isGlobalCommand(msg) {
   return (
     t === 'MENU'   || t === 'START'  || t === 'HI' || t === 'HELLO' ||
     t === 'CART'   || t === 'ORDERS' || t === 'CANCEL' || t === 'HELP' ||
+    t === 'EXIT'   || t === 'EXIT USER MODE' ||
     msg.id === 'cmd_menu'   || msg.id === 'cmd_cart' ||
     msg.id === 'cmd_cancel' || msg.id === 'cmd_orders' ||
-    msg.id === 'cmd_help'
+    msg.id === 'cmd_help'    || msg.id === 'exit_user_mode'
   );
 }
 
 async function handleGlobalCommand(phone, msg, session, env) {
   const t  = (msg.text || '').toUpperCase().trim();
   const id = msg.id || '';
+
+  if (t === 'EXIT' || t === 'EXIT USER MODE' || id === 'exit_user_mode') {
+    if (session.adminUserMode) {
+      session.adminUserMode = false;
+      session.state = 'admin_idle';
+      session.adminCtx = {};
+      clearCart(session);
+      await saveSession(phone, session, env);
+      return sendText(phone, '🔧 *User Mode Exited*\n\nReturning to Admin Panel.', env)
+        .then(() => import('../handlers/admin.js').then(m => m.handleAdminMessage(phone, { type: 'button_reply', id: 'admin_home' }, session, env)));
+    }
+    return sendText(phone, '⚠️ Not in User Mode. Send *HELP* for commands.', env);
+  }
 
   if (t === 'CANCEL' || id === 'cmd_cancel') {
     if (session.cart.length > 0 && session.state !== 'idle') {
@@ -630,14 +644,19 @@ async function handleConfirmCancel(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function showWelcome(phone, env) {
+  const session = await getSession(phone, env);
+  const buttons = [
+    { id: 'cmd_menu',   title: '🍽️ View Menu'  },
+    { id: 'cmd_cart',   title: '🛒 My Cart'     },
+    { id: 'cmd_orders', title: '📋 My Orders'   },
+  ];
+  if (session.adminUserMode) {
+    buttons.push({ id: 'exit_user_mode', title: '🔧 Exit User Mode' });
+  }
   return sendButtons(
     phone,
     `👋 Welcome to *FastChow*! 🍔🍕🥤\n\nOrder fresh food delivered to your door.\n\nWhat would you like to do?\n\nNeed help? Send *HELP* anytime.`,
-    [
-      { id: 'cmd_menu',   title: '🍽️ View Menu'  },
-      { id: 'cmd_cart',   title: '🛒 My Cart'     },
-      { id: 'cmd_orders', title: '📋 My Orders'   },
-    ],
+    buttons,
     env,
     '🍔 FastChow',
     'Fast. Fresh. Delivered.'
@@ -742,23 +761,31 @@ async function showCart(phone, session, env) {
   }
 
   if (!session.cart.length) {
+    const buttons = [{ id: 'cmd_menu', title: '🍽️ Browse Menu' }];
+    if (session.adminUserMode) {
+      buttons.push({ id: 'exit_user_mode', title: '🔧 Exit User Mode' });
+    }
     return sendButtons(
       phone,
       '🛒 Your cart is empty.\nBrowse our menu to add items!',
-      [{ id: 'cmd_menu', title: '🍽️ Browse Menu' }],
+      buttons,
       env
     );
   }
 
   const summary = cartSummary(session.cart);
+  const buttons = [
+    { id: 'btn_checkout_start', title: '✅ Checkout'     },
+    { id: 'btn_keep_shopping',  title: '➕ Add More'     },
+    { id: 'btn_manage_cart',    title: '✏️ Manage'       },
+  ];
+  if (session.adminUserMode) {
+    buttons.push({ id: 'exit_user_mode', title: '🔧 Exit User Mode' });
+  }
   return sendButtons(
     phone,
     `🛒 *Your Cart*\n\n${summary}`,
-    [
-      { id: 'btn_checkout_start', title: '✅ Checkout'     },
-      { id: 'btn_keep_shopping',  title: '➕ Add More'     },
-      { id: 'btn_manage_cart',    title: '✏️ Manage'       },
-    ],
+    buttons,
     env,
     'Shopping Cart'
   );

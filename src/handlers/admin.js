@@ -180,6 +180,12 @@ async function showAdminMenu(phone, env) {
           { id: 'admin_bulk_menu',     title: 'Bulk Actions',  description: 'Manage multiple items/orders' },
         ],
       },
+      {
+        title: 'Testing',
+        rows: [
+          { id: 'admin_user_mode',    title: '👤 User Mode',   description: 'Experience app as a customer' },
+        ],
+      },
     ],
     env
   );
@@ -217,6 +223,14 @@ async function handleAdminIdle(phone, msg, session, env) {
   }
   if (id === 'admin_bulk_menu') {
     return showBulkMenu(phone, session, env);
+  }
+
+  if (id === 'admin_user_mode') {
+    session.adminUserMode = true;
+    session.state = 'idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '👤 *User Mode Activated*\n\nYou can now experience the app as a customer. Tap "Exit User Mode" in the cart to return to admin panel.', env)
+      .then(() => import('../handlers/user.js').then(m => m.handleUserMessage(phone, { type: 'text', text: 'MENU' }, env)));
   }
 
   // Route any bulk_* re-entry buttons (from success screens) through handleBulkMenu
