@@ -208,6 +208,37 @@ async function handleItemDetail(phone, msg, session, env) {
 }
 
 async function handleEnteringQuantity(phone, msg, session, env) {
+  // Handle global commands to escape stuck state
+  const t = (msg.text || '').toUpperCase().trim();
+  const id = msg.id || '';
+  if (t === 'CANCEL' || id === 'cmd_cancel') {
+    session.state = 'idle';
+    delete session.tempItemId;
+    delete session.tempQty;
+    delete session.cartQtyEdit;
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return sendText(phone, '🚫 Cancelled. Send *MENU* to start over.', env);
+  }
+  if (t === 'CART' || id === 'cmd_cart') {
+    session.state = 'cart_review';
+    delete session.tempItemId;
+    delete session.tempQty;
+    delete session.cartQtyEdit;
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+  if (t === 'MENU' || id === 'cmd_menu') {
+    session.state = 'idle';
+    delete session.tempItemId;
+    delete session.tempQty;
+    delete session.cartQtyEdit;
+    delete session.tempCartIdx;
+    await saveSession(phone, session, env);
+    return showMenuCategories(phone, session, env);
+  }
+
   const raw = (msg.text || '').trim();
   // BUG-12 style: strict integer check — "5abc" must not pass as 5
   const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
@@ -217,7 +248,7 @@ async function handleEnteringQuantity(phone, msg, session, env) {
       phone,
       '⚠️ Please enter a whole number between 1 and 20.\n\n' +
       'Examples: *1*, *3*, or *10*\n\n' +
-      'Send *CANCEL* to go back.',
+      'Send *CART* to view cart, *MENU* to browse, or *CANCEL* to abort.',
       env
     );
   }
