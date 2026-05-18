@@ -439,17 +439,25 @@ export async function sendList(to, bodyText, btnLabel, sections, env) {
 
 
 export async function sendImageButtons(to, bodyText, btns, imageUrl, env, footer) {
-
+  if (!bodyText || typeof bodyText !== 'string' || bodyText.trim().length === 0) {
+    console.error('[WhatsApp] sendImageButtons: body text is empty');
+    throw new Error('sendImageButtons: body text is empty');
+  }
+  if (bodyText.length > 1024) {
+    console.error('[WhatsApp] sendImageButtons: body text exceeds 1024 chars');
+    bodyText = bodyText.slice(0, 1024);
+  }
   return sendWhatsAppMessage(to, imageButtonPayload(bodyText, btns, imageUrl, footer), env);
-
 }
 
 
 
 export async function sendImage(to, imageUrl, caption, env) {
-
+  if (caption && typeof caption === 'string' && caption.length > 1024) {
+    console.error('[WhatsApp] sendImage: caption exceeds 1024 chars');
+    caption = caption.slice(0, 1024);
+  }
   return sendWhatsAppMessage(to, imagePayload(imageUrl, caption), env);
-
 }
 
 
