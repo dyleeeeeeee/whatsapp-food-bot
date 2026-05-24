@@ -74,6 +74,8 @@ async function processMessage(message, env) {
     return;
   }
 
+  console.log('[Webhook] Processing message:', { from, type, wamid: wamid?.slice(-8) });
+
   // BUG-03 FIX: Deduplicate using wamid in KV.
   // Meta retries webhooks on timeout — without this, a slow D1 write
   // during order placement causes createOrder to run twice.
@@ -93,6 +95,7 @@ async function processMessage(message, env) {
   }
 
   const parsed = parseMessage(message);
+  console.log('[Webhook] Parsed:', JSON.stringify(parsed));
 
   if (!parsed) {
     // BUG-26 FIX: Unsupported types (photo, voice, sticker, location, etc.)

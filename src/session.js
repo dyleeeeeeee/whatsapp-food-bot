@@ -61,11 +61,13 @@ export async function clearSession(phone, env) {
 
 function defaultSession() {
   return {
-    state:      'idle',
-    cart:       [],    // [{ itemId, name, qty, unitPrice, notes }]
-    adminCtx:   {},    // scratch space for admin multi-step flows
-    tempItemId: null,  // item being viewed/added
-    tempQty:    null,
+    state:            'idle',
+    cart:             [],    // [{ itemId, name, qty, unitPrice, notes }]
+    adminCtx:         {},    // scratch space for admin multi-step flows
+    tempItemId:       null,  // item being viewed/added
+    tempQty:          null,
+    tempCategoryId:   null,  // category user last browsed (for back navigation)
+    tempCategoryName: null,
   };
 }
 

@@ -140,6 +140,28 @@ export async function getMenuItem(id, env) {
 
 
 
+/**
+
+ * Fetch a single menu item by ID, only if currently available.
+
+ * Used in the add-to-cart flow so unavailable items cannot be added.
+
+ */
+
+export async function getAvailableMenuItem(id, env) {
+
+  return env.DB.prepare(
+
+    `SELECT id, category_id, name, description, price, image_url, is_available
+
+     FROM MenuItems WHERE id = ? AND is_available = 1`
+
+  ).bind(id).first();
+
+}
+
+
+
 export async function createMenuItem(item, env) {
 
   const { categoryId, name, description, price, imageUrl } = item;

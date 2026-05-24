@@ -30,7 +30,7 @@ import {
   formatPrice,
 } from '../session.js';
 import {
-  getFullMenu, getMenuItem, createOrder, getUserOrders, getOrder,
+  getFullMenu, getMenuItem, getAvailableMenuItem, createOrder, getUserOrders, getOrder,
   updateOrderPayment,
 } from '../db.js';
 import { initializeFlutterwaveTransaction } from '../payments/flutterwave.js';
@@ -51,6 +51,12 @@ export async function handleUserMessage(phone, msg, env) {
     return handleGlobalCommand(phone, msg, session, env);
   }
 
+  // Correct stale KV state using button ID as ground truth
+  const inferred = inferStateFromMessage(msg, session);
+  if (inferred) session.state = inferred;
+
+  console.log('[User] state:', session.state, '| msg.type:', msg.type, '| msg.id:', msg.id, '| msg.text:', msg.text?.slice(0, 30));
+
   switch (session.state) {
     case 'idle':             return handleIdle(phone, msg, session, env);
     case 'browsing_menu':    return handleBrowsingMenu(phone, msg, session, env);
@@ -69,6 +75,43 @@ export async function handleUserMessage(phone, msg, env) {
     default:
       return handleIdle(phone, msg, session, env);
   }
+}
+
+// Infer the correct state from the button ID when KV may be stale.
+// Returns the inferred state string, or null to trust stored state.
+function inferStateFromMessage(msg, session) {
+  const id = msg.id || '';
+
+  if (id.startsWith('qty_1_') || id.startsWith('qty_custom_')) return 'item_detail';
+  if (id.startsWith('qty_') && /^qty_\d+$/.test(id)) return 'entering_quantity';
+  if (id === 'btn_checkout_start' || id === 'btn_keep_shopping' || id === 'btn_manage_cart' || id === 'btn_clear_cart') return 'cart_review';
+  if (id === 'btn_place_order' || id === 'btn_edit_cart') return 'checkout_confirm';
+  if (id === 'delivery_notes_skip') return 'checkout_delivery_notes';
+  if (id.startsWith('item_') && msg.type === 'list_reply') return 'selecting_item';
+  if ((id.startsWith('page_next_') || id.startsWith('page_prev_')) && msg.type === 'list_reply') return 'selecting_item';
+  if (id.startsWith('cat_') && msg.type === 'list_reply') return 'browsing_menu';
+  if ((id.startsWith('cart_idx_') || id === 'cart_clear_all') && msg.type === 'list_reply') return 'cart_manage';
+  if (id === 'cart_item_remove' || id === 'cart_item_qty' || id === 'cart_item_notes' || id === 'btn_cart_back') return 'cart_item_edit';
+  if (id === 'confirm_cancel_yes' || id === 'confirm_cancel_no') return 'confirm_cancel';
+
+  // KV stale-state recovery for checkout text input.
+  // Button IDs are ground truth, but plain text during checkout has no ID.
+  // If KV state hasn't propagated yet, we infer based on cart + tempAddress.
+  // Exception: numeric text (1-20) while in item_detail/entering_quantity is a qty, not an address.
+  const browsingStates = ['browsing_menu', 'selecting_item', 'cart_review'];
+  const isNumericQty = msg.type === 'text' && /^\d+$/.test((msg.text || '').trim()) && parseInt(msg.text, 10) >= 1 && parseInt(msg.text, 10) <= 20;
+  if (msg.type === 'text' && !id && session.cart && session.cart.length > 0 && !isNumericQty) {
+    // tempAddress not yet set → user is typing their address
+    if (!session.tempAddress && browsingStates.includes(session.state)) {
+      return 'checkout_address';
+    }
+    // tempAddress already set → user is typing delivery instructions
+    if (session.tempAddress && browsingStates.includes(session.state)) {
+      return 'checkout_delivery_notes';
+    }
+  }
+
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -181,193 +224,165 @@ async function handleSelectingItem(phone, msg, session, env) {
     const itemId = parseInt(msg.id.replace('item_', ''), 10);
     return showItemDetail(phone, itemId, session, env);
   }
+
+  // Pagination nav: page_next_{catId}_{page} or page_prev_{catId}_{page}
+  if (msg.type === 'list_reply' && (msg.id?.startsWith('page_next_') || msg.id?.startsWith('page_prev_'))) {
+    const parts = msg.id.split('_');
+    // format: page_(next|prev)_{categoryId}_{page}
+    const catId = parseInt(parts[2], 10);
+    const page  = parseInt(parts[3], 10);
+    const catName = session.tempCategoryName || msg.title || 'Menu';
+    return showItemsForCategory(phone, catId, catName, session, env, page);
+  }
+
   return showMenuCategories(phone, session, env);
 }
 
 async function handleItemDetail(phone, msg, session, env) {
-  if (msg.id === 'btn_add') {
-    session.state = 'entering_quantity';
-    await saveSession(phone, session, env);
-    return sendText(phone, '🔢 How many would you like? (1–20)', env);
-  }
-  if (msg.id === 'btn_back_menu') {
-    session.tempItemId = null;
-    await saveSession(phone, session, env);
-    return showMenuCategories(phone, session, env);
-  }
-  if (msg.id === 'btn_checkout') {
-    return showCart(phone, session, env);
+  // Recover item ID from button ID if KV is stale (btn format: qty_1_{itemId})
+  const id = msg.id || '';
+  if (id.startsWith('qty_1_') || id.startsWith('qty_custom_')) {
+    const parts = id.split('_');
+    const embeddedId = parseInt(parts[parts.length - 1], 10);
+    if (!isNaN(embeddedId) && !session.tempItemId) {
+      session.tempItemId = embeddedId;
+    }
   }
 
-  // BUG FIX: Handle quantity input that arrives before KV state update propagates
-  // If user types a number, assume they're responding to "how many would you like"
-  const raw = (msg.text || '').trim();
-  const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
-  if (!isNaN(qty) && qty >= 1 && qty <= 20) {
-    // Treat as quantity input, transition to entering_quantity state
+  // Instant add: quantity 1
+  if (id.startsWith('qty_1_')) {
+    return addItemToCartAndConfirm(phone, session, 1, env);
+  }
+
+  // Custom quantity: show qty buttons + accept text
+  if (id.startsWith('qty_custom_')) {
     session.state = 'entering_quantity';
-    session.tempQty = qty;
-    await saveSession(phone, session, env);
-    // Forward to entering_notes flow
-    session.state = 'entering_notes';
     await saveSession(phone, session, env);
     return sendButtons(
       phone,
-      `📝 Any special notes for this item?\n(e.g. "No onions", "Extra sauce")`,
-      [{ id: 'notes_none', title: 'No notes' }],
-      env
+      '🔢 How many would you like?\n\nTap a button or type any number (1–20):',
+      [
+        { id: 'qty_2', title: '2' },
+        { id: 'qty_3', title: '3' },
+        { id: 'qty_5', title: '5' },
+      ],
+      env,
+      null,
+      'MENU | CART | CANCEL'
     );
   }
 
-  // Any other input while on item detail — explain what to do
+  if (msg.id === 'btn_back_menu') {
+    session.tempItemId = null;
+    await saveSession(phone, session, env);
+    // Return to the category the user came from, not the top-level menu
+    if (session.tempCategoryId) {
+      return showItemsForCategory(
+        phone, session.tempCategoryId, session.tempCategoryName || 'Menu', session, env
+      );
+    }
+    return showMenuCategories(phone, session, env);
+  }
+
+  // Numeric text while on item_detail = treat as qty (handles KV race)
+  const raw = (msg.text || '').trim();
+  const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+  if (!isNaN(qty) && qty >= 1 && qty <= 20) {
+    return addItemToCartAndConfirm(phone, session, qty, env);
+  }
+
   return sendText(
     phone,
-    '👆 Please tap a button above: *Add to Cart*, *View Cart*, or *Back to Menu*.\n\n' +
-    'Or send *MENU* to start over or *HELP* for assistance.',
+    '👆 Tap *Add 1* to add to cart, *Choose Qty* for a custom amount, or *Back* to return.\n\n' +
+    'Or send *MENU* to browse, *CART* to view cart.',
     env
   );
 }
 
 async function handleEnteringQuantity(phone, msg, session, env) {
-  // Handle global commands to escape stuck state
-  const t = (msg.text || '').toUpperCase().trim();
-  const id = msg.id || '';
-  if (t === 'CANCEL' || id === 'cmd_cancel') {
-    session.state = 'idle';
-    delete session.tempItemId;
-    delete session.tempQty;
-    delete session.cartQtyEdit;
-    delete session.tempCartIdx;
-    await saveSession(phone, session, env);
-    return sendText(phone, '🚫 Cancelled. Send *MENU* to start over.', env);
-  }
-  if (t === 'CART' || id === 'cmd_cart') {
-    session.state = 'cart_review';
-    delete session.tempItemId;
-    delete session.tempQty;
-    delete session.cartQtyEdit;
-    delete session.tempCartIdx;
-    await saveSession(phone, session, env);
-    return showCart(phone, session, env);
-  }
-  if (t === 'MENU' || id === 'cmd_menu') {
-    session.state = 'idle';
-    delete session.tempItemId;
-    delete session.tempQty;
-    delete session.cartQtyEdit;
-    delete session.tempCartIdx;
-    await saveSession(phone, session, env);
-    return showMenuCategories(phone, session, env);
-  }
-
-  const raw = (msg.text || '').trim();
-  // BUG-12 style: strict integer check — "5abc" must not pass as 5
-  const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
-
-  if (isNaN(qty) || qty < 1 || qty > 20) {
-    return sendText(
-      phone,
-      '⚠️ Please enter a whole number between 1 and 20.\n\n' +
-      'Examples: *1*, *3*, or *10*\n\n' +
-      'Send *CART* to view cart, *MENU* to browse, or *CANCEL* to abort.',
-      env
-    );
-  }
-
-  session.tempQty = qty;
-
-  if (session.cartQtyEdit) {
-    const idx = session.tempCartIdx;
-    if (idx !== undefined && session.cart[idx]) {
-      session.cart[idx].qty = qty;
-      session.state = 'cart_review';
-      delete session.tempCartIdx;
-      delete session.cartQtyEdit;
-      await saveSession(phone, session, env);
-      return sendText(phone, `✅ Updated *${session.cart[idx].name}* quantity to ${qty}.`, env)
-        .then(() => showCart(phone, session, env));
+  // Button-based qty selection (qty_2, qty_3, qty_5, etc.)
+  if (msg.id?.startsWith('qty_') && /^qty_\d+$/.test(msg.id)) {
+    const qty = parseInt(msg.id.replace('qty_', ''), 10);
+    if (qty >= 1 && qty <= 20) {
+      if (session.cartQtyEdit) return updateCartQty(phone, session, qty, env);
+      return addItemToCartAndConfirm(phone, session, qty, env);
     }
   }
 
-  session.state   = 'entering_notes';
-  await saveSession(phone, session, env);
+  // Text-based qty
+  const raw = (msg.text || '').trim();
+  const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
 
-  return sendButtons(
-    phone,
-    `📝 Any special notes for this item?\n(e.g. "No onions", "Extra sauce")`,
-    [{ id: 'notes_none', title: 'No notes' }],
-    env
-  );
+  if (isNaN(qty) || qty < 1 || qty > 20) {
+    return sendButtons(
+      phone,
+      '⚠️ Please enter a number between 1 and 20, or tap a button:',
+      [
+        { id: 'qty_2', title: '2' },
+        { id: 'qty_3', title: '3' },
+        { id: 'qty_5', title: '5' },
+      ],
+      env,
+      null,
+      'MENU | CART | CANCEL'
+    );
+  }
+
+  if (session.cartQtyEdit) return updateCartQty(phone, session, qty, env);
+  return addItemToCartAndConfirm(phone, session, qty, env);
+}
+
+async function updateCartQty(phone, session, qty, env) {
+  const idx = session.tempCartIdx;
+  if (idx !== undefined && session.cart[idx]) {
+    const name = session.cart[idx].name;
+    session.cart[idx].qty = qty;
+    session.state = 'cart_review';
+    delete session.tempCartIdx;
+    delete session.cartQtyEdit;
+    await saveSession(phone, session, env);
+    return sendText(phone, `✅ Updated *${name}* quantity to ${qty}.`, env)
+      .then(() => showCart(phone, session, env));
+  }
+  session.state = 'cart_review';
+  await saveSession(phone, session, env);
+  return showCart(phone, session, env);
 }
 
 async function handleEnteringNotes(phone, msg, session, env) {
-  // Handle global commands to escape stuck state
-  const t = (msg.text || '').toUpperCase().trim();
-  const id = msg.id || '';
-  if (t === 'CANCEL' || id === 'cmd_cancel') {
-    session.state = 'idle';
-    delete session.tempItemId;
-    delete session.tempQty;
-    delete session.cartQtyEdit;
-    delete session.tempCartIdx;
-    await saveSession(phone, session, env);
-    return sendText(phone, '🚫 Cancelled. Send *MENU* to start over.', env);
-  }
-  if (t === 'CART' || id === 'cmd_cart') {
-    session.state = 'cart_review';
-    delete session.tempItemId;
-    delete session.tempQty;
-    delete session.cartQtyEdit;
-    delete session.tempCartIdx;
-    await saveSession(phone, session, env);
-    return showCart(phone, session, env);
-  }
-  if (t === 'MENU' || id === 'cmd_menu') {
-    session.state = 'idle';
-    delete session.tempItemId;
-    delete session.tempQty;
-    delete session.cartQtyEdit;
-    delete session.tempCartIdx;
-    await saveSession(phone, session, env);
-    return showMenuCategories(phone, session, env);
-  }
-
+  // This state is only reached from cart item editing (cart_item_notes button).
   const notes = msg.id === 'notes_none' ? '' : sanitize(msg.text || '', 200);
 
-  // If we were editing quantity, we shouldn't even reach here, but guard just in case
-  if (session.cartQtyEdit) {
-    delete session.cartQtyEdit;
+  const idx = session.tempCartIdx;
+  if (idx !== undefined && session.cart[idx]) {
+    const name = session.cart[idx].name;
+    session.cart[idx].notes = notes;
     session.state = 'cart_review';
+    delete session.tempCartIdx;
+    delete session.cartQtyEdit;
     await saveSession(phone, session, env);
-    return showCart(phone, session, env);
+    return sendText(phone, `✅ Notes updated for *${name}*.`, env)
+      .then(() => showCart(phone, session, env));
   }
 
-  if (!session.tempItemId || !session.tempQty) {
-    session.state = 'idle';
-    await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Something went wrong. Please start over.', env);
+  // Fallback: in-flight sessions from old flow — add item to cart with notes
+  if (session.tempItemId && session.tempQty) {
+    const item = await getAvailableMenuItem(session.tempItemId, env);
+    if (item) {
+      addToCart(session.cart, {
+        itemId:    item.id,
+        name:      item.name,
+        qty:       session.tempQty,
+        unitPrice: item.price,
+        notes,
+      });
+    }
   }
-
-  const item = await getMenuItem(session.tempItemId, env);
-  if (!item) {
-    session.state = 'idle';
-    await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ That item is no longer available. Please try again.', env);
-  }
-
-  addToCart(session.cart, {
-    itemId:    item.id,
-    name:      item.name,
-    qty:       session.tempQty,
-    unitPrice: item.price,
-    notes,
-  });
 
   session.state      = 'cart_review';
   session.tempItemId = null;
   session.tempQty    = null;
   await saveSession(phone, session, env);
-
   return showCart(phone, session, env);
 }
 
@@ -398,7 +413,7 @@ async function handleCartReview(phone, msg, session, env) {
     }));
     rows.push({
       id: 'cart_clear_all',
-      title: '🧹 Clear Entire Cart',
+      title: '🧹 Clear Cart',
       description: 'Remove all items from cart'
     });
 
@@ -457,14 +472,14 @@ async function handleCartManage(phone, msg, session, env) {
       phone,
       `✏️ *Managing: ${item.name}*\nQuantity: ${item.qty}\nNotes: ${item.notes || 'None'}`,
       [
-        { id: 'cart_item_remove', title: '🗑️ Remove' },
-        { id: 'cart_item_qty',    title: '🔢 Change Qty' },
-        { id: 'btn_cart_back',    title: '⬅️ Back' }
+        { id: 'cart_item_remove', title: '🗑️ Remove'      },
+        { id: 'cart_item_qty',    title: '🔢 Change Qty'  },
+        { id: 'cart_item_notes',  title: '📝 Edit Notes'  },
       ],
       env
     );
   }
-  
+
   return showCart(phone, session, env);
 }
 
@@ -508,12 +523,32 @@ async function handleCartItemEdit(phone, msg, session, env) {
   }
 
   if (msg.id === 'cart_item_qty') {
-    session.state = 'entering_quantity'; // Reuse entering_quantity but need to handle return path
-    session.tempItemId = session.cart[idx].itemId; // Hack: setting this so handler thinks we're adding
-    // Actually better to have a dedicated state or a flag in session
-    session.cartQtyEdit = true; 
+    session.state = 'entering_quantity';
+    session.cartQtyEdit = true;
     await saveSession(phone, session, env);
-    return sendText(phone, `🔢 Enter new quantity for *${session.cart[idx].name}* (1-20):`, env);
+    return sendButtons(
+      phone,
+      `🔢 New quantity for *${session.cart[idx].name}*?\n\nTap a button or type a number (1–20):`,
+      [
+        { id: 'qty_2', title: '2' },
+        { id: 'qty_3', title: '3' },
+        { id: 'qty_5', title: '5' },
+      ],
+      env,
+      null,
+      'MENU | CART | CANCEL'
+    );
+  }
+
+  if (msg.id === 'cart_item_notes') {
+    session.state = 'entering_notes';
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `📝 Notes for *${session.cart[idx].name}*:\n\nType your note and send, or tap *No Notes* to clear.`,
+      [{ id: 'notes_none', title: 'No Notes' }],
+      env
+    );
   }
 
   if (msg.id === 'btn_cart_back' || (msg.text || '').toUpperCase() === 'BACK') {
@@ -872,7 +907,11 @@ async function showMenuCategories(phone, session, env) {
   );
 }
 
-async function showItemsForCategory(phone, categoryId, categoryName, session, env) {
+// WhatsApp hard limit: 10 rows total per list message (not per section).
+// For categories with >10 items we paginate: 9 items + 1 "Next Page" nav row.
+const ITEMS_PER_PAGE = 9;
+
+async function showItemsForCategory(phone, categoryId, categoryName, session, env, page = 0) {
   const menu  = await getMenuCached(env);
   const items = menu.itemsByCategory[categoryId] || [];
 
@@ -880,29 +919,44 @@ async function showItemsForCategory(phone, categoryId, categoryName, session, en
     return sendButtons(
       phone,
       `😕 No items available in *${categoryName}* right now.`,
-      [{ id: 'cmd_menu', title: '⬅️ Back to Categories' }],
+      [{ id: 'cmd_menu', title: '⬅️ Categories' }],
       env
     );
   }
 
-  const rows = items.map(item => {
+  const totalPages = Math.ceil(items.length / ITEMS_PER_PAGE);
+  const pageItems  = items.slice(page * ITEMS_PER_PAGE, (page + 1) * ITEMS_PER_PAGE);
+
+  const rows = pageItems.map(item => {
     const priceStr = `₦${item.price.toFixed(2)}`;
-    // Ensure price is visible: max 72 chars for description, budget for price
-    const maxDesc = 72 - priceStr.length - 3; // " — " separator
-    const desc = (item.description || '').slice(0, Math.max(0, maxDesc));
+    const maxDesc  = 72 - priceStr.length - 3;
+    const desc     = (item.description || '').slice(0, Math.max(0, maxDesc));
     return {
       id:          `item_${item.id}`,
-      title:       item.name.slice(0, 24), // Title max 24 chars per WhatsApp limits
+      title:       item.name.slice(0, 24),
       description: `${priceStr} — ${desc || 'Tap to order'}`,
     };
   });
 
-  session.state = 'selecting_item';
+  // Add navigation rows when there are multiple pages
+  if (page > 0) {
+    rows.push({ id: `page_prev_${categoryId}_${page - 1}`, title: '⬅️ Previous Page', description: `Page ${page} of ${totalPages}` });
+  }
+  if (page < totalPages - 1) {
+    rows.push({ id: `page_next_${categoryId}_${page + 1}`, title: '➡️ Next Page', description: `Page ${page + 2} of ${totalPages}` });
+  }
+
+  session.state            = 'selecting_item';
+  session.tempCategoryId   = categoryId;
+  session.tempCategoryName = categoryName;
   await saveSession(phone, session, env);
+
+  const pageLabel = totalPages > 1 ? ` — Page ${page + 1}/${totalPages}` : '';
+  console.log('[User] showItemsForCategory:', categoryName, '| page:', page, '| rows:', rows.length);
 
   return sendList(
     phone,
-    `🍽️ *${categoryName}*\n\nSelect an item to see details:`,
+    `🍽️ *${categoryName}*${pageLabel} (${items.length} items)\n\nSelect an item to see details:`,
     'Choose Item',
     [{ title: categoryName, rows }],
     env
@@ -911,28 +965,80 @@ async function showItemsForCategory(phone, categoryId, categoryName, session, en
 
 async function showItemDetail(phone, itemId, session, env) {
   const item = await getMenuItem(itemId, env);
-  if (!item) {
-    return sendText(phone, '⚠️ Item not found.', env);
+  if (!item || !item.is_available) {
+    return sendButtons(
+      phone,
+      '⚠️ This item is no longer available.',
+      [{ id: 'cmd_menu', title: '🍽️ Back to Menu' }],
+      env
+    );
   }
 
   session.tempItemId = item.id;
   session.state      = 'item_detail';
   await saveSession(phone, session, env);
 
-  const hasCartItems = session.cart.length > 0;
-  const buttons = [{ id: 'btn_add', title: '➕ Add to Cart' }];
-  if (hasCartItems) buttons.push({ id: 'btn_checkout', title: '🛒 View Cart' });
-  buttons.push({ id: 'btn_back_menu', title: '⬅️ Back to Menu' });
+  const buttons = [
+    { id: `qty_1_${item.id}`,      title: '➕ Add 1'      },
+    { id: `qty_custom_${item.id}`, title: '🔢 Choose Qty' },
+    { id: 'btn_back_menu',         title: '⬅️ Back'       },
+  ];
 
   const bodyText = `*${item.name}*\n💰 ₦${item.price.toFixed(2)}\n\n${item.description || 'No description.'}`;
+  const footer   = 'MENU | CART | HELP';
 
-  // BUG-28 FIX: Use imageButtonPayload to send image + buttons as ONE message
-  // instead of two separate API calls (sendImage then sendButtons).
   if (item.image_url) {
-    return sendImageButtons(phone, bodyText, buttons, item.image_url, env);
+    return sendImageButtons(phone, bodyText, buttons, item.image_url, env, footer);
   }
 
-  return sendButtons(phone, bodyText, buttons, env, item.name);
+  return sendButtons(phone, bodyText, buttons, env, item.name, footer);
+}
+
+async function addItemToCartAndConfirm(phone, session, qty, env) {
+  if (!session.tempItemId) {
+    session.state = 'idle';
+    await saveSession(phone, session, env);
+    return sendText(phone, '⚠️ Something went wrong. Send *MENU* to start over.', env);
+  }
+
+  const item = await getAvailableMenuItem(session.tempItemId, env);
+  if (!item) {
+    session.state      = 'idle';
+    session.tempItemId = null;
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      '⚠️ Sorry, this item is no longer available.',
+      [{ id: 'cmd_menu', title: '🍽️ Browse Menu' }],
+      env
+    );
+  }
+
+  addToCart(session.cart, {
+    itemId:    item.id,
+    name:      item.name,
+    qty,
+    unitPrice: item.price,
+    notes:     '',
+  });
+
+  session.state      = 'cart_review';
+  session.tempItemId = null;
+  session.tempQty    = null;
+  await saveSession(phone, session, env);
+
+  const total = cartTotal(session.cart).toFixed(2);
+  return sendButtons(
+    phone,
+    `✅ Added *${item.name}* ×${qty} to cart!\n\n🛒 Cart total: ₦${total}`,
+    [
+      { id: 'btn_checkout_start', title: '✅ Checkout'  },
+      { id: 'btn_keep_shopping',  title: '➕ Add More'  },
+      { id: 'btn_manage_cart',    title: '✏️ Manage'    },
+    ],
+    env,
+    'Item Added!'
+  );
 }
 
 async function showCart(phone, session, env) {
@@ -1009,11 +1115,29 @@ async function showOrderHistory(phone, session, env) {
   );
 }
 
+// Silently verify payment with Flutterwave and update if confirmed paid.
+// Catches orders where the webhook was missed.
+async function recoverPaymentIfNeeded(order, env) {
+  if (order.payment_status === 'paid' || !order.payment_reference) return order;
+  try {
+    const { verifyFlutterwaveTransaction } = await import('../payments/flutterwave.js');
+    const data = await verifyFlutterwaveTransaction(order.payment_reference, env);
+    if (data.status === 'successful' && Math.abs(data.amount - order.total_price) <= 0.01) {
+      await updateOrderPayment(order.id, { payment_status: 'paid', paid_at: new Date().toISOString() }, env);
+      order.payment_status = 'paid';
+    }
+  } catch (err) {
+    console.warn('[OrderTracking] Payment recovery check failed:', err.message);
+  }
+  return order;
+}
+
 async function handleOrderTracking(phone, msg, session, env) {
   if (msg.type === 'list_reply' && msg.id?.startsWith('track_')) {
     const orderId = parseInt(msg.id.replace('track_', ''), 10);
-    const order = await getOrder(orderId, env);
+    let order = await getOrder(orderId, env);
     if (!order) return showOrderHistory(phone, session, env);
+    order = await recoverPaymentIfNeeded(order, env);
 
     const statusEmoji = {
       pending:   '⏳ Pending',
@@ -1063,7 +1187,7 @@ async function handleOrderTracking(phone, msg, session, env) {
       phone,
       body,
       [
-        { id: 'cmd_orders', title: '⬅️ Back to History' },
+        { id: 'cmd_orders', title: '⬅️ Order History' },
         { id: 'cmd_menu',   title: '🍽️ View Menu'       },
       ],
       env

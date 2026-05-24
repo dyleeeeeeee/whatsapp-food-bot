@@ -68,17 +68,8 @@ export async function verifyFlutterwaveTransaction(txRef, env) {
 }
 
 export async function verifyFlutterwaveWebhookSignature(signature, env) {
-  const secretKey = env.FLUTTERWAVE_SECRET_KEY;
-  if (!secretKey || !signature) return false;
-
-  // Flutterwave signature: SHA256 hash of the secret key
-  // Different from Paystack's HMAC-SHA512 of request body
-  const encoder = new TextEncoder();
-  const data = encoder.encode(secretKey);
-
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-  return hashHex === signature;
+  const webhookSecret = env.FLUTTERWAVE_WEBHOOK_SECRET || '';
+  // If no secret configured, skip verification (set FLUTTERWAVE_WEBHOOK_SECRET to lock down)
+  if (!webhookSecret) return true;
+  return signature === webhookSecret;
 }

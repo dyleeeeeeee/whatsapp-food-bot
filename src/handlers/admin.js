@@ -92,6 +92,24 @@ export async function handleAdminMessage(phone, msg, env) {
     return handleBackNavigation(phone, session, env);
   }
 
+  // Stale-state recovery: these button IDs must route correctly regardless of KV state
+  if (msg.id === 'admin_update_status') {
+    session.state    = 'admin_update_status_id';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendText(phone, '📦 Enter the *Order ID* to update:\n\nSend *CANCEL* to abort.', env);
+  }
+  if (msg.id === 'admin_bulk_menu') {
+    return showBulkMenu(phone, session, env);
+  }
+  if (msg.id?.startsWith('ba_os_')) {
+    if (!session.adminCtx.bulk?.selectedIds) {
+      session.adminCtx.bulk = { type: 'orders', selectedIds: [], page: 0 };
+    }
+    session.state = 'admin_bulk_orders_action';
+    return handleBulkOrdersAction(phone, msg, session, env);
+  }
+
   switch (session.state) {
     case 'admin_idle':                return handleAdminIdle(phone, msg, session, env);
     case 'admin_add_category':        return handleAddCategory(phone, msg, session, env);
@@ -358,7 +376,7 @@ async function handleViewCategories(phone, msg, session, env) {
       phone,
       `📂 *${category.name}*\n\n${itemText}`,
       [
-        { id: 'admin_view_cats', title: '📂 View Other Categories' },
+        { id: 'admin_view_cats', title: '📂 View Categories' },
         { id: 'admin_home', title: '🔧 Admin Menu' },
       ],
       env,
@@ -788,7 +806,7 @@ async function handleEditItemField(phone, msg, session, env) {
       phone,
       `✅ *${item.name}* is now *${label}*.`,
       [
-        { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+        { id: 'admin_edit_item', title: '✏️ Edit Another' },
         { id: 'admin_home',      title: '🔧 Admin Menu'        },
       ],
       env
@@ -881,7 +899,7 @@ async function handleEditItemValue(phone, msg, session, env) {
         phone,
         `✅ Category updated → *${cat.name}*`,
         [
-          { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+          { id: 'admin_edit_item', title: '✏️ Edit Another' },
           { id: 'admin_home',      title: '🔧 Admin Menu'        },
         ],
         env
@@ -903,7 +921,7 @@ async function handleEditItemValue(phone, msg, session, env) {
       phone,
       '❌ Edit cancelled.',
       [
-        { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+        { id: 'admin_edit_item', title: '✏️ Edit Another' },
         { id: 'admin_home', title: '🔧 Admin Menu' },
       ],
       env
@@ -955,7 +973,7 @@ async function handleEditItemValue(phone, msg, session, env) {
     phone,
     `✅ *${editField}* updated → ${displayVal}`,
     [
-      { id: 'admin_edit_item', title: '✏️ Edit Another Item' },
+      { id: 'admin_edit_item', title: '✏️ Edit Another' },
       { id: 'admin_home',      title: '🔧 Admin Menu'        },
     ],
     env
@@ -1042,7 +1060,7 @@ async function handleDeleteItemConfirm(phone, msg, session, env) {
       phone,
       `✅ *${deleteItemName}* deleted from menu.`,
       [
-        { id: 'admin_delete_item', title: '🗑️ Delete Another Item' },
+        { id: 'admin_delete_item', title: '🗑️ Delete Another' },
         { id: 'admin_home', title: '🔧 Admin Menu' },
       ],
       env
@@ -1116,7 +1134,7 @@ async function handleToggleItemSelect(phone, msg, session, env) {
     phone,
     `*${item.name}* is now *${label}*.`,
     [
-      { id: 'admin_toggle_item', title: '🔄 Toggle Another Item' },
+      { id: 'admin_toggle_item', title: '🔄 Toggle Another' },
       { id: 'admin_home', title: '🔧 Admin Menu' },
     ],
     env
@@ -1209,7 +1227,7 @@ async function handleUpdateStatusId(phone, msg, session, env) {
       phone,
       '❌ Status update cancelled.',
       [
-        { id: 'admin_update_status', title: '📦 Update Another Status' },
+        { id: 'admin_update_status', title: '📦 Update Status' },
         { id: 'admin_home', title: '🔧 Admin Menu' },
       ],
       env
@@ -1315,7 +1333,7 @@ async function performStatusUpdate(phone, session, env) {
     phone,
     `✅ Order #${updateOrderId} status updated to *${newStatus.toUpperCase()}*.\n\nCustomer notified.`,
     [
-      { id: 'admin_update_status', title: '📦 Update Another Status' },
+      { id: 'admin_update_status', title: '📦 Update Status' },
       { id: 'admin_home', title: '🔧 Admin Menu' },
     ],
     env
@@ -1490,12 +1508,13 @@ async function showBulkOrdersList(phone, session, env) {
     };
   });
 
-  if (offset + pageSize < total) {
-    rows.push({ id: 'bulk_page_next', title: '➡️ Next Page', description: `Show orders ${offset + pageSize + 1}-${Math.min(offset + pageSize * 2, total)}` });
-  }
   if (bulk.page > 0) {
     rows.push({ id: 'bulk_page_prev', title: '⬅️ Prev Page', description: `Show orders ${offset - pageSize + 1}-${offset}` });
   }
+  if (offset + pageSize < total) {
+    rows.push({ id: 'bulk_page_next', title: '➡️ Next Page', description: `Show orders ${offset + pageSize + 1}-${Math.min(offset + pageSize * 2, total)}` });
+  }
+  rows.push({ id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length} sel.)`, description: 'Review & apply status' });
 
   const footer = `Page ${bulk.page + 1} of ${Math.ceil(total / pageSize)} | ${bulk.selectedIds.length} selected`;
 
@@ -2135,7 +2154,7 @@ async function handleBulkItemsRemoveSelect(phone, msg, session, env) {
       phone,
       `🗑️ *Confirm Delete*\n\nDelete ${selectedItems.length} items? *This cannot be undone.*\n\n${nameList}${more}`,
       [
-        { id: 'bulk_remove_confirm', title: '🗑️ Yes, Delete All' },
+        { id: 'bulk_remove_confirm', title: '🗑️ Delete All' },
         { id: 'bulk_back_select',    title: '⬅️ Back'            },
       ],
       env
@@ -2197,7 +2216,7 @@ async function handleBulkItemsRemoveConfirm(phone, msg, session, env) {
     phone,
     `🗑️ Confirm delete of ${bulk.selectedIds.length} items?`,
     [
-      { id: 'bulk_remove_confirm', title: '🗑️ Yes, Delete All' },
+      { id: 'bulk_remove_confirm', title: '🗑️ Delete All' },
       { id: 'bulk_back_select',    title: '⬅️ Back'            },
     ],
     env
@@ -2499,7 +2518,7 @@ async function handleBulkItemsEditConfirm(phone, msg, session, env) {
     phone,
     `✅ *Bulk Edit Complete*\n\nUpdated: ${updatedCount}\nLog ID: ${logId}`,
     [
-      { id: 'bulk_items_edit', title: '✏️ Edit More Items' },
+      { id: 'bulk_items_edit', title: '✏️ Edit More' },
       { id: 'admin_bulk_menu', title: '📦 Bulk Actions'   },
     ],
     env
@@ -2701,7 +2720,7 @@ async function handleBulkCatsRenameValue(phone, msg, session, env) {
     return sendButtons(phone,
       `✅ Category renamed: *${bulk.renameCatOldName}* → *${newName}*\nLog ID: ${logId}`,
       [
-        { id: 'bulk_cats_rename', title: '✏️ Rename Another' },
+        { id: 'bulk_cats_rename', title: '✏️ Rename Again' },
         { id: 'admin_bulk_menu',  title: '📦 Bulk Actions'   },
       ], env);
   } catch (err) {
@@ -2762,8 +2781,8 @@ async function handleBulkCatsDeleteSelect(phone, msg, session, env) {
       phone,
       `🗑️ *Delete ${selectedCats.length} Categories*\n\n${catNames}\n\nTotal items affected: *${totalItems}*\n\n*How should items be handled?*`,
       [
-        { id: 'bcd_mode_cascade', title: '🗑️ Delete Items Too' },
-        { id: 'bcd_mode_move',    title: '🔀 Move Items First' },
+        { id: 'bcd_mode_cascade', title: '🗑️ Delete Items' },
+        { id: 'bcd_mode_move',    title: '🔀 Move Items' },
       ],
       env
     );
@@ -2786,7 +2805,7 @@ async function handleBulkCatsDeleteMode(phone, msg, session, env) {
       phone,
       `⚠️ *Final Confirm*\n\nDelete ${bulk.selectedIds.length} categories AND all *${totalItems} items* in them?\n\n*This cannot be undone.*`,
       [
-        { id: 'bcd_confirm_yes', title: '⚠️ Yes, Delete All' },
+        { id: 'bcd_confirm_yes', title: '⚠️ Yes, Delete' },
         { id: 'bcd_back',        title: '⬅️ Back'            },
       ],
       env
@@ -2809,7 +2828,7 @@ async function handleBulkCatsDeleteMode(phone, msg, session, env) {
   }
 
   return sendButtons(phone, '⚠️ Choose how to handle items in deleted categories:',
-    [{ id: 'bcd_mode_cascade', title: '🗑️ Delete Items Too' }, { id: 'bcd_mode_move', title: '🔀 Move Items First' }], env);
+    [{ id: 'bcd_mode_cascade', title: '🗑️ Delete Items' }, { id: 'bcd_mode_move', title: '🔀 Move Items First' }], env);
 }
 
 async function handleBulkCatsDeleteTarget(phone, msg, session, env) {
