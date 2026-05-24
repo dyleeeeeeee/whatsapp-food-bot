@@ -33,6 +33,7 @@ database_id   = "0bcc31a6-ed24-4874-8cd8-ddf800c3e825"
 ENVIRONMENT      = "production"
 MENU_CACHE_TTL   = "300"       # seconds to cache menu in KV
 GRAPH_API_VERSION = "v21.0"   # BUG-22: configurable, not hardcoded
+FLUTTERWAVE_CALLBACK_URL = "https://flutterwave.com/pay"  # Redirect URL after payment
 
 # ─── Staging ─────────────────────────────────────────────────
 [env.staging]

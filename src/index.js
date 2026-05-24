@@ -9,7 +9,7 @@
 
 import { verifyWebhookSignature } from './security.js';
 import { handleWebhookGet, handleWebhookPost } from './webhook.js';
-import { handlePaystackWebhook } from './paystack_handler.js';
+import { handleFlutterwaveWebhook } from './webhooks/flutterwave_handler.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -43,8 +43,8 @@ export default {
         }
       }
 
-      if (url.pathname === '/paystack/webhook' && request.method === 'POST') {
-        return handlePaystackWebhook(request, env, ctx);
+      if (url.pathname === '/flutterwave/webhook' && request.method === 'POST') {
+        return handleFlutterwaveWebhook(request, env, ctx);
       }
 
       return new Response('Not Found', { status: 404 });

@@ -1,0 +1,17 @@
+-- ============================================================
+-- migration_002.sql — Flutterwave Migration
+-- ============================================================
+-- Migrating from Paystack to Flutterwave payment gateway.
+--
+-- No schema changes required - existing payment fields are compatible:
+-- - payment_reference: Will store Flutterwave tx_ref
+-- - payment_url: Will store Flutterwave checkout link
+-- - payment_access_code: Will remain NULL (Flutterwave doesn't use this)
+-- - payment_status: Same statuses (unpaid, pending, paid, failed)
+--
+-- This file serves as documentation of the migration.
+-- Existing Paystack orders will remain in the database but webhook
+-- endpoint has been changed from /paystack/webhook to /flutterwave/webhook
+
+-- Verification query:
+-- SELECT id, user_phone, payment_status, payment_reference, payment_url FROM Orders ORDER BY id DESC LIMIT 5;

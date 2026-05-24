@@ -33,7 +33,7 @@ import {
   getFullMenu, getMenuItem, createOrder, getUserOrders, getOrder,
   updateOrderPayment,
 } from '../db.js';
-import { initializePaystackTransaction } from '../paystack.js';
+import { initializeFlutterwaveTransaction } from '../payments/flutterwave.js';
 import { sanitize } from '../security.js';
 
 // Maximum chars in checkout confirm body (WhatsApp cap: 1024)
@@ -691,27 +691,33 @@ async function handleCheckoutConfirm(phone, msg, session, env) {
         env
       );
 
-      // 2. Initialize Paystack
-      const amountKobo = Math.round(cartTotal(session.cart) * 100);
+      // 2. Initialize Flutterwave
+      const amount = cartTotal(session.cart);
       const reference = `order_${orderId}_${Date.now()}`;
-      
+
       let payData;
       try {
-        payData = await initializePaystackTransaction({
-          amountKobo,
-          reference,
+        payData = await initializeFlutterwaveTransaction({
+          amount,
+          txRef: reference,
+          currency: 'NGN',
+          customer: {
+            email: 'customer@fastchow.bot',
+            phone_number: phone,
+            name: 'Customer'
+          },
           metadata: { orderId, phone }
         }, env);
 
-        // 3. Update order with Paystack details
+        // 3. Update order with Flutterwave details
         await updateOrderPayment(orderId, {
           payment_reference: reference,
-          payment_url: payData.authorization_url,
-          payment_access_code: payData.access_code,
+          payment_url: payData.link,
+          payment_access_code: null,
           payment_status: 'pending'
         }, env);
       } catch (payErr) {
-        console.error('[Checkout] Paystack init failed:', payErr);
+        console.error('[Checkout] Flutterwave init failed:', payErr);
         // We still created the order, but payment link failed.
         // We'll let the user know and they can retry from My Orders.
       }
@@ -726,9 +732,9 @@ async function handleCheckoutConfirm(phone, msg, session, env) {
         return sendText(
           phone,
           `🎉 *Order #${orderId} placed!*\n\n` +
-          `💰 Total: ${formatPrice(amountKobo / 100)}\n\n` +
+          `💰 Total: ${formatPrice(amount)}\n\n` +
           `💳 *Action Required:* Please complete your payment to confirm this order:\n\n` +
-          `${payData.authorization_url}\n\n` +
+          `${payData.link}\n\n` +
           `Once paid, we will begin preparing your meal! Track anytime with *ORDERS*.`,
           env
         );
