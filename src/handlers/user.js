@@ -198,6 +198,27 @@ async function handleItemDetail(phone, msg, session, env) {
   if (msg.id === 'btn_checkout') {
     return showCart(phone, session, env);
   }
+
+  // BUG FIX: Handle quantity input that arrives before KV state update propagates
+  // If user types a number, assume they're responding to "how many would you like"
+  const raw = (msg.text || '').trim();
+  const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+  if (!isNaN(qty) && qty >= 1 && qty <= 20) {
+    // Treat as quantity input, transition to entering_quantity state
+    session.state = 'entering_quantity';
+    session.tempQty = qty;
+    await saveSession(phone, session, env);
+    // Forward to entering_notes flow
+    session.state = 'entering_notes';
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `📝 Any special notes for this item?\n(e.g. "No onions", "Extra sauce")`,
+      [{ id: 'notes_none', title: 'No notes' }],
+      env
+    );
+  }
+
   // Any other input while on item detail — explain what to do
   return sendText(
     phone,
