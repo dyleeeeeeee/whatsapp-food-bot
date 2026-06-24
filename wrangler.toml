@@ -36,13 +36,15 @@ GRAPH_API_VERSION = "v21.0"   # BUG-22: configurable, not hardcoded
 FLUTTERWAVE_CALLBACK_URL = "https://flutterwave.com/pay"  # Redirect URL after payment
 
 # ─── Optional feature flags (leave unset to keep current behavior) ──
-# CHECKOUT_FLOW_ID — if set, customer checkout uses the WhatsApp Flow in
-#   flows/checkout.json instead of the current text-based flow. (UX-04)
-# CHECKOUT_FLOW_ID = "<flow-id-from-whatsapp-manager>"
+# CHECKOUT_FLOW_ID — customer checkout uses the WhatsApp Flow in
+#   flows/checkout.json instead of the text-based flow. (UX-04)
+CHECKOUT_FLOW_ID = "1038848575351171"
 #
-# ADD_ITEM_FLOW_ID — if set, admin Add-Item uses the WhatsApp Flow in
-#   flows/add-item.json instead of the current text-based flow. (UX-13)
-# ADD_ITEM_FLOW_ID = "<flow-id-from-whatsapp-manager>"
+# ADD_ITEM_FLOW_ID — admin Add-Item uses the WhatsApp Flow in flows/add-item.json. (UX-13)
+#   HELD until flows/add-item.json's category Dropdown is rebuilt with the real
+#   numeric MenuCategories.id values and re-published — the placeholder ids
+#   (mains/sides/…) parseInt to NaN and every category pick would fail.
+# ADD_ITEM_FLOW_ID = "1608620654017634"
 #
 # FLUTTERWAVE_WEBHOOK_SECRET — REQUIRED for webhook acceptance (hard-fail
 #   if missing). It is a secret, so it is NOT set here. Set it with:
