@@ -30,11 +30,9 @@
                 "label": "Category",
                 "required": true,
                 "data-source": [
-                  { "id": "mains", "title": "Mains" },
-                  { "id": "sides", "title": "Sides" },
-                  { "id": "drinks", "title": "Drinks" },
-                  { "id": "desserts", "title": "Desserts" },
-                  { "id": "other", "title": "Other" }
+                  { "id": "8",  "title": "Drinks" },
+                  { "id": "9",  "title": "Snacks" },
+                  { "id": "10", "title": "Main Menu" }
                 ]
               },
               {
