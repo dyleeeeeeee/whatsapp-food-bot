@@ -1,0 +1,52 @@
+{
+  "version": "3.1",
+  "screens": [
+    {
+      "id": "CHECKOUT",
+      "title": "Delivery Details",
+      "terminal": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Where should we deliver?"
+          },
+          {
+            "type": "Form",
+            "name": "checkout_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "name": "address",
+                "label": "Delivery address",
+                "input-type": "text",
+                "required": true,
+                "helper-text": "Street, house/apartment, area and any landmark."
+              },
+              {
+                "type": "TextArea",
+                "name": "notes",
+                "label": "Delivery notes (optional)",
+                "required": false,
+                "helper-text": "e.g. call on arrival, gate code, leave at door."
+              },
+              {
+                "type": "Footer",
+                "label": "Place Order",
+                "on-click-action": {
+                  "name": "complete",
+                  "payload": {
+                    "address": "${form.address}",
+                    "notes": "${form.notes}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

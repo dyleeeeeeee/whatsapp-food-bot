@@ -13,6 +13,48 @@ A production-ready food ordering bot built on Cloudflare Workers + WhatsApp Clou
 | Database      | Cloudflare D1 (SQLite)  |
 | Media         | Cloudflare R2 (optional)|
 | Messaging     | WhatsApp Cloud API      |
+| Payments      | Flutterwave (NGN ₦)     |
+
+---
+
+## What changed in this release
+
+Payments moved from Paystack to **Flutterwave**, plus optional WhatsApp Flows
+and a profile-configuration helper. Read this before deploying an existing
+instance.
+
+### New environment variables / secrets
+
+| Variable                     | Required | Notes                                                                 |
+|------------------------------|----------|-----------------------------------------------------------------------|
+| `FLUTTERWAVE_SECRET_KEY`     | ✅        | Flutterwave v3 API key (`FLWSECK...`).                                |
+| `FLUTTERWAVE_WEBHOOK_SECRET` | ✅        | **Payments return HTTP 401 until this is set.** Must equal the Flutterwave webhook "Secret hash". |
+| `FLUTTERWAVE_CALLBACK_URL`   | ❌        | Post-payment redirect (set in `wrangler.toml`).                       |
+| `CHECKOUT_FLOW_ID`           | ❌        | If set, customer checkout uses a WhatsApp Flow (otherwise the text flow). |
+| `ADD_ITEM_FLOW_ID`           | ❌        | If set, admin Add-Item uses a WhatsApp Flow (otherwise the text flow).   |
+
+> All feature flags fall back to the current text-based behavior when unset, so
+> upgrading without setting them keeps the live bot working unchanged.
+
+### Required manual steps
+
+1. **Set `FLUTTERWAVE_WEBHOOK_SECRET`** (`wrangler secret put FLUTTERWAVE_WEBHOOK_SECRET`)
+   and register the Flutterwave webhook (`/flutterwave/webhook`, event
+   `charge.completed`) with a matching **Secret hash**. Without this, every
+   webhook is rejected with 401 and orders never confirm as paid.
+
+2. **Run `node scripts/configure-profile.js`** to set the WhatsApp business
+   profile **Ice Breakers** and **Commands** (conversation entry points).
+
+### Optional steps
+
+- **Enable WhatsApp Flows** — set `CHECKOUT_FLOW_ID` and/or `ADD_ITEM_FLOW_ID`
+  after publishing `flows/checkout.json` and `flows/add-item.json` in the Meta
+  **Flow Builder**. Leave the flags unset to keep the text-based flows.
+
+- **Order-status message templates** — create approved templates so out-of-band
+  order-status updates can reach customers **outside the 24-hour customer-service
+  window** (free-form messages are blocked once the window closes).
 
 ---
 
@@ -101,7 +143,17 @@ wrangler secret put VERIFY_TOKEN
 
 # App Secret from Meta App Settings (for signature verification)
 wrangler secret put WHATSAPP_APP_SECRET
+
+# Flutterwave API key (FLWSECK...)
+wrangler secret put FLUTTERWAVE_SECRET_KEY
+
+# Flutterwave webhook "Secret hash" — REQUIRED. Without it the
+# /flutterwave/webhook endpoint hard-fails every call with HTTP 401,
+# so payments are never confirmed.
+wrangler secret put FLUTTERWAVE_WEBHOOK_SECRET
 ```
+
+See **FLUTTERWAVE_DEPLOYMENT.md** for the full payment setup.
 
 ---
 
@@ -109,11 +161,11 @@ wrangler secret put WHATSAPP_APP_SECRET
 
 ```bash
 wrangler d1 execute food-bot-db --command \
-  "INSERT INTO AdminUsers (phone_number, name) VALUES ('1XXXXXXXXXX', 'Your Name');"
+  "INSERT INTO AdminUsers (phone_number, name) VALUES ('2348012345678', 'Your Name');"
 ```
 
 > Phone number must be in E.164 format **without** the `+` prefix.
-> e.g. US number +1 555 123 4567 → `15551234567`
+> e.g. Nigerian number +234 801 234 5678 → `2348012345678`
 
 ---
 
@@ -130,13 +182,22 @@ https://whatsapp-food-bot.<your-subdomain>.workers.dev
 
 ---
 
-## Step 6 — Register Webhook in Meta
+## Step 6 — Register Webhooks
+
+### Meta / WhatsApp
 
 1. Meta Dashboard → WhatsApp → Configuration
 2. **Webhook URL**: `https://whatsapp-food-bot.<subdomain>.workers.dev/webhook`
 3. **Verify Token**: same value you set in `VERIFY_TOKEN`
 4. Click **Verify and Save**
 5. Subscribe to: `messages`
+
+### Flutterwave
+
+1. Flutterwave Dashboard → Settings → Webhooks
+2. **Webhook URL**: `https://whatsapp-food-bot.<subdomain>.workers.dev/flutterwave/webhook`
+3. **Secret hash**: the exact value you set as the `FLUTTERWAVE_WEBHOOK_SECRET` secret
+4. Select event: `charge.completed`
 
 ---
 
@@ -150,14 +211,23 @@ Send a WhatsApp message to your test number. You should receive the welcome menu
 
 ## Environment Variables Reference
 
-| Variable              | Required | Description                              |
-|-----------------------|----------|------------------------------------------|
-| `WHATSAPP_TOKEN`      | ✅        | Bearer token for Meta API calls          |
-| `PHONE_NUMBER_ID`     | ✅        | Your WhatsApp Phone Number ID            |
-| `VERIFY_TOKEN`        | ✅        | Webhook verification shared secret       |
-| `WHATSAPP_APP_SECRET` | ✅        | App Secret for signature verification    |
-| `MENU_CACHE_TTL`      | ❌        | Seconds to cache menu in KV (default 300)|
-| `ENVIRONMENT`         | ❌        | `production` / `development`             |
+| Variable                     | Required | Description                                                       |
+|------------------------------|----------|-------------------------------------------------------------------|
+| `WHATSAPP_TOKEN`             | ✅        | Bearer token for Meta API calls                                   |
+| `PHONE_NUMBER_ID`            | ✅        | Your WhatsApp Phone Number ID                                     |
+| `VERIFY_TOKEN`               | ✅        | Webhook verification shared secret                                |
+| `WHATSAPP_APP_SECRET`        | ✅        | App Secret for signature verification                             |
+| `FLUTTERWAVE_SECRET_KEY`     | ✅        | Flutterwave v3 API key (`FLWSECK...`)                             |
+| `FLUTTERWAVE_WEBHOOK_SECRET` | ✅        | Secret hash compared against the `verif-hash` webhook header (payments return 401 without it) |
+| `FLUTTERWAVE_CALLBACK_URL`   | ❌        | Post-payment redirect URL (set in `wrangler.toml`)               |
+| `CHECKOUT_FLOW_ID`           | ❌        | If set, customer checkout uses a WhatsApp Flow instead of the text flow |
+| `ADD_ITEM_FLOW_ID`           | ❌        | If set, admin Add-Item uses a WhatsApp Flow instead of the text flow |
+| `MENU_CACHE_TTL`             | ❌        | Seconds to cache menu in KV (default 300)                        |
+| `ENVIRONMENT`                | ❌        | `production` / `development`                                      |
+
+Currency is **NGN (₦)** throughout; all prices and order totals are formatted in Naira.
+
+There is **no** `FLUTTERWAVE_PUBLIC_KEY` — checkout is server-side only.
 
 ---
 
@@ -182,42 +252,55 @@ User sends any message
  └───────────────┘                            │
         │ select item                         │
         ▼                                     │
- ┌─────────────┐                              │
- │ item_detail │                              │
- └─────────────┘                              │
-        │ "Add to Cart"                       │
-        ▼                                     │
- ┌──────────────────┐                         │
- │entering_quantity │◄────────────────────────┤
- └──────────────────┘                         │
-        │ enter number                        │
-        ▼                                     │
- ┌───────────────┐                            │
- │entering_notes │                            │
- └───────────────┘                            │
-        │                                     │
-        ▼                                     │
- ┌─────────────┐     keep shopping            │
- │ cart_review │─────────────────────────┐    │
- └─────────────┘                         │    │
-        │ checkout                       │    │
-        ▼                                ▼    │
- ┌──────────────────┐          ┌──────────────┐│
- │checkout_address  │          │browsing_menu ││
- └──────────────────┘          └──────────────┘│
-        │ enter address                       │
-        ▼                                     │
- ┌────────────────────────┐                   │
- │checkout_delivery_notes │                   │
- └────────────────────────┘                   │
-        │ enter notes/skip                    │
-        ▼                                     │
- ┌──────────────────┐                         │
- │checkout_confirm  │                         │
- └──────────────────┘                         │
-        │ "Place Order" → save to D1           │
-        └──────────────────────────────────────┘
+ ┌─────────────┐  "➕ Add 1" (adds 1 unit)     │
+ │ item_detail │──────────────────────────┐   │
+ └─────────────┘                          │   │
+        │ "🔢 Choose Qty"                  │   │
+        ▼                                 │   │
+ ┌──────────────────┐                     │   │
+ │entering_quantity │                     │   │
+ └──────────────────┘                     │   │
+        │ enter number                    │   │
+        ▼                                 ▼   │
+ ┌─────────────┐◄───────────────────────────  │
+ │ cart_review │──────────────┐  keep shopping │
+ └─────────────┘              │                │
+   │  │ checkout              ▼                │
+   │  │             ┌──────────────┐           │
+   │  │             │browsing_menu │           │
+   │  │             └──────────────┘           │
+   │  │                                        │
+   │  │ "✏️ Manage" → pick item → "🔢 Change Qty"│
+   │  └────────────► entering_quantity ────────┘ (back to cart_review)
+   │
+   │  "✏️ Manage" → pick item → edit notes
+   └───────────────► entering_notes ───────────► (back to cart_review)
+        │ checkout
+        ▼
+ ┌──────────────────┐
+ │checkout_address  │
+ └──────────────────┘
+        │ enter address  ("BACK" returns here from notes)
+        ▼
+ ┌────────────────────────┐
+ │checkout_delivery_notes │
+ └────────────────────────┘
+        │ enter notes / "Skip"
+        ▼
+ ┌──────────────────┐
+ │checkout_confirm  │
+ └──────────────────┘
+        │ "Place Order" → save to D1 → Flutterwave payment link
+        ▼
+      (idle)
 ```
+
+> **Note:** `entering_notes` is a **cart-edit branch**, not a checkout step. It
+> is reached only via **✏️ Manage → select item → edit notes**, and it returns
+> to `cart_review`. Inline checkout never asks for per-item notes — the only
+> notes prompt during checkout is the order-level `checkout_delivery_notes`
+> step. Adding an item with **➕ Add 1** goes straight to the cart; **🔢 Choose
+> Qty** routes through `entering_quantity` first.
 
 ---
 
@@ -227,6 +310,7 @@ User sends any message
 |-----------------------|---------|--------------------------------------|
 | `session:{phone}`     | 2 hours | Session state + cart JSON            |
 | `menu:cache`          | 5 min   | Full serialised menu from D1         |
+| `addr:{phone}`        | 30 days | Last delivery address (for reuse)    |
 
 ---
 
@@ -262,5 +346,6 @@ To support multiple restaurants:
 | Webhook verification fails     | Check `VERIFY_TOKEN` matches Meta dashboard            |
 | 403 on POST                    | Set `WHATSAPP_APP_SECRET`, or set `ENVIRONMENT=development` |
 | Messages not received          | Verify webhook subscription includes `messages`        |
+| Payments never confirm / 401 on `/flutterwave/webhook` | Set `FLUTTERWAVE_WEBHOOK_SECRET` and make it match the Flutterwave "Secret hash" |
 | D1 errors                      | Run `schema.sql` against production D1                 |
 | Menu not updating              | Bust KV cache: `wrangler kv:key delete menu:cache --binding SESSION_KV` |

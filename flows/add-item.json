@@ -1,0 +1,82 @@
+{
+  "version": "3.1",
+  "screens": [
+    {
+      "id": "ADD_ITEM",
+      "title": "Add Menu Item",
+      "terminal": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "New menu item"
+          },
+          {
+            "type": "Form",
+            "name": "add_item_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "name": "name",
+                "label": "Item name",
+                "input-type": "text",
+                "required": true
+              },
+              {
+                "type": "Dropdown",
+                "name": "category",
+                "label": "Category",
+                "required": true,
+                "data-source": [
+                  { "id": "mains", "title": "Mains" },
+                  { "id": "sides", "title": "Sides" },
+                  { "id": "drinks", "title": "Drinks" },
+                  { "id": "desserts", "title": "Desserts" },
+                  { "id": "other", "title": "Other" }
+                ]
+              },
+              {
+                "type": "TextInput",
+                "name": "price",
+                "label": "Price (NGN)",
+                "input-type": "number",
+                "required": true,
+                "helper-text": "Whole or decimal amount in Naira, e.g. 2500."
+              },
+              {
+                "type": "TextArea",
+                "name": "description",
+                "label": "Description",
+                "required": false
+              },
+              {
+                "type": "TextInput",
+                "name": "image_url",
+                "label": "Image URL (optional)",
+                "input-type": "text",
+                "required": false,
+                "helper-text": "https link to a JPG/PNG image."
+              },
+              {
+                "type": "Footer",
+                "label": "Add Item",
+                "on-click-action": {
+                  "name": "complete",
+                  "payload": {
+                    "name": "${form.name}",
+                    "category": "${form.category}",
+                    "price": "${form.price}",
+                    "description": "${form.description}",
+                    "image_url": "${form.image_url}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

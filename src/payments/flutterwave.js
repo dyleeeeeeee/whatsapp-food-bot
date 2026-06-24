@@ -13,6 +13,21 @@ export async function initializeFlutterwaveTransaction(data, env) {
     throw new Error('FLUTTERWAVE_SECRET_KEY is not set');
   }
 
+  // BUG-08: tx_ref is always caller-provided so the reference can be
+  // persisted to D1 BEFORE this init call.
+  if (!txRef) {
+    throw new Error('initializeFlutterwaveTransaction: txRef is required');
+  }
+
+  // BUG-03: never send a non-positive or below-minimum charge to Flutterwave.
+  // Flutterwave's minimum collectable amount is 100 NGN.
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    throw new Error(`initializeFlutterwaveTransaction: amount must be > 0 (got ${amount})`);
+  }
+  if (amount < 100) {
+    throw new Error(`initializeFlutterwaveTransaction: amount must be >= 100 NGN (got ${amount})`);
+  }
+
   const response = await fetch('https://api.flutterwave.com/v3/payments', {
     method: 'POST',
     headers: {
@@ -69,7 +84,33 @@ export async function verifyFlutterwaveTransaction(txRef, env) {
 
 export async function verifyFlutterwaveWebhookSignature(signature, env) {
   const webhookSecret = env.FLUTTERWAVE_WEBHOOK_SECRET || '';
-  // If no secret configured, skip verification (set FLUTTERWAVE_WEBHOOK_SECRET to lock down)
-  if (!webhookSecret) return true;
-  return signature === webhookSecret;
+
+  // BUG-06 FIX: hard fail when the secret is missing/empty. A blank secret
+  // previously meant "skip verification", which left the webhook open to
+  // forgery by anyone who knew the endpoint URL.
+  if (!webhookSecret) {
+    console.error('[Flutterwave] FATAL: FLUTTERWAVE_WEBHOOK_SECRET is not set. Rejecting webhook.');
+    return false;
+  }
+
+  if (typeof signature !== 'string' || signature.length === 0) return false;
+
+  return constantTimeEqual(signature, webhookSecret);
+}
+
+/**
+ * Constant-time string comparison to avoid leaking the secret via timing.
+ * Compares byte-by-byte over the max length so the loop count does not
+ * depend on where the first mismatch occurs.
+ */
+function constantTimeEqual(a, b) {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  const len = Math.max(ab.length, bb.length);
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < len; i++) {
+    diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
+  }
+  return diff === 0;
 }

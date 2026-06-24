@@ -84,6 +84,51 @@ export function isValidHttpsUrl(str) {
 }
 
 /**
+ * Validate that a URL is a plausible HTTPS image URL.
+ *
+ * BUG-19: stricter than isValidHttpsUrl — requires https, a dotted
+ * public hostname (rejects localhost and bare IPs), and a reasonable
+ * length. Accepts typical image paths/extensions without forcing one
+ * (many CDNs serve images from extension-less URLs).
+ */
+export function isValidImageUrl(url) {
+  if (typeof url !== 'string') return false;
+  if (url.length < 12 || url.length > 2048) return false;
+
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+
+  if (u.protocol !== 'https:') return false;
+
+  const host = u.hostname;
+  // Reject localhost and bare IPv4/IPv6 addresses — require a real domain.
+  if (host === 'localhost') return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return false;
+  if (host.includes(':') || u.hostname.startsWith('[')) return false;
+
+  // Require a dotted hostname with a non-numeric TLD of at least 2 chars.
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(host)) return false;
+
+  return true;
+}
+
+/**
+ * Check whether a string contains at least n alphanumeric characters.
+ *
+ * EDGE-16: guards against empty / punctuation-only inputs (e.g. names
+ * or descriptions made up entirely of emoji or symbols).
+ */
+export function hasMinAlphaNum(str, n = 3) {
+  if (typeof str !== 'string') return false;
+  const matches = str.match(/[a-z0-9]/gi);
+  return matches !== null && matches.length >= n;
+}
+
+/**
  * Check if a phone number is registered as admin.
  *
  * BUG-23 FIX: KV read/write failures fall back to D1 gracefully.

@@ -1,12 +1,13 @@
 /**
  * src/webhooks/flutterwave_handler.js — Flutterwave Webhook Logic
  *
- * Handles payment confirmation webhooks from Flutterwave.
- * Mirrors paystack_handler.js structure with Flutterwave-specific differences.
+ * Handles payment confirmation webhooks from Flutterwave: verifies the
+ * signature, matches the unpaid order by tx_ref, and confirms payment exactly
+ * once (atomic, idempotent) before notifying the customer.
  */
 
 import { verifyFlutterwaveWebhookSignature, verifyFlutterwaveTransaction } from '../payments/flutterwave.js';
-import { getOrderByReference, updateOrderPayment } from '../db.js';
+import { getOrderByReference, updateOrderPayment, markOrderPaidAtomic } from '../db.js';
 import { sendText } from '../whatsapp.js';
 
 export async function handleFlutterwaveWebhook(request, env, ctx) {
@@ -61,7 +62,7 @@ async function processPaymentSuccess(txRef, amount, status, env) {
     }
 
     // 4. Confirm amount matches D1 order total
-    // Flutterwave uses direct float amount (not kobo like Paystack)
+    // Flutterwave uses a direct float amount (NGN), not minor units
     const expectedAmount = order.total_price;
     if (Math.abs(amount - expectedAmount) > 0.01) {
       console.error(`[Flutterwave] CRITICAL: Amount mismatch for order #${order.id}. Expected ${expectedAmount}, got ${amount}`);
@@ -70,13 +71,16 @@ async function processPaymentSuccess(txRef, amount, status, env) {
       return;
     }
 
-    // 5. Mark as paid
-    await updateOrderPayment(order.id, {
-      payment_status: 'paid',
-      paid_at: new Date().toISOString()
-    }, env);
+    // 5. Atomically mark as paid. The DB guard (payment_status != 'paid')
+    // makes this idempotent: a duplicate webhook flips no row, so { changed }
+    // is only true for the single delivery that actually marked it paid.
+    const { changed } = await markOrderPaidAtomic(order.id, new Date().toISOString(), env);
+    if (!changed) {
+      console.log(`[Flutterwave] Order #${order.id} already paid; skipping duplicate confirmation.`);
+      return;
+    }
 
-    // 6. Notify customer
+    // 6. Notify customer — only on the delivery that actually changed the row.
     await sendText(
       order.user_phone,
       `✅ *Payment Received!*\n\nThanks! Your payment for order #${order.id} has been confirmed. We're now getting your food ready!`,

@@ -17,15 +17,37 @@ const SESSION_TTL = 60 * 60 * 2; // 2 hours in seconds
 
 // Currency configuration
 export const CURRENCY_SYMBOL = '₦';
-export const MAX_PRICE = 999.99; // Maximum allowed price for items
+export const MAX_PRICE = 1000000; // Maximum allowed price for items (₦1,000,000 ceiling)
 
 /**
- * Format a price amount with the currency symbol.
+ * Format a price amount with the currency symbol, using NGN locale
+ * grouping (e.g. "₦1,234" / "₦1,234.5"). Fraction digits 0–2: whole
+ * Naira render with no decimals, kobo amounts keep up to 2 places.
  * @param {number} amount - Price amount
- * @returns {string} Formatted price like "₦9.99"
+ * @returns {string} Formatted price like "₦1,234.56"
  */
 export function formatPrice(amount) {
-  return `${CURRENCY_SYMBOL}${Number(amount).toFixed(2)}`;
+  return `${CURRENCY_SYMBOL}${Number(amount).toLocaleString('en-NG', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+/**
+ * Parse a user-supplied price string into a Number.
+ * Strips the currency symbol, commas and spaces, then requires a plain
+ * decimal with at most 2 fraction digits. Returns the Number only when it
+ * is > 0 and <= MAX_PRICE; otherwise null.
+ * @param {string} str - Raw price input (e.g. "₦1,234.50")
+ * @returns {number|null} Parsed price, or null if invalid/out of range
+ */
+export function parsePrice(str) {
+  if (typeof str !== 'string') return null;
+  const cleaned = str.replace(/[₦,\s]/g, '');
+  if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
+  const value = Number(cleaned);
+  if (value > 0 && value <= MAX_PRICE) return value;
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -46,6 +68,9 @@ export async function getSession(phone, env) {
 }
 
 /** Persist session to KV, resetting the 2-hour TTL */
+// BUG-20 policy note: every save SLIDES the 2h TTL — an active user's
+// session stays alive as long as they keep interacting; it only expires
+// after 2h of inactivity.
 export async function saveSession(phone, session, env) {
   await env.SESSION_KV.put(
     sessionKey(phone),
@@ -118,6 +143,10 @@ export function addToCart(cart, item) {
     i => i.itemId === item.itemId && i.notes === item.notes
   );
   if (existing) {
+    // BUG-18 note: merging keeps the FIRST line's unitPrice — if the menu
+    // price changed between the two adds, this stale price persists here.
+    // Callers MUST refresh each line's price at checkout (fully fixed in
+    // user.js, which re-reads live menu prices before payment).
     existing.qty += item.qty;
   } else {
     cart.push({ ...item });

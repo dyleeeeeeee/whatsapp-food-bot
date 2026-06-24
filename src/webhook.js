@@ -15,7 +15,8 @@
 import { handleUserMessage } from './handlers/user.js';
 import { handleAdminMessage } from './handlers/admin.js';
 import { isAdmin } from './security.js';
-import { sendText } from './whatsapp.js';
+import { sendText, sendTypingIndicator } from './whatsapp.js';
+import { getSession } from './session.js';
 
 // ─────────────────────────────────────────────────────────────
 // GET — Meta webhook verification
@@ -52,8 +53,23 @@ export async function handleWebhookPost(body, env) {
     const messages = value?.messages;
     if (!messages?.length) return;
 
+    // BUG-13 FIX: load ONE session per distinct 'from' for the whole batch.
+    // Previously each message loaded its own session from KV, so in-memory
+    // mutations from message[0] were lost before message[1] ran (KV writes
+    // are eventually consistent). Reusing the same object lets later messages
+    // observe earlier ones' state changes within a single webhook delivery.
+    const sessions = new Map(); // from -> session object (shared across batch)
+
     for (const message of messages) {
-      await processMessage(message, env);
+      const from = message.from;
+      let preSession = null;
+      if (from) {
+        if (!sessions.has(from)) {
+          sessions.set(from, await getSession(from, env));
+        }
+        preSession = sessions.get(from);
+      }
+      await processMessage(message, env, preSession);
     }
   } catch (err) {
     console.error('[Webhook] handleWebhookPost error:', err);
@@ -64,7 +80,7 @@ export async function handleWebhookPost(body, env) {
 // Per-message processing
 // ─────────────────────────────────────────────────────────────
 
-async function processMessage(message, env) {
+async function processMessage(message, env, preSession = null) {
   const from   = message.from;  // E.164 without +
   const wamid  = message.id;    // WhatsApp message ID — unique per message
   const type   = message.type;
@@ -94,28 +110,34 @@ async function processMessage(message, env) {
     console.warn('[Webhook] KV dedup unavailable, processing anyway:', err);
   }
 
+  // UX-06: best-effort read receipt + typing indicator so the user sees the
+  // bot is "working" while we route the message. Never throws.
+  sendTypingIndicator(from, wamid, env).catch(() => {});
+
   const parsed = parseMessage(message);
   console.log('[Webhook] Parsed:', JSON.stringify(parsed));
 
   if (!parsed) {
-    // BUG-26 FIX: Unsupported types (photo, voice, sticker, location, etc.)
-    // previously returned silently, making the bot appear dead. Now we
-    // send a friendly nudge so users know what to do.
+    // BP-01: Unsupported types (voice, sticker, contacts, etc.) previously
+    // returned silently. We now acknowledge the things the bot DOES support
+    // (buttons + lists) and handle a shared location gracefully instead of
+    // wrongly claiming we only understand "text and button taps".
     console.log('[Webhook] Unsupported message type:', type);
-    await sendText(
-      from,
-      '🤖 I only understand text messages and button taps.\n\nSend *MENU* to start ordering!',
-      env
-    ).catch(err => console.error('[Webhook] Failed to send type-fallback reply:', err));
+    const fallback = type === 'location'
+      ? '📍 Thanks for sharing your location! I can\'t read map pins yet — please type your delivery address as text.\n\nSend *MENU* to start ordering!'
+      : '🤖 I understand text, button taps, and list selections.\n\nSend *MENU* to start ordering!';
+    await sendText(from, fallback, env)
+      .catch(err => console.error('[Webhook] Failed to send type-fallback reply:', err));
     return;
   }
 
-  // Route to admin or customer handler
+  // Route to admin or customer handler. BUG-13: pass the shared preSession so
+  // batched messages from the same 'from' reuse one in-memory session object.
   const admin = await isAdmin(from, env);
   if (admin) {
-    await handleAdminMessage(from, parsed, env);
+    await handleAdminMessage(from, parsed, env, preSession);
   } else {
-    await handleUserMessage(from, parsed, env);
+    await handleUserMessage(from, parsed, env, preSession);
   }
 }
 
@@ -145,7 +167,69 @@ function parseMessage(message) {
       if (!r?.id) return null;
       return { type: 'list_reply', id: r.id, title: r.title || '' };
     }
+
+    // UX-03: WhatsApp Flow completion. The submitted screen data arrives as a
+    // JSON string in response_json; parse it for the handler to consume.
+    if (interactive.type === 'nfm_reply') {
+      const r = interactive.nfm_reply;
+      let data = null;
+      try {
+        data = r?.response_json ? JSON.parse(r.response_json) : null;
+      } catch (err) {
+        console.warn('[Webhook] nfm_reply response_json parse failed:', err);
+        return null;
+      }
+      return { type: 'flow_reply', data };
+    }
+
+    return null;
   }
 
-  return null; // audio, image, video, sticker, location, contacts, etc.
+  // UX-03: shared location pin — surface coordinates + any label/address.
+  if (type === 'location') {
+    const loc = message.location;
+    if (!loc) return null;
+    return {
+      type:      'location',
+      latitude:  loc.latitude,
+      longitude: loc.longitude,
+      name:      loc.name || '',
+      address:   loc.address || '',
+    };
+  }
+
+  // UX-03: inbound image (e.g. proof of payment). Caption is a free-text hint.
+  if (type === 'image') {
+    const img = message.image;
+    if (!img) return null;
+    return {
+      type:      'image',
+      id:        img.id || '',
+      mimeType:  img.mime_type || '',
+      caption:   img.caption || '',
+    };
+  }
+
+  // UX-03: shared contact card(s).
+  if (type === 'contacts') {
+    const contacts = message.contacts;
+    if (!contacts?.length) return null;
+    return { type: 'contacts', contacts };
+  }
+
+  // UX-03: emoji reaction to a previous message.
+  if (type === 'reaction') {
+    const r = message.reaction;
+    if (!r) return null;
+    return { type: 'reaction', emoji: r.emoji || '', messageId: r.message_id || '' };
+  }
+
+  // UX-03: template quick-reply button tap (distinct from interactive replies).
+  if (type === 'button') {
+    const b = message.button;
+    if (!b) return null;
+    return { type: 'button', text: b.text || '' };
+  }
+
+  return null; // audio, video, sticker, etc.
 }

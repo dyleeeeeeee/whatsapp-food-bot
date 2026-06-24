@@ -21,6 +21,7 @@
 
 import {
   sendText, sendButtons, sendList, sendImageButtons,
+  sendCtaUrl, sendLocationRequest, sendFlow,
 } from '../whatsapp.js';
 import {
   getSession, saveSession,
@@ -31,20 +32,47 @@ import {
 } from '../session.js';
 import {
   getFullMenu, getMenuItem, getAvailableMenuItem, createOrder, getUserOrders, getOrder,
-  updateOrderPayment,
+  updateOrderPayment, saveCustomerAddress, getCustomerAddress,
 } from '../db.js';
 import { initializeFlutterwaveTransaction } from '../payments/flutterwave.js';
-import { sanitize } from '../security.js';
+import { sanitize, hasMinAlphaNum } from '../security.js';
 
 // Maximum chars in checkout confirm body (WhatsApp cap: 1024)
 const CONFIRM_BODY_MAX = 900;
+
+// EDGE-13: order-tracking body budget — collapse items above this length.
+const TRACKING_BODY_MAX = 1000;
+
+// EDGE-03: shared quantity-parse helper. Extracts the first integer in the
+// string and accepts it only when it falls in the 1–20 range. Returns null
+// for anything else (callers reuse the same warning copy).
+const QTY_ERROR = '⚠️ Please enter a number from 1 to 20';
+
+function parseQuantity(text) {
+  const m = (text || '').match(/\d+/);
+  if (!m) return null;
+  const n = parseInt(m[0], 10);
+  if (n >= 1 && n <= 20) return n;
+  return null;
+}
+
+// UX-07: a List of quantities 1–10 (ids qty_1..qty_10) so the user can tap
+// instead of typing. Used from the "Choose Qty" branch.
+function quantityListSections() {
+  const rows = [];
+  for (let n = 1; n <= 10; n++) {
+    rows.push({ id: `qty_${n}`, title: String(n), description: `Add ${n}` });
+  }
+  return [{ title: 'Quantity', rows }];
+}
 
 // ─────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────
 
-export async function handleUserMessage(phone, msg, env) {
-  const session = await getSession(phone, env);
+export async function handleUserMessage(phone, msg, env, preSession = null) {
+  // BUG-13: reuse the caller-provided session when batching messages.
+  const session = preSession || await getSession(phone, env);
 
   // Global shortcuts intercept first, regardless of state
   if (isGlobalCommand(msg)) {
@@ -93,6 +121,14 @@ function inferStateFromMessage(msg, session) {
   if ((id.startsWith('cart_idx_') || id === 'cart_clear_all') && msg.type === 'list_reply') return 'cart_manage';
   if (id === 'cart_item_remove' || id === 'cart_item_qty' || id === 'cart_item_notes' || id === 'btn_cart_back') return 'cart_item_edit';
   if (id === 'confirm_cancel_yes' || id === 'confirm_cancel_no') return 'confirm_cancel';
+  // UX-05: a Reorder tap is only ever offered on the order-detail view.
+  if (id.startsWith('reorder_') || (id.startsWith('track_') && msg.type === 'list_reply')) return 'order_tracking';
+  // UX-02/UX-04: saved-address tap, shared location, or a completed checkout
+  // Flow all belong to the address-capture step (only meaningful with a cart).
+  if (id === 'use_saved_address') return 'checkout_address';
+  if ((msg.type === 'location' || msg.type === 'flow_reply') && session.cart && session.cart.length > 0) {
+    return 'checkout_address';
+  }
 
   // KV stale-state recovery for checkout text input.
   // Button IDs are ground truth, but plain text during checkout has no ID.
@@ -142,7 +178,7 @@ async function handleGlobalCommand(phone, msg, session, env) {
       clearCart(session);
       await saveSession(phone, session, env);
       return sendText(phone, '🔧 *User Mode Exited*\n\nReturning to Admin Panel.', env)
-        .then(() => import('../handlers/admin.js').then(m => m.handleAdminMessage(phone, { type: 'button_reply', id: 'admin_home' }, session, env)));
+        .then(() => import('../handlers/admin.js').then(m => m.handleAdminMessage(phone, { type: 'button_reply', id: 'admin_home' }, env)));
     }
     return sendText(phone, '⚠️ Not in User Mode. Send *HELP* for commands.', env);
   }
@@ -186,6 +222,7 @@ async function handleGlobalCommand(phone, msg, session, env) {
       '• *ORDERS* — Track your active and past orders\n' +
       '• *CANCEL* — Stop your current ordering process\n' +
       '• *HELP* — Show this guide again\n\n' +
+      '_Commands work in any case — "menu", "MENU" or "Menu" all work._\n\n' +
       '💡 *Tip:* You can also type "BACK" during checkout to change your address or notes.\n\n' +
       'Still stuck? Just reply with your question and our team will assist you!',
       env
@@ -207,7 +244,35 @@ async function handleGlobalCommand(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function handleIdle(phone, msg, session, env) {
+  // EDGE-01 + BUG-12: a stranded address/notes message (free text with no
+  // button id) usually means the session timed out mid-checkout. Tell the
+  // user plainly instead of silently bouncing them to the welcome card.
+  const text = (msg.text || '').trim();
+  if (msg.type === 'text' && !msg.id && looksLikeAddress(text)) {
+    return sendText(
+      phone,
+      '⌛ Your session timed out — send *MENU* to start again.',
+      env
+    );
+  }
   return showWelcome(phone, env);
+}
+
+// Heuristic for "stranded" free text: long-ish, multi-word, contains letters.
+// Single greetings/short commands are handled as global commands earlier.
+function looksLikeAddress(text) {
+  if (text.length < 8) return false;
+  if (!/[a-z]/i.test(text)) return false;
+  return text.split(/\s+/).length >= 2;
+}
+
+// EDGE-10: when a state expects a list/button tap but stray text arrives,
+// surface a short notice before re-rendering the options so the user isn't
+// silently shown the same screen.
+const STRAY_TEXT_NOTICE = "I didn't catch that — pick an option, or send MENU/HELP";
+
+function isStrayText(msg) {
+  return msg.type === 'text' && !msg.id && (msg.text || '').trim().length > 0;
 }
 
 async function handleBrowsingMenu(phone, msg, session, env) {
@@ -215,6 +280,9 @@ async function handleBrowsingMenu(phone, msg, session, env) {
   if (msg.type === 'list_reply' && msg.id?.startsWith('cat_')) {
     const categoryId = parseInt(msg.id.replace('cat_', ''), 10);
     return showItemsForCategory(phone, categoryId, msg.title, session, env);
+  }
+  if (isStrayText(msg)) {
+    await sendText(phone, STRAY_TEXT_NOTICE, env);
   }
   return showMenuCategories(phone, session, env);
 }
@@ -235,6 +303,14 @@ async function handleSelectingItem(phone, msg, session, env) {
     return showItemsForCategory(phone, catId, catName, session, env, page);
   }
 
+  if (isStrayText(msg)) {
+    await sendText(phone, STRAY_TEXT_NOTICE, env);
+    if (session.tempCategoryId) {
+      return showItemsForCategory(
+        phone, session.tempCategoryId, session.tempCategoryName || 'Menu', session, env
+      );
+    }
+  }
   return showMenuCategories(phone, session, env);
 }
 
@@ -254,21 +330,16 @@ async function handleItemDetail(phone, msg, session, env) {
     return addItemToCartAndConfirm(phone, session, 1, env);
   }
 
-  // Custom quantity: show qty buttons + accept text
+  // Custom quantity: UX-07 — send a List of quantities 1–10 (still accept text).
   if (id.startsWith('qty_custom_')) {
     session.state = 'entering_quantity';
     await saveSession(phone, session, env);
-    return sendButtons(
+    return sendList(
       phone,
-      '🔢 How many would you like?\n\nTap a button or type any number (1–20):',
-      [
-        { id: 'qty_2', title: '2' },
-        { id: 'qty_3', title: '3' },
-        { id: 'qty_5', title: '5' },
-      ],
-      env,
-      null,
-      'MENU | CART | CANCEL'
+      '🔢 How many would you like?\n\nPick a quantity, or type any number (1–20):',
+      'Choose Qty',
+      quantityListSections(),
+      env
     );
   }
 
@@ -285,9 +356,8 @@ async function handleItemDetail(phone, msg, session, env) {
   }
 
   // Numeric text while on item_detail = treat as qty (handles KV race)
-  const raw = (msg.text || '').trim();
-  const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
-  if (!isNaN(qty) && qty >= 1 && qty <= 20) {
+  const qty = parseQuantity(msg.text);
+  if (qty !== null) {
     return addItemToCartAndConfirm(phone, session, qty, env);
   }
 
@@ -300,31 +370,24 @@ async function handleItemDetail(phone, msg, session, env) {
 }
 
 async function handleEnteringQuantity(phone, msg, session, env) {
-  // Button-based qty selection (qty_2, qty_3, qty_5, etc.)
+  // Button/list qty selection (qty_1..qty_10 from UX-07, plus legacy qty_N)
   if (msg.id?.startsWith('qty_') && /^qty_\d+$/.test(msg.id)) {
-    const qty = parseInt(msg.id.replace('qty_', ''), 10);
-    if (qty >= 1 && qty <= 20) {
-      if (session.cartQtyEdit) return updateCartQty(phone, session, qty, env);
-      return addItemToCartAndConfirm(phone, session, qty, env);
+    const picked = parseInt(msg.id.replace('qty_', ''), 10);
+    if (picked >= 1 && picked <= 20) {
+      if (session.cartQtyEdit) return updateCartQty(phone, session, picked, env);
+      return addItemToCartAndConfirm(phone, session, picked, env);
     }
   }
 
-  // Text-based qty
-  const raw = (msg.text || '').trim();
-  const qty = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
-
-  if (isNaN(qty) || qty < 1 || qty > 20) {
-    return sendButtons(
+  // Text-based qty (EDGE-03: shared parse + shared warning copy)
+  const qty = parseQuantity(msg.text);
+  if (qty === null) {
+    return sendList(
       phone,
-      '⚠️ Please enter a number between 1 and 20, or tap a button:',
-      [
-        { id: 'qty_2', title: '2' },
-        { id: 'qty_3', title: '3' },
-        { id: 'qty_5', title: '5' },
-      ],
-      env,
-      null,
-      'MENU | CART | CANCEL'
+      `${QTY_ERROR}, or pick one below:`,
+      'Choose Qty',
+      quantityListSections(),
+      env
     );
   }
 
@@ -391,13 +454,7 @@ async function handleCartReview(phone, msg, session, env) {
     if (!session.cart.length) {
       return sendText(phone, '🛒 Your cart is empty. Browse the menu first.', env);
     }
-    session.state = 'checkout_address';
-    await saveSession(phone, session, env);
-    return sendText(
-      phone,
-      '📍 Please enter your *delivery address*:\n\n_(Type your full address and press send)_',
-      env
-    );
+    return startCheckout(phone, session, env);
   }
   if (msg.id === 'btn_keep_shopping') return showMenuCategories(phone, session, env);
   
@@ -406,8 +463,10 @@ async function handleCartReview(phone, msg, session, env) {
     session.state = 'cart_manage';
     await saveSession(phone, session, env);
     
+    // EDGE-05: embed the itemId in the row id so a stale list (cart mutated
+    // since render) is detected before we mutate the wrong line.
     const rows = session.cart.map((item, idx) => ({
-      id: `cart_idx_${idx}`,
+      id: `cart_idx_${idx}_${item.itemId}`,
       title: `${item.name} (x${item.qty})`,
       description: `Notes: ${item.notes || 'None'}`
     }));
@@ -460,9 +519,15 @@ async function handleCartManage(phone, msg, session, env) {
   }
 
   if (msg.type === 'list_reply' && msg.id?.startsWith('cart_idx_')) {
-    const idx = parseInt(msg.id.replace('cart_idx_', ''), 10);
+    // EDGE-05: id format is cart_idx_{N}_{itemId}. Verify the embedded itemId
+    // still matches cart[N] before mutating; on mismatch, re-render the cart.
+    const parts = msg.id.split('_');             // ['cart','idx','N','itemId']
+    const idx = parseInt(parts[2], 10);
+    const embeddedItemId = parseInt(parts[3], 10);
     const item = session.cart[idx];
-    if (!item) return showCart(phone, session, env);
+    if (!item || item.itemId !== embeddedItemId) {
+      return showCart(phone, session, env);
+    }
 
     session.tempCartIdx = idx;
     session.state = 'cart_item_edit';
@@ -526,17 +591,12 @@ async function handleCartItemEdit(phone, msg, session, env) {
     session.state = 'entering_quantity';
     session.cartQtyEdit = true;
     await saveSession(phone, session, env);
-    return sendButtons(
+    return sendList(
       phone,
-      `🔢 New quantity for *${session.cart[idx].name}*?\n\nTap a button or type a number (1–20):`,
-      [
-        { id: 'qty_2', title: '2' },
-        { id: 'qty_3', title: '3' },
-        { id: 'qty_5', title: '5' },
-      ],
-      env,
-      null,
-      'MENU | CART | CANCEL'
+      `🔢 New quantity for *${session.cart[idx].name}*?\n\nPick one, or type a number (1–20):`,
+      'Choose Qty',
+      quantityListSections(),
+      env
     );
   }
 
@@ -561,6 +621,60 @@ async function handleCartItemEdit(phone, msg, session, env) {
   return showCart(phone, session, env);
 }
 
+// Begin checkout: pick the address-capture flow based on env.
+//   UX-04: env.CHECKOUT_FLOW_ID set → send a WhatsApp Flow (address + notes
+//          in one shot, handled via flow_reply in checkout_address).
+//   UX-02: else → native location request + a "Use saved address" button
+//          when we have a remembered address for this customer.
+async function startCheckout(phone, session, env) {
+  session.state = 'checkout_address';
+  await saveSession(phone, session, env);
+
+  // UX-04: hosted Flow path (only when the flag is set — falls back otherwise).
+  if (env.CHECKOUT_FLOW_ID) {
+    return sendFlow(
+      phone,
+      '🧾 Tap below to enter your delivery details.',
+      {
+        flowId:   env.CHECKOUT_FLOW_ID,
+        flowToken: `checkout_${phone}_${Date.now()}`,
+        flowCta:  'Checkout',
+        screenId: env.CHECKOUT_FLOW_SCREEN_ID || 'CHECKOUT',
+        data:     {},
+      },
+      env
+    );
+  }
+
+  return promptForAddress(phone, session, env);
+}
+
+// UX-02: ask for the delivery address. Offers a native location-request
+// button; if we have a saved address, also offer a "Use saved address" tap.
+async function promptForAddress(phone, session, env) {
+  const saved = await getCustomerAddress(phone, env);
+  if (saved) {
+    session.tempSavedAddress = saved;
+    await saveSession(phone, session, env);
+    await sendButtons(
+      phone,
+      `📍 Deliver to your saved address?\n\n*${saved}*\n\n` +
+      'Tap *Use saved address*, share your location, or just type a new address.',
+      [{ id: 'use_saved_address', title: '📍 Use saved' }],
+      env
+    );
+  } else if (session.tempSavedAddress) {
+    delete session.tempSavedAddress;
+    await saveSession(phone, session, env);
+  }
+
+  return sendLocationRequest(
+    phone,
+    '📍 Share your *delivery location*, or type your full address as text.',
+    env
+  );
+}
+
 async function handleCheckoutAddress(phone, msg, session, env) {
   // Handle global commands to escape stuck state
   const t = (msg.text || '').toUpperCase().trim();
@@ -568,24 +682,68 @@ async function handleCheckoutAddress(phone, msg, session, env) {
   if (t === 'CANCEL' || id === 'cmd_cancel') {
     session.state = 'cart_review';
     delete session.tempAddress;
+    delete session.tempSavedAddress;
     await saveSession(phone, session, env);
     return showCart(phone, session, env);
   }
   if (t === 'CART' || id === 'cmd_cart') {
     session.state = 'cart_review';
     delete session.tempAddress;
+    delete session.tempSavedAddress;
     await saveSession(phone, session, env);
     return showCart(phone, session, env);
   }
   if (t === 'MENU' || id === 'cmd_menu') {
     session.state = 'idle';
     delete session.tempAddress;
+    delete session.tempSavedAddress;
     await saveSession(phone, session, env);
     return showMenuCategories(phone, session, env);
   }
 
+  // UX-04: a completed checkout Flow fills address + notes in one shot.
+  if (msg.type === 'flow_reply' && msg.data) {
+    const flowAddr  = sanitize(String(msg.data.address || msg.data.delivery_address || ''), 300);
+    const flowNotes = sanitize(String(msg.data.notes || msg.data.delivery_notes || ''), 200);
+    if (hasMinAlphaNum(flowAddr, 3) && flowAddr.length >= 5) {
+      session.tempAddress    = flowAddr;
+      session.tempOrderNotes = flowNotes;
+      return finishAddressStep(phone, session, env, /*skipNotes=*/true);
+    }
+    // Flow returned an unusable address — fall back to manual capture.
+    return promptForAddress(phone, session, env);
+  }
+
+  // UX-02: user shared a location pin → compose an address string.
+  if (msg.type === 'location') {
+    const parts = [];
+    if (msg.name)    parts.push(msg.name);
+    if (msg.address) parts.push(msg.address);
+    let composed = parts.join(', ');
+    if (!composed && (msg.latitude != null && msg.longitude != null)) {
+      composed = `Pinned location (${msg.latitude}, ${msg.longitude})`;
+    }
+    const address = sanitize(composed, 300);
+    if (!hasMinAlphaNum(address, 3) || address.length < 5) {
+      return sendLocationRequest(
+        phone,
+        '⚠️ I couldn\'t read that location. Please type your full delivery address as text.',
+        env
+      );
+    }
+    session.tempAddress = address;
+    return finishAddressStep(phone, session, env);
+  }
+
+  // UX-02: reuse the saved address.
+  if (id === 'use_saved_address' && session.tempSavedAddress) {
+    session.tempAddress = session.tempSavedAddress;
+    return finishAddressStep(phone, session, env);
+  }
+
   const address = sanitize(msg.text || '', 300);
-  if (address.length < 5) {
+  // EDGE-16: reject pure emoji/whitespace — require at least 3 alphanumerics.
+  if (address.length < 5 || !hasMinAlphaNum(address, 3)) {
     return sendText(
       phone,
       '⚠️ Please enter a valid delivery address (at least 5 characters).\n\n' +
@@ -597,6 +755,18 @@ async function handleCheckoutAddress(phone, msg, session, env) {
   }
 
   session.tempAddress = address;
+  return finishAddressStep(phone, session, env);
+}
+
+// Shared tail of the address step. When skipNotes is true (Flow already
+// supplied notes) we jump straight to the confirm screen.
+async function finishAddressStep(phone, session, env, skipNotes = false) {
+  delete session.tempSavedAddress;
+
+  if (skipNotes) {
+    return renderCheckoutConfirm(phone, session, env);
+  }
+
   session.state = 'checkout_delivery_notes';
   await saveSession(phone, session, env);
 
@@ -639,11 +809,7 @@ async function handleCheckoutDeliveryNotes(phone, msg, session, env) {
   if (t === 'BACK') {
     session.state = 'checkout_address';
     await saveSession(phone, session, env);
-    return sendText(
-      phone,
-      '📍 Please enter your *delivery address*:\n\n_(Type your full address and press send)_',
-      env
-    );
+    return promptForAddress(phone, session, env);
   }
 
   const notes = msg.id === 'delivery_notes_skip'
@@ -651,6 +817,12 @@ async function handleCheckoutDeliveryNotes(phone, msg, session, env) {
     : sanitize(msg.text || '', 200);
 
   session.tempOrderNotes = notes;
+  return renderCheckoutConfirm(phone, session, env);
+}
+
+// Build and send the order-confirmation screen. Shared by the text flow and
+// the one-shot Flow path (UX-04). Sets state to checkout_confirm.
+async function renderCheckoutConfirm(phone, session, env) {
   session.state = 'checkout_confirm';
   await saveSession(phone, session, env);
 
@@ -734,88 +906,7 @@ async function handleCheckoutConfirm(phone, msg, session, env) {
   }
 
   if (msg.id === 'btn_place_order') {
-    try {
-      // 1. Create order in D1
-      const orderId = await createOrder(
-        {
-          userPhone:  phone,
-          address:    session.tempAddress || '',
-          orderNotes: session.tempOrderNotes || '',
-          items:      session.cart,
-          paymentStatus: 'unpaid',
-        },
-        env
-      );
-
-      // 2. Initialize Flutterwave
-      const amount = cartTotal(session.cart);
-      const reference = `order_${orderId}_${Date.now()}`;
-
-      let payData;
-      try {
-        payData = await initializeFlutterwaveTransaction({
-          amount,
-          txRef: reference,
-          currency: 'NGN',
-          customer: {
-            email: 'customer@fastchow.bot',
-            phone_number: phone,
-            name: 'Customer'
-          },
-          metadata: { orderId, phone }
-        }, env);
-
-        // 3. Update order with Flutterwave details
-        await updateOrderPayment(orderId, {
-          payment_reference: reference,
-          payment_url: payData.link,
-          payment_access_code: null,
-          payment_status: 'pending'
-        }, env);
-      } catch (payErr) {
-        console.error('[Checkout] Flutterwave init failed:', payErr);
-        // We still created the order, but payment link failed.
-        // We'll let the user know and they can retry from My Orders.
-      }
-
-      clearCart(session);
-      session.state = 'idle';
-      delete session.tempAddress;
-      delete session.tempOrderNotes;
-      await saveSession(phone, session, env);
-
-      if (payData) {
-        return sendText(
-          phone,
-          `🎉 *Order #${orderId} placed!*\n\n` +
-          `💰 Total: ${formatPrice(amount)}\n\n` +
-          `💳 *Action Required:* Please complete your payment to confirm this order:\n\n` +
-          `${payData.link}\n\n` +
-          `Once paid, we will begin preparing your meal! Track anytime with *ORDERS*.`,
-          env
-        );
-      } else {
-        return sendButtons(
-          phone,
-          `🎉 *Order #${orderId} placed!*\n\n` +
-          `⚠️ We had trouble creating your payment link. You can try paying again from *My Orders*.`,
-          [{ id: 'cmd_orders', title: '📋 My Orders' }],
-          env
-        );
-      }
-    } catch (err) {
-      console.error('[Checkout] createOrder failed:', err);
-      // Session unchanged — user stays in checkout_confirm and can retry
-      return sendButtons(
-        phone,
-        `⚠️ We couldn't place your order due to a system error. Please try again.`,
-        [
-          { id: 'btn_place_order', title: '🔄 Retry'        },
-          { id: 'cmd_cancel',      title: '❌ Cancel Order'  },
-        ],
-        env
-      );
-    }
+    return placeOrder(phone, session, env);
   }
 
   // Unknown input — re-prompt with action buttons (don't clobber session state)
@@ -831,12 +922,192 @@ async function handleCheckoutConfirm(phone, msg, session, env) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────
+// Place Order — re-validate, re-price, guard, create, pay
+// ─────────────────────────────────────────────────────────────
+
+// BUG-10: a double-tap on "Place Order" must not create two orders. We use a
+// SETNX-style KV guard keyed by phone. get → if present, ignore; else put with
+// a short TTL. Always cleared in a finally so a crash can't wedge the user.
+async function placeOrder(phone, session, env) {
+  const lockKey = 'placing:' + phone;
+  const held = await env.SESSION_KV.get(lockKey);
+  if (held) {
+    console.log('[Checkout] Duplicate Place Order tap ignored for', phone);
+    return; // swallow the duplicate tap
+  }
+  await env.SESSION_KV.put(lockKey, '1', { expirationTtl: 60 });
+
+  try {
+    // BUG-02 + EDGE-04: guard an empty cart before doing anything else.
+    if (!session.cart.length) {
+      session.state = 'cart_review';
+      await saveSession(phone, session, env);
+      await sendText(phone, '🛒 Your cart is empty. Browse the menu to add items.', env);
+      return showCart(phone, session, env);
+    }
+
+    // BUG-02 + EDGE-04: re-validate every line against the live menu. Drop any
+    // item that was deleted or turned unavailable since it was added.
+    // BUG-01 + BUG-18 + EDGE-12: re-price each surviving line from the live
+    // price and surface a notice for any change before payment.
+    const survivors = [];
+    const removed = [];
+    const repriced = [];
+
+    for (const line of session.cart) {
+      const item = await getAvailableMenuItem(line.itemId, env);
+      if (!item) {
+        removed.push(line.name);
+        continue;
+      }
+      if (Math.round(item.price * 100) !== Math.round(line.unitPrice * 100)) {
+        repriced.push({ name: item.name, price: item.price });
+        line.unitPrice = item.price;
+      }
+      survivors.push(line);
+    }
+
+    if (removed.length) {
+      session.cart = survivors;
+      session.state = 'cart_review';
+      await saveSession(phone, session, env);
+      await sendText(
+        phone,
+        `⚠️ Some items are no longer available and were removed:\n` +
+        removed.map(n => `• ${n}`).join('\n') +
+        `\n\nPlease review your cart before checking out.`,
+        env
+      );
+      return showCart(phone, session, env);
+    }
+
+    // BUG-01 + BUG-18 + EDGE-12: prices changed — apply, notify, then continue.
+    if (repriced.length) {
+      session.cart = survivors;
+      await saveSession(phone, session, env);
+      for (const r of repriced) {
+        await sendText(
+          phone,
+          `ℹ️ price for ${r.name} updated to ${formatPrice(r.price)}`,
+          env
+        );
+      }
+    }
+
+    // BUG-08 + BUG-03: create the order, mint a deterministic tx_ref, PERSIST
+    // it before init, then initialize Flutterwave with that same reference.
+    const amount = cartTotal(session.cart);
+    if (!(amount > 0)) {
+      session.state = 'cart_review';
+      await saveSession(phone, session, env);
+      await sendText(phone, '⚠️ Your order total is invalid. Please review your cart.', env);
+      return showCart(phone, session, env);
+    }
+
+    const orderId = await createOrder(
+      {
+        userPhone:  phone,
+        address:    session.tempAddress || '',
+        orderNotes: session.tempOrderNotes || '',
+        items:      session.cart,
+        paymentStatus: 'unpaid',
+      },
+      env
+    );
+
+    // BUG-03: deterministic, order-scoped reference persisted BEFORE init.
+    const txref = `FCHOW-${orderId}-${Date.now().toString(36)}`;
+    await updateOrderPayment(orderId, {
+      payment_reference: txref,
+      payment_status: 'pending',
+    }, env);
+
+    let payData;
+    try {
+      payData = await initializeFlutterwaveTransaction({
+        amount,
+        txRef: txref,
+        currency: 'NGN',
+        customer: {
+          email: 'customer@fastchow.bot',
+          phone_number: phone,
+          name: 'Customer'
+        },
+        metadata: { orderId, phone }
+      }, env);
+
+      await updateOrderPayment(orderId, {
+        payment_url: payData.link,
+      }, env);
+    } catch (payErr) {
+      console.error('[Checkout] Flutterwave init failed:', payErr);
+      // Order + reference are already persisted; user can retry from My Orders.
+    }
+
+    // UX-02: remember the address for next time, now that the order succeeded.
+    const placedAddress = session.tempAddress || '';
+    if (placedAddress) {
+      await saveCustomerAddress(phone, placedAddress, env);
+    }
+
+    clearCart(session);
+    session.state = 'idle';
+    delete session.tempAddress;
+    delete session.tempOrderNotes;
+    delete session.tempSavedAddress;
+    await saveSession(phone, session, env);
+
+    if (payData) {
+      // UX-01: send the detail first, then the pay link as a CTA URL button.
+      await sendText(
+        phone,
+        `🎉 *Order #${orderId} placed!*\n\n` +
+        `💰 Total: ${formatPrice(amount)}\n\n` +
+        `💳 *Action Required:* Tap *Pay Now* to complete your payment.\n\n` +
+        `Once paid, we will begin preparing your meal! Track anytime with *ORDERS*.`,
+        env
+      );
+      return sendCtaUrl(
+        phone,
+        `💳 Complete payment for Order #${orderId} — ${formatPrice(amount)}`,
+        'Pay Now',
+        payData.link,
+        env
+      );
+    }
+    return sendButtons(
+      phone,
+      `🎉 *Order #${orderId} placed!*\n\n` +
+      `⚠️ We had trouble creating your payment link. You can try paying again from *My Orders*.`,
+      [{ id: 'cmd_orders', title: '📋 My Orders' }],
+      env
+    );
+  } catch (err) {
+    console.error('[Checkout] placeOrder failed:', err);
+    // Session unchanged — user stays in checkout_confirm and can retry
+    return sendButtons(
+      phone,
+      `⚠️ We couldn't place your order due to a system error. Please try again.`,
+      [
+        { id: 'btn_place_order', title: '🔄 Retry'        },
+        { id: 'cmd_cancel',      title: '❌ Cancel Order'  },
+      ],
+      env
+    );
+  } finally {
+    // BUG-10: always release the guard so the next legitimate attempt works.
+    await env.SESSION_KV.delete(lockKey).catch(() => {});
+  }
+}
+
 async function handleConfirmCancel(phone, msg, session, env) {
   if (msg.id === 'confirm_cancel_yes') {
     const isCartClear = session.confirmCancelType === 'cart_clear';
     clearCart(session);
     session.state = 'idle';
     delete session.confirmCancelType;
+    delete session.confirmCancelReprompted;
     await saveSession(phone, session, env);
     const doneMsg = isCartClear
       ? '🧹 Cart cleared!'
@@ -849,8 +1120,37 @@ async function handleConfirmCancel(phone, msg, session, env) {
     );
   }
 
-  // No or any other input — return to cart
+  // Explicit "No" — return to cart.
+  if (msg.id === 'confirm_cancel_no') {
+    delete session.confirmCancelType;
+    delete session.confirmCancelReprompted;
+    session.state = 'cart_review';
+    await saveSession(phone, session, env);
+    return showCart(phone, session, env);
+  }
+
+  // EDGE-18: unrecognized input — re-prompt Yes/No exactly once before
+  // defaulting to "No" so a stray tap doesn't silently abandon the prompt.
+  if (!session.confirmCancelReprompted) {
+    session.confirmCancelReprompted = true;
+    await saveSession(phone, session, env);
+    const isCartClear = session.confirmCancelType === 'cart_clear';
+    return sendButtons(
+      phone,
+      isCartClear
+        ? '❓ Please choose: clear your entire cart?'
+        : '❓ Please choose: cancel your current order?',
+      [
+        { id: 'confirm_cancel_yes', title: isCartClear ? 'Yes, Clear' : 'Yes, Cancel' },
+        { id: 'confirm_cancel_no',  title: 'No, Keep it' },
+      ],
+      env
+    );
+  }
+
+  // Second unrecognized input — fall back to "No".
   delete session.confirmCancelType;
+  delete session.confirmCancelReprompted;
   session.state = 'cart_review';
   await saveSession(phone, session, env);
   return showCart(phone, session, env);
@@ -1133,6 +1433,12 @@ async function recoverPaymentIfNeeded(order, env) {
 }
 
 async function handleOrderTracking(phone, msg, session, env) {
+  // UX-05: rebuild the cart from a past order and jump to cart review.
+  if (msg.id?.startsWith('reorder_')) {
+    const orderId = parseInt(msg.id.replace('reorder_', ''), 10);
+    return reorder(phone, session, orderId, env);
+  }
+
   if (msg.type === 'list_reply' && msg.id?.startsWith('track_')) {
     const orderId = parseInt(msg.id.replace('track_', ''), 10);
     let order = await getOrder(orderId, env);
@@ -1157,8 +1463,6 @@ async function handleOrderTracking(phone, msg, session, env) {
       cancelled: 'This order was cancelled. Contact us if you have any questions.',
     };
 
-    const itemsSummary = order.items.map(i => `• ${i.name} x${i.quantity}`).join('\n');
-    
     const paymentEmoji = {
       paid: '✅ Paid',
       pending: '⏳ Pending',
@@ -1166,35 +1470,105 @@ async function handleOrderTracking(phone, msg, session, env) {
       failed: '⚠️ Failed'
     };
 
-    let body = 
+    const head =
       `📦 *Order #${order.id} Details*\n\n` +
       `*Status:* ${statusEmoji[order.status] || order.status}\n` +
       `_${statusDesc[order.status] || ''}_\n\n` +
       `*Payment:* ${paymentEmoji[order.payment_status] || order.payment_status}\n`;
 
-    if (order.payment_status !== 'paid' && order.payment_url) {
-      body += `🔗 *Pay here:* ${order.payment_url}\n`;
-    }
-
-    body += 
-      `\n*Items:*\n${itemsSummary}\n\n` +
+    const tail =
       `*Total:* ${formatPrice(order.total_price)}\n` +
       `*Address:* ${order.address}\n` +
       `*Notes:* ${order.notes || 'None'}\n\n` +
       `*Placed on:* ${order.created_at}`;
 
-    return sendButtons(
+    // EDGE-13: budget the body. If the full item list would push the message
+    // past TRACKING_BODY_MAX, collapse it to "N items — ₦total" so nothing
+    // gets hard-truncated mid-line.
+    const fullItems = order.items.map(i => `• ${i.name} x${i.quantity}`).join('\n');
+    const itemCount = order.items.length;
+    const collapsed = `${itemCount} item${itemCount !== 1 ? 's' : ''} — ${formatPrice(order.total_price)}`;
+    const fullBody  = `${head}\n*Items:*\n${fullItems}\n\n${tail}`;
+    const itemsBlock = fullBody.length > TRACKING_BODY_MAX ? collapsed : fullItems;
+    const body = `${head}\n*Items:*\n${itemsBlock}\n\n${tail}`;
+
+    const buttons = [
+      { id: 'cmd_orders',           title: '⬅️ Order History' },
+      { id: `reorder_${order.id}`,  title: '🔁 Reorder'       },
+      { id: 'cmd_menu',             title: '🍽️ View Menu'     },
+    ];
+
+    // UX-01: send the detail first, then the pay link as a CTA URL button.
+    await sendButtons(phone, body, buttons, env);
+
+    if (order.payment_status !== 'paid' && order.payment_url) {
+      return sendCtaUrl(
+        phone,
+        `💳 Complete payment for Order #${order.id} — ${formatPrice(order.total_price)}`,
+        'Pay Now',
+        order.payment_url,
+        env
+      );
+    }
+    return;
+  }
+
+  if (isStrayText(msg)) {
+    await sendText(phone, STRAY_TEXT_NOTICE, env);
+  }
+  return showOrderHistory(phone, session, env);
+}
+
+// UX-05: rebuild session.cart from a past order. Re-validate each line against
+// the live menu (skip gone items) and re-price from the current menu price.
+async function reorder(phone, session, orderId, env) {
+  const order = await getOrder(orderId, env);
+  if (!order || !order.items.length) {
+    await sendText(phone, '⚠️ Sorry, that order could not be loaded.', env);
+    return showOrderHistory(phone, session, env);
+  }
+
+  const cart = [];
+  const skipped = [];
+  for (const oi of order.items) {
+    const item = await getAvailableMenuItem(oi.menu_item_id, env);
+    if (!item) {
+      skipped.push(oi.name);
+      continue;
+    }
+    addToCart(cart, {
+      itemId:    item.id,
+      name:      item.name,
+      qty:       oi.quantity,
+      unitPrice: item.price, // re-price live
+      notes:     oi.notes || '',
+    });
+  }
+
+  if (!cart.length) {
+    await sendText(
       phone,
-      body,
-      [
-        { id: 'cmd_orders', title: '⬅️ Order History' },
-        { id: 'cmd_menu',   title: '🍽️ View Menu'       },
-      ],
+      '⚠️ None of the items from that order are available right now.',
+      env
+    );
+    return showMenuCategories(phone, session, env);
+  }
+
+  session.cart  = cart;
+  session.state = 'cart_review';
+  await saveSession(phone, session, env);
+
+  if (skipped.length) {
+    await sendText(
+      phone,
+      `ℹ️ These items are no longer available and were skipped:\n` +
+      skipped.map(n => `• ${n}`).join('\n'),
       env
     );
   }
 
-  return showOrderHistory(phone, session, env);
+  await sendText(phone, '🔁 Added your previous order to the cart!', env);
+  return showCart(phone, session, env);
 }
 
 // ─────────────────────────────────────────────────────────────

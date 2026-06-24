@@ -20,6 +20,21 @@ Successfully replaced Paystack with Flutterwave for payment processing.
 - `src/handlers/user.js` - Updated checkout flow to use Flutterwave
 - `wrangler.toml` - Added `FLUTTERWAVE_CALLBACK_URL` configuration
 
+## Required Environment Variables
+
+| Variable                     | Required | Type   | Description                                                        |
+|------------------------------|----------|--------|--------------------------------------------------------------------|
+| `FLUTTERWAVE_SECRET_KEY`     | ✅        | secret | Bearer key for the Flutterwave v3 API (`FLWSECK...`)               |
+| `FLUTTERWAVE_WEBHOOK_SECRET` | ✅        | secret | Secret hash used to verify the `verif-hash` webhook header         |
+| `FLUTTERWAVE_CALLBACK_URL`   | ❌        | var    | Redirect URL after checkout (set in `wrangler.toml`)              |
+
+> **There is no `FLUTTERWAVE_PUBLIC_KEY`.** The bot uses the Standard Checkout
+> API server-side only; the public key is never needed. Do not set it.
+>
+> **`FLUTTERWAVE_WEBHOOK_SECRET` is mandatory.** The webhook handler hard-fails
+> (returns **401**) when it is missing or empty — a blank secret no longer means
+> "skip verification". Payments will silently never confirm until it is set.
+
 ## Deployment Steps
 
 ### 1. Set Flutterwave Secrets
@@ -29,8 +44,8 @@ Successfully replaced Paystack with Flutterwave for payment processing.
 wrangler secret put FLUTTERWAVE_SECRET_KEY --env staging
 # Enter: FLWSECK_TEST-xxxxxxxxxxxxx
 
-wrangler secret put FLUTTERWAVE_PUBLIC_KEY --env staging
-# Enter: FLWPUBK_TEST-xxxxxxxxxxxxx
+wrangler secret put FLUTTERWAVE_WEBHOOK_SECRET --env staging
+# Enter: the "Secret hash" you set on the Flutterwave webhook page
 ```
 
 **Production:**
@@ -38,9 +53,12 @@ wrangler secret put FLUTTERWAVE_PUBLIC_KEY --env staging
 wrangler secret put FLUTTERWAVE_SECRET_KEY
 # Enter: FLWSECK-xxxxxxxxxxxxx
 
-wrangler secret put FLUTTERWAVE_PUBLIC_KEY
-# Enter: FLWPUBK-xxxxxxxxxxxxx
+wrangler secret put FLUTTERWAVE_WEBHOOK_SECRET
+# Enter: the "Secret hash" you set on the Flutterwave webhook page
 ```
+
+> Set `FLUTTERWAVE_CALLBACK_URL` (the post-payment redirect) in `wrangler.toml`
+> under `[vars]`; it is not a secret.
 
 ### 2. Configure Flutterwave Dashboard
 
@@ -49,8 +67,12 @@ wrangler secret put FLUTTERWAVE_PUBLIC_KEY
 3. Add webhook URL:
    - **Sandbox:** `https://your-worker-staging.dev/flutterwave/webhook`
    - **Production:** `https://your-worker.workers.dev/flutterwave/webhook`
-4. Select event: **charge.completed**
-5. Save webhook configuration
+4. Set a **Secret hash** — this exact value must match the
+   `FLUTTERWAVE_WEBHOOK_SECRET` secret you set in step 1. Flutterwave sends it
+   back on every webhook in the `verif-hash` request header, and the bot
+   compares it in constant time.
+5. Select event: **charge.completed**
+6. Save webhook configuration
 
 ### 3. Deploy
 
@@ -104,7 +126,7 @@ wrangler tail --format pretty
 | Feature | Paystack | Flutterwave |
 |---------|----------|-------------|
 | Webhook Event | `charge.success` | `charge.completed` |
-| Signature | HMAC-SHA512 of body | SHA256 of secret key |
+| Signature | HMAC-SHA512 of body | `verif-hash` header equals `FLUTTERWAVE_WEBHOOK_SECRET` (constant-time compare) |
 | Amount Format | Kobo (cents) | Naira (float) |
 | Reference Field | `reference` | `tx_ref` |
 | Checkout URL | `authorization_url` | `link` |
@@ -114,12 +136,13 @@ wrangler tail --format pretty
 ## Testing Checklist
 
 ### Manual Tests
+- [ ] `FLUTTERWAVE_WEBHOOK_SECRET` is set (without it every webhook returns 401)
 - [ ] Place order → Receive Flutterwave payment link
-- [ ] Complete payment → Webhook received
-- [ ] Order status updated to 'paid'
+- [ ] Complete payment → Webhook received (`charge.completed`)
+- [ ] Order status updated to 'paid' (atomic, idempotent — duplicate webhooks notify once)
 - [ ] Customer receives WhatsApp confirmation
 - [ ] Payment link works on mobile devices
-- [ ] Invalid webhook signature rejected (401)
+- [ ] Invalid/mismatched `verif-hash` rejected (401)
 
 ### Test Cards (Sandbox)
 

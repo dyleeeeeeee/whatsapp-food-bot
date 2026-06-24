@@ -32,15 +32,15 @@
  */
 
 import {
-  sendText, sendButtons, sendList,
+  sendText, sendButtons, sendList, sendFlow, sendTemplate,
 } from '../whatsapp.js';
 import {
-  getSession, saveSession, bustMenuCache, formatPrice, MAX_PRICE, CURRENCY_SYMBOL,
+  getSession, saveSession, bustMenuCache, formatPrice, parsePrice, MAX_PRICE, CURRENCY_SYMBOL,
 } from '../session.js';
 import {
   getAllMenuItems, getMenuItem, getCategories, getFullMenu,
   createMenuItem, updateMenuItem, deleteMenuItem,
-  getPendingOrders, getOrder, updateOrderStatus,
+  getOrder, updateOrderStatus,
   bulkUpdateOrderStatus, bulkUpdateMenuAvailability,
   getMenuItemsPaginated, getActiveOrdersPaginated,
   logBulkAction,
@@ -54,15 +54,78 @@ import { sanitize, isValidHttpsUrl } from '../security.js';
 
 const VALID_STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'delivered', 'cancelled'];
 
+// EDGE-07: allowed status transitions. 'delivered' and 'cancelled' are terminal.
+// A status may always be set to itself (caught earlier as a no-op).
+const STATUS_TRANSITIONS = {
+  pending:   ['pending', 'confirmed', 'preparing', 'ready', 'delivered', 'cancelled'],
+  confirmed: ['confirmed', 'preparing', 'ready', 'delivered', 'cancelled'],
+  preparing: ['preparing', 'ready', 'delivered', 'cancelled'],
+  ready:     ['ready', 'delivered', 'cancelled'],
+  delivered: ['delivered'],
+  cancelled: ['cancelled'],
+};
+
+function isAllowedTransition(current, next) {
+  const allowed = STATUS_TRANSITIONS[current];
+  // Unknown current status — be permissive rather than strand the admin.
+  if (!allowed) return true;
+  return allowed.includes(next);
+}
+
+/**
+ * BUG-11: robustly toggle an id in a bulk selection. We rebuild a de-duplicated
+ * Set from the CURRENT selectedIds each tap and write it back, so rapid taps
+ * (which may race on the same session object) can never produce duplicates or
+ * mis-toggle. Mutates `bulk.selectedIds` in place and returns the new array.
+ */
+function toggleSelection(bulk, id) {
+  const set = new Set(bulk.selectedIds || []);
+  if (set.has(id)) set.delete(id);
+  else set.add(id);
+  bulk.selectedIds = [...set];
+  return bulk.selectedIds;
+}
+
+/**
+ * EDGE-11: send a terminal error with an admin_home button so the admin is
+ * never stranded with a text-only dead end.
+ */
+function sendAdminError(phone, body, env) {
+  return sendButtons(phone, body, [{ id: 'admin_home', title: '🔧 Admin Menu' }], env);
+}
+
+// UX-16 / EDGE-17: canned bulk-cancel reasons. Codes map to customer-facing
+// sentences; "Other" lets the admin type a custom reason, "Skip" sends none.
+const BULK_CANCEL_REASONS = {
+  out_of_stock: 'Some items are out of stock.',
+  closed:       'We are closed right now.',
+  unreachable:  'We could not reach you to confirm the order.',
+  payment:      'There was a problem with the payment.',
+};
+
 // ─────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────
 
-export async function handleAdminMessage(phone, msg, env) {
-  const session = await getSession(phone, env);
+export async function handleAdminMessage(phone, msg, env, preSession = null) {
+  // BUG-13: reuse the caller-supplied session when batching, else load it.
+  const session = preSession || await getSession(phone, env);
 
   // Ensure adminCtx always exists — old sessions may predate this field
   session.adminCtx = session.adminCtx || {};
+
+  // UX-13: Add-Item Flow completion arrives as a flow_reply — route it to the
+  // dedicated handler regardless of the persisted state.
+  if (msg.type === 'flow_reply') {
+    if (session.state === 'admin_add_item_flow') {
+      return handleAddItemFlowReply(phone, msg, session, env);
+    }
+    // Unknown flow reply — fall back to the admin menu.
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return showAdminMenu(phone, env);
+  }
 
   const text = (msg.text || '').toUpperCase().trim();
 
@@ -93,7 +156,14 @@ export async function handleAdminMessage(phone, msg, env) {
   }
 
   // Stale-state recovery: these button IDs must route correctly regardless of KV state
+  // UX-12: route Update Status to the tappable order list by default.
   if (msg.id === 'admin_update_status') {
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return viewOrders(phone, session, env);
+  }
+  // UX-12: explicit fallback to the typed-numeric-ID path.
+  if (msg.id === 'admin_update_status_id') {
     session.state    = 'admin_update_status_id';
     session.adminCtx = {};
     await saveSession(phone, session, env);
@@ -114,6 +184,7 @@ export async function handleAdminMessage(phone, msg, env) {
     case 'admin_idle':                return handleAdminIdle(phone, msg, session, env);
     case 'admin_add_category':        return handleAddCategory(phone, msg, session, env);
     case 'admin_view_categories':     return handleViewCategories(phone, msg, session, env);
+    case 'admin_add_item_flow':       return handleAddItemFlowReply(phone, msg, session, env);
     case 'admin_add_item_name':       return handleAddItemName(phone, msg, session, env);
     case 'admin_add_item_category':   return handleAddItemCategory(phone, msg, session, env);
     case 'admin_add_item_price':      return handleAddItemPrice(phone, msg, session, env);
@@ -134,12 +205,14 @@ export async function handleAdminMessage(phone, msg, env) {
     case 'admin_bulk_menu':                  return handleBulkMenu(phone, msg, session, env);
     case 'admin_bulk_orders_action':         return handleBulkOrdersAction(phone, msg, session, env);
     case 'admin_bulk_orders_select':         return handleBulkOrdersSelect(phone, msg, session, env);
+    case 'admin_bulk_orders_reason':         return handleBulkOrdersReason(phone, msg, session, env);
     case 'admin_bulk_orders_confirm':        return handleBulkOrdersConfirm(phone, msg, session, env);
     // Bulk Actions — Items (legacy availability toggle)
     case 'admin_bulk_items_action':          return handleBulkItemsAction(phone, msg, session, env);
     case 'admin_bulk_items_select':          return handleBulkItemsSelect(phone, msg, session, env);
     case 'admin_bulk_items_confirm':         return handleBulkItemsConfirm(phone, msg, session, env);
     // Bulk Actions — Items (add/remove/edit)
+    case 'admin_bulk_items_add_category':    return handleBulkItemsAddCategory(phone, msg, session, env);
     case 'admin_bulk_items_add_paste':       return handleBulkItemsAddPaste(phone, msg, session, env);
     case 'admin_bulk_items_add_review':      return handleBulkItemsAddReview(phone, msg, session, env);
     case 'admin_bulk_items_remove_select':   return handleBulkItemsRemoveSelect(phone, msg, session, env);
@@ -176,7 +249,7 @@ export async function handleAdminMessage(phone, msg, env) {
 async function showAdminMenu(phone, env) {
   return sendList(
     phone,
-    '🔧 *Admin Panel*\nWhat would you like to manage?',
+    '🔧 *Admin Panel*\nWhat would you like to manage?\n\n_Anytime: type ADMIN to return here, BACK to go back, CANCEL to abort._',
     'Admin Actions',
     [
       {
@@ -213,8 +286,12 @@ async function handleAdminIdle(phone, msg, session, env) {
   const id = msg.id || '';
 
   if (id === 'admin_add_item') {
-    session.state    = 'admin_add_item_name';
     session.adminCtx = {};
+    // UX-13: drive Add-Item via a WhatsApp Flow when configured.
+    if (env.ADD_ITEM_FLOW_ID) {
+      return startAddItemFlow(phone, session, env);
+    }
+    session.state = 'admin_add_item_name';
     await saveSession(phone, session, env);
     return sendText(phone, '➕ *Add New Item*\n\nEnter the item *name*:\n\nSend *CANCEL* to abort.', env);
   }
@@ -234,10 +311,14 @@ async function handleAdminIdle(phone, msg, session, env) {
   if (id === 'admin_delete_item') return startDeleteFlow(phone, session, env);
   if (id === 'admin_toggle_item') return startToggleFlow(phone, session, env);
   if (id === 'admin_view_orders') return viewOrders(phone, session, env);
+  // UX-12: default Update Status to the tappable order list.
   if (id === 'admin_update_status') {
+    return viewOrders(phone, session, env);
+  }
+  if (id === 'admin_update_status_id') {
     session.state = 'admin_update_status_id';
     await saveSession(phone, session, env);
-    return sendText(phone, '📦 Enter the *Order ID* to update:', env);
+    return sendText(phone, '📦 Enter the *Order ID* to update:\n\nSend *CANCEL* to abort.', env);
   }
   if (id === 'admin_bulk_menu') {
     return showBulkMenu(phone, session, env);
@@ -270,7 +351,7 @@ async function handleBackNavigation(phone, session, env) {
   const backMap = {
     'admin_add_item_category':   { newState: 'admin_add_item_name', prompt: '➕ *Add New Item*\n\nEnter the item *name*:' },
     'admin_add_item_price':      { newState: 'admin_add_item_category', prompt: null }, // Will re-show category list
-    'admin_add_item_description':{ newState: 'admin_add_item_price', prompt: '💰 Enter the *price* (e.g. 9.99):' },
+    'admin_add_item_description':{ newState: 'admin_add_item_price', prompt: '💰 Enter the *price* (e.g. 1500):' },
     'admin_add_item_image':      { newState: 'admin_add_item_description', prompt: null }, // Will re-show description prompt
     'admin_edit_item_field':     { newState: 'admin_edit_item_select', prompt: null }, // Will re-show item list
     'admin_edit_item_value':     { newState: 'admin_edit_item_field', prompt: null }, // Will re-show field list
@@ -280,12 +361,14 @@ async function handleBackNavigation(phone, session, env) {
 
   const backInfo = backMap[state];
   if (!backInfo) {
-    // Can't go back from here, stay in current state
-    return sendText(
-      phone,
-      '⚠️ Cannot go back from here.\n\nSend *CANCEL* to abort or continue.',
-      env
-    );
+    // EDGE-20: don't dead-end. Bulk states fall back to the bulk menu; any
+    // other unmapped state falls back to the admin menu.
+    if (typeof state === 'string' && state.startsWith('admin_bulk_')) {
+      return showBulkMenu(phone, session, env);
+    }
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
+    return showAdminMenu(phone, env);
   }
 
   session.state = backInfo.newState;
@@ -304,6 +387,14 @@ async function handleBackNavigation(phone, session, env) {
       [{ id: 'skip_desc', title: 'Skip' }],
       env
     );
+  }
+
+  // EDGE-20: edit-item back steps re-render the relevant picker/list.
+  if (state === 'admin_edit_item_field') {
+    return showEditItemPicker(phone, session, env);
+  }
+  if (state === 'admin_edit_item_value') {
+    return handleEditItemSelect(phone, { id: `edit_${adminCtx?.editItemId}` }, session, env);
   }
 
   if (state === 'admin_update_status_value' || state === 'admin_update_status_confirm') {
@@ -360,16 +451,24 @@ async function handleViewCategories(phone, msg, session, env) {
     ).bind(categoryId).first();
 
     if (!category) {
-      return sendText(phone, '⚠️ Category not found.', env);
+      return showCategoriesList(phone, session, env);
     }
 
     const items = menu.itemsByCategory[categoryId] || [];
     if (!items.length) {
-      return sendText(phone, `😕 No items in *${category.name}* yet.`, env);
+      return sendButtons(
+        phone,
+        `😕 No items in *${category.name}* yet.`,
+        [
+          { id: 'admin_view_cats', title: '📂 View Categories' },
+          { id: 'admin_home',      title: '🔧 Admin Menu'      },
+        ],
+        env
+      );
     }
 
     const itemText = items.map(i =>
-      `• *${i.name}*\n  ₦${i.price.toFixed(2)}${i.is_available ? '' : ' (unavailable)'}`
+      `• *${i.name}*\n  ${formatPrice(i.price)}${i.is_available ? '' : ' (unavailable)'}`
     ).join('\n\n');
 
     return sendButtons(
@@ -448,6 +547,127 @@ async function handleAddCategory(phone, msg, session, env) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Add Item — WhatsApp Flow (UX-13, only when ADD_ITEM_FLOW_ID is set)
+// ─────────────────────────────────────────────────────────────
+
+async function startAddItemFlow(phone, session, env) {
+  session.state = 'admin_add_item_flow';
+  await saveSession(phone, session, env);
+
+  // Hand the categories to the Flow so its dropdown can be populated.
+  const cats = await getCategories(env);
+  const flowToken = `add_item_${Date.now()}`;
+  return sendFlow(
+    phone,
+    '➕ *Add New Item*\nTap below to fill in the item details.',
+    {
+      flowId:   env.ADD_ITEM_FLOW_ID,
+      flowToken,
+      flowCta:  'Add Item',
+      screenId: env.ADD_ITEM_FLOW_SCREEN || 'ADD_ITEM',
+      data:     { categories: cats.map(c => ({ id: String(c.id), title: c.name })) },
+    },
+    env
+  );
+}
+
+async function handleAddItemFlowReply(phone, msg, session, env) {
+  // The admin tapped a button instead of completing the Flow, or sent text.
+  if (msg.type !== 'flow_reply') {
+    const t = (msg.text || '').toUpperCase().trim();
+    if (t === 'CANCEL' || msg.id === 'admin_home') {
+      session.state    = 'admin_idle';
+      session.adminCtx = {};
+      await saveSession(phone, session, env);
+      return showAdminMenu(phone, env);
+    }
+    // Re-launch the Flow so the admin isn't stranded.
+    return startAddItemFlow(phone, session, env);
+  }
+
+  const data = msg.data || {};
+  const name = sanitize(data.name || '', 100);
+  const catId = parseInt(data.category_id ?? data.category, 10);
+  const price = parsePrice(String(data.price ?? ''));
+  const description = sanitize(data.description || '', 300);
+  const rawImg = (data.image_url || '').trim();
+
+  // Validate the submitted Flow data; on any problem, re-launch the Flow.
+  const problems = [];
+  if (name.length < 2) problems.push('• Name must be at least 2 characters.');
+  if (isNaN(catId)) problems.push('• Please choose a category.');
+  if (price === null) problems.push(`• Price must be a number between 1 and ${formatPrice(MAX_PRICE)}.`); // EDGE-21
+  let imageUrl = '';
+  if (rawImg) {
+    if (!isValidHttpsUrl(rawImg)) problems.push('• Image URL must start with https://');
+    else imageUrl = rawImg;
+  }
+
+  if (problems.length) {
+    return sendButtons(
+      phone,
+      '⚠️ Could not add the item:\n\n' + problems.join('\n'),
+      [
+        { id: 'admin_add_item', title: '➕ Try Again' },
+        { id: 'admin_home',     title: '🔧 Admin Menu' },
+      ],
+      env
+    );
+  }
+
+  // Reject a category that doesn't exist (EDGE-11: re-offer the menu on failure).
+  const cat = await getCategories(env).then(cats => cats.find(c => c.id === catId));
+  if (!cat) {
+    return sendButtons(
+      phone,
+      '⚠️ That category no longer exists. Please try again.',
+      [
+        { id: 'admin_add_item', title: '➕ Try Again' },
+        { id: 'admin_home',     title: '🔧 Admin Menu' },
+      ],
+      env
+    );
+  }
+
+  // Duplicate-name guard (mirrors the text flow).
+  const existing = await env.DB.prepare(
+    'SELECT id FROM MenuItems WHERE LOWER(name) = LOWER(?)'
+  ).bind(name).first();
+  if (existing) {
+    return sendButtons(
+      phone,
+      `⚠️ An item named "${name}" already exists.`,
+      [
+        { id: 'admin_add_item', title: '➕ Try Again' },
+        { id: 'admin_home',     title: '🔧 Admin Menu' },
+      ],
+      env
+    );
+  }
+
+  // Create the item exactly once.
+  const itemId = await createMenuItem(
+    { categoryId: catId, name, description, price, imageUrl }, env
+  );
+  await bustMenuCache(env);
+  console.log('[Admin] Item created via Flow:', name, 'ID:', itemId);
+
+  session.state    = 'admin_idle';
+  session.adminCtx = {};
+  await saveSession(phone, session, env);
+
+  return sendButtons(
+    phone,
+    `✅ *${name}* added to menu!\n💰 ${formatPrice(price)}`,
+    [
+      { id: 'admin_add_item', title: '➕ Add Another Item' },
+      { id: 'admin_home',     title: '🔧 Admin Menu'       },
+    ],
+    env
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // Add Item — multi-step flow
 // ─────────────────────────────────────────────────────────────
 
@@ -519,7 +739,7 @@ async function handleAddItemCategory(phone, msg, session, env) {
   if (!session.adminCtx?.newItem) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
   }
 
   // Admin wants to create a new category while mid-way through add-item
@@ -545,7 +765,7 @@ async function handleAddItemCategory(phone, msg, session, env) {
   session.adminCtx.newItem.categoryId = catId;
   session.state = 'admin_add_item_price';
   await saveSession(phone, session, env);
-  return sendText(phone, '💰 Enter the *price* (e.g. 9.99):\n\nSend *BACK* to choose a different category.', env);
+  return sendText(phone, '💰 Enter the *price* (e.g. 1500):\n\nSend *BACK* to choose a different category.', env);
 }
 
 async function handleAddItemPrice(phone, msg, session, env) {
@@ -553,7 +773,7 @@ async function handleAddItemPrice(phone, msg, session, env) {
   if (!session.adminCtx?.newItem) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
   }
 
   // Handle global commands to escape stuck state
@@ -572,21 +792,13 @@ async function handleAddItemPrice(phone, msg, session, env) {
     return showCategoryListForItem(phone, session.adminCtx.newItem.name, env);
   }
 
-  const price = parseFloat(msg.text || '');
-  if (isNaN(price) || price < 0) {
+  // EDGE-21: validate with parsePrice — rejects non-numeric/zero/over-ceiling.
+  const price = parsePrice(msg.text || '');
+  if (price === null) {
     return sendText(
       phone,
-      '⚠️ Enter a valid price (e.g. 9.99).\n\n' +
-      'Price must be a positive number.\n' +
-      'Send *CANCEL* to abort or *BACK* to change the category.',
-      env
-    );
-  }
-  if (price > MAX_PRICE) {
-    return sendText(
-      phone,
-      `⚠️ Price seems too high (₦${price}).\n\n` +
-      `Maximum allowed is ₦${MAX_PRICE}.\n` +
+      '⚠️ Enter a valid price (e.g. 1500).\n\n' +
+      `Price must be a number between 1 and ${formatPrice(MAX_PRICE)}.\n` +
       'Send *CANCEL* to abort or *BACK* to change the category.',
       env
     );
@@ -610,7 +822,7 @@ async function handleAddItemDescription(phone, msg, session, env) {
   if (!session.adminCtx?.newItem) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
   }
 
   // Handle global commands to escape stuck state
@@ -626,7 +838,7 @@ async function handleAddItemDescription(phone, msg, session, env) {
     session.state = 'admin_add_item_price';
     delete session.adminCtx.newItem.price;
     await saveSession(phone, session, env);
-    return sendText(phone, '💰 Enter the *price* (e.g. 9.99):', env);
+    return sendText(phone, '💰 Enter the *price* (e.g. 1500):', env);
   }
 
   const desc = msg.id === 'skip_desc' ? '' : sanitize(msg.text || '', 300);
@@ -647,7 +859,7 @@ async function handleAddItemImage(phone, msg, session, env) {
   if (!session.adminCtx?.newItem) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
   }
 
   // Handle global commands to escape stuck state
@@ -715,11 +927,23 @@ async function handleAddItemImage(phone, msg, session, env) {
 // Edit Item
 // ─────────────────────────────────────────────────────────────
 
-async function startEditFlow(phone, session, env) {
-  // BUG-04 FIX: use getAllMenuItems so unavailable items are still editable
-  const items = await getAllMenuItems(env);
+// UX-11: page size 8 so 8 items + Prev + Next ≤ 10 rows per WhatsApp list.
+const ITEM_PICKER_PAGE_SIZE = 8;
 
-  if (!items.length) {
+/**
+ * UX-11: render a paginated single-select item picker.
+ * `prefix` is the row-id prefix (edit_/del_/tog_), `prevId`/`nextId` are the
+ * nav row ids the matching select handler watches for.
+ */
+async function showItemPicker(phone, session, env, opts) {
+  const { prefix, prevId, nextId, body, btnLabel, sectionTitle, descFor } = opts;
+  const page   = Math.max(0, session.adminCtx.pickerPage || 0);
+  const offset = page * ITEM_PICKER_PAGE_SIZE;
+  const { items, total } = await getMenuItemsPaginated(env, ITEM_PICKER_PAGE_SIZE, offset);
+
+  if (!items.length && page === 0) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
     return sendButtons(
       phone,
       '📭 No items in menu yet. Add one first.',
@@ -727,37 +951,65 @@ async function startEditFlow(phone, session, env) {
       env
     );
   }
+  if (!items.length && page > 0) {
+    session.adminCtx.pickerPage = page - 1;
+    await saveSession(phone, session, env);
+    return showItemPicker(phone, session, env, opts);
+  }
 
-  // BUG-21: show count when truncated
-  const visible = items.slice(0, 10);
-  const rows = visible.map(i => ({
-    id:          `edit_${i.id}`,
+  const rows = items.map(i => ({
+    id:          `${prefix}${i.id}`,
     title:       i.name,
-    description: `₦${i.price.toFixed(2)}${i.is_available ? '' : ' (unavail)'}`,
+    description: descFor(i),
   }));
 
-  const footer = items.length > 10
-    ? `Showing 10 of ${items.length} items`
-    : null;
+  if (page > 0) rows.push({ id: prevId, title: '⬅️ Prev Page' });
+  if (offset + ITEM_PICKER_PAGE_SIZE < total) rows.push({ id: nextId, title: '➡️ Next Page' });
 
-  session.state = 'admin_edit_item_select';
+  const totalPages = Math.max(1, Math.ceil(total / ITEM_PICKER_PAGE_SIZE));
   await saveSession(phone, session, env);
 
   return sendList(
     phone,
-    `✏️ *Edit Item*\nSelect an item to edit:${footer ? `\n_${footer}_` : ''}`,
-    'Choose',
-    [{ title: 'Items', rows }],
+    `${body} — Page ${page + 1} of ${totalPages}`,
+    btnLabel,
+    [{ title: sectionTitle, rows }],
     env
   );
 }
 
+async function startEditFlow(phone, session, env) {
+  session.adminCtx.pickerPage = 0;
+  session.state = 'admin_edit_item_select';
+  return showEditItemPicker(phone, session, env);
+}
+
+async function showEditItemPicker(phone, session, env) {
+  return showItemPicker(phone, session, env, {
+    prefix: 'edit_', prevId: 'edit_page_prev', nextId: 'edit_page_next',
+    body: '✏️ *Edit Item*\nSelect an item to edit:',
+    btnLabel: 'Choose', sectionTitle: 'Items',
+    descFor: i => `${formatPrice(i.price)}${i.is_available ? '' : ' (unavail)'}`,
+  });
+}
+
 async function handleEditItemSelect(phone, msg, session, env) {
-  if (!msg.id?.startsWith('edit_')) return startEditFlow(phone, session, env);
+  // UX-11: pagination navigation.
+  if (msg.id === 'edit_page_next') {
+    session.adminCtx.pickerPage = (session.adminCtx.pickerPage || 0) + 1;
+    await saveSession(phone, session, env);
+    return showEditItemPicker(phone, session, env);
+  }
+  if (msg.id === 'edit_page_prev') {
+    session.adminCtx.pickerPage = Math.max(0, (session.adminCtx.pickerPage || 0) - 1);
+    await saveSession(phone, session, env);
+    return showEditItemPicker(phone, session, env);
+  }
+  if (!msg.id?.startsWith('edit_')) return showEditItemPicker(phone, session, env);
 
   const itemId = parseInt(msg.id.replace('edit_', ''), 10);
   const item   = await getMenuItem(itemId, env);
-  if (!item) return sendText(phone, '⚠️ Item not found.', env);
+  if (!item) return sendAdminError(phone, '⚠️ Item not found.', env);
 
   session.adminCtx.editItemId = itemId;
   session.state = 'admin_edit_item_field';
@@ -794,7 +1046,7 @@ async function handleEditItemField(phone, msg, session, env) {
   // Availability: toggle immediately, no value step needed
   if (msg.id === 'ef_availability') {
     const item = await getMenuItem(session.adminCtx.editItemId, env);
-    if (!item) return sendText(phone, '⚠️ Item not found.', env);
+    if (!item) return sendAdminError(phone, '⚠️ Item not found.', env);
     const newVal = item.is_available ? 0 : 1;
     await updateMenuItem(item.id, { is_available: newVal }, env);
     await bustMenuCache(env);
@@ -841,7 +1093,7 @@ async function handleEditItemField(phone, msg, session, env) {
   if (!field) {
     // User typed text instead of selecting from list — re-show field picker
     const item = await getMenuItem(session.adminCtx.editItemId, env);
-    if (!item) return sendText(phone, '⚠️ Item not found.', env);
+    if (!item) return sendAdminError(phone, '⚠️ Item not found.', env);
     const availLabel = item.is_available ? '✅ Available' : '❌ Unavailable';
     return sendList(
       phone,
@@ -868,7 +1120,7 @@ async function handleEditItemField(phone, msg, session, env) {
 
   const prompts = {
     name:        'Enter the new *name*:\n\nSend *CANCEL* to abort.',
-    price:       'Enter the new *price* (e.g. 12.99):\n\nSend *CANCEL* to abort.',
+    price:       'Enter the new *price* (e.g. 1500):\n\nSend *CANCEL* to abort.',
     description: 'Enter the new *description*:\n\nSend *CANCEL* to abort.',
     image_url:   'Enter the new *image URL* (must start with https://):\n\nSend *CANCEL* to abort.',
   };
@@ -881,7 +1133,7 @@ async function handleEditItemValue(phone, msg, session, env) {
   if (!editItemId || !editField) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
   }
 
   // Category edit: handle list_reply from the category picker
@@ -931,19 +1183,13 @@ async function handleEditItemValue(phone, msg, session, env) {
   let value = sanitize(msg.text || '', 500);
 
   if (editField === 'price') {
-    const p = parseFloat(value);
-    if (isNaN(p) || p < 0) {
+    // EDGE-21: validate with parsePrice — rejects non-numeric/zero/over-ceiling.
+    const p = parsePrice(value);
+    if (p === null) {
       return sendText(
         phone,
-        '⚠️ Enter a valid price (e.g. 12.99).\n\n' +
-        'Send *CANCEL* to abort.',
-        env
-      );
-    }
-    if (p > MAX_PRICE) {
-      return sendText(
-        phone,
-        `⚠️ Price seems too high. Maximum is ₦${MAX_PRICE}.\n\n` +
+        '⚠️ Enter a valid price (e.g. 1500).\n\n' +
+        `Price must be a number between 1 and ${formatPrice(MAX_PRICE)}.\n` +
         'Send *CANCEL* to abort.',
         env
       );
@@ -968,7 +1214,7 @@ async function handleEditItemValue(phone, msg, session, env) {
   session.adminCtx = {};
   await saveSession(phone, session, env);
 
-  const displayVal = editField === 'price' ? `₦${Number(value).toFixed(2)}` : String(value).slice(0, 40);
+  const displayVal = editField === 'price' ? formatPrice(value) : String(value).slice(0, 40);
   return sendButtons(
     phone,
     `✅ *${editField}* updated → ${displayVal}`,
@@ -985,48 +1231,37 @@ async function handleEditItemValue(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function startDeleteFlow(phone, session, env) {
-  // BUG-04 FIX: use getAllMenuItems so unavailable items can still be deleted
-  const items = await getAllMenuItems(env);
-
-  if (!items.length) {
-    return sendButtons(
-      phone,
-      '📭 No items to delete. Add one first.',
-      [{ id: 'admin_add_item', title: '➕ Add Item' }],
-      env
-    );
-  }
-
-  // BUG-21: show count when truncated
-  const visible = items.slice(0, 10);
-  const rows = visible.map(i => ({
-    id:          `del_${i.id}`,
-    title:       i.name,
-    description: `₦${i.price.toFixed(2)}${i.is_available ? '' : ' (unavail)'}`,
-  }));
-
-  const footer = items.length > 10
-    ? `Showing 10 of ${items.length} items`
-    : null;
-
+  session.adminCtx.pickerPage = 0;
   session.state = 'admin_delete_item_select';
-  await saveSession(phone, session, env);
+  return showDeleteItemPicker(phone, session, env);
+}
 
-  return sendList(
-    phone,
-    `🗑️ *Delete Item*\nSelect item to delete:${footer ? `\n_${footer}_` : ''}`,
-    'Choose',
-    [{ title: 'Items', rows }],
-    env
-  );
+async function showDeleteItemPicker(phone, session, env) {
+  return showItemPicker(phone, session, env, {
+    prefix: 'del_', prevId: 'del_page_prev', nextId: 'del_page_next',
+    body: '🗑️ *Delete Item*\nSelect item to delete:',
+    btnLabel: 'Choose', sectionTitle: 'Items',
+    descFor: i => `${formatPrice(i.price)}${i.is_available ? '' : ' (unavail)'}`,
+  });
 }
 
 async function handleDeleteItemSelect(phone, msg, session, env) {
-  if (!msg.id?.startsWith('del_')) return startDeleteFlow(phone, session, env);
+  // UX-11: pagination navigation.
+  if (msg.id === 'del_page_next') {
+    session.adminCtx.pickerPage = (session.adminCtx.pickerPage || 0) + 1;
+    await saveSession(phone, session, env);
+    return showDeleteItemPicker(phone, session, env);
+  }
+  if (msg.id === 'del_page_prev') {
+    session.adminCtx.pickerPage = Math.max(0, (session.adminCtx.pickerPage || 0) - 1);
+    await saveSession(phone, session, env);
+    return showDeleteItemPicker(phone, session, env);
+  }
+  if (!msg.id?.startsWith('del_')) return showDeleteItemPicker(phone, session, env);
 
   const itemId = parseInt(msg.id.replace('del_', ''), 10);
   const item   = await getMenuItem(itemId, env);
-  if (!item) return sendText(phone, '⚠️ Item not found.', env);
+  if (!item) return sendAdminError(phone, '⚠️ Item not found.', env);
 
   session.adminCtx.deleteItemId   = itemId;
   session.adminCtx.deleteItemName = item.name;
@@ -1035,7 +1270,7 @@ async function handleDeleteItemSelect(phone, msg, session, env) {
 
   return sendButtons(
     phone,
-    `⚠️ Delete *${item.name}* (₦${item.price.toFixed(2)})?\n\nThis cannot be undone.`,
+    `⚠️ Delete *${item.name}* (${formatPrice(item.price)})?\n\nThis cannot be undone.`,
     [
       { id: 'confirm_delete', title: '🗑️ Yes, Delete' },
       { id: 'admin_home',     title: '❌ Cancel'       },
@@ -1050,7 +1285,7 @@ async function handleDeleteItemConfirm(phone, msg, session, env) {
     if (!deleteItemId) {
       session.state = 'admin_idle';
       await saveSession(phone, session, env);
-      return sendText(phone, '⚠️ Session lost. Please start over.', env);
+      return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
     }
 
     await deleteMenuItem(deleteItemId, env);
@@ -1078,50 +1313,40 @@ async function handleDeleteItemConfirm(phone, msg, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function startToggleFlow(phone, session, env) {
-  // BUG-04 FIX: getAllMenuItems — must see unavailable items to re-enable them
-  const items = await getAllMenuItems(env);
-
-  if (!items.length) {
-    return sendButtons(
-      phone,
-      '📭 No items in menu yet. Add one first.',
-      [{ id: 'admin_add_item', title: '➕ Add Item' }],
-      env
-    );
-  }
-
-  const visible = items.slice(0, 10);
-  const rows = visible.map(i => ({
-    id:          `tog_${i.id}`,
-    title:       i.name,
-    description: i.is_available ? '✅ Available' : '❌ Unavailable',
-  }));
-
-  const footer = items.length > 10
-    ? `Showing 10 of ${items.length} items`
-    : null;
-
+  session.adminCtx.pickerPage = 0;
   session.state = 'admin_toggle_item_select';
-  await saveSession(phone, session, env);
+  return showToggleItemPicker(phone, session, env);
+}
 
-  return sendList(
-    phone,
-    `🔄 *Toggle Availability*\nTap an item to flip its status:${footer ? `\n_${footer}_` : ''}`,
-    'Choose Item',
-    [{ title: 'All Items', rows }],
-    env
-  );
+async function showToggleItemPicker(phone, session, env) {
+  return showItemPicker(phone, session, env, {
+    prefix: 'tog_', prevId: 'tog_page_prev', nextId: 'tog_page_next',
+    body: '🔄 *Toggle Availability*\nTap an item to flip its status:',
+    btnLabel: 'Choose Item', sectionTitle: 'All Items',
+    descFor: i => (i.is_available ? '✅ Available' : '❌ Unavailable'),
+  });
 }
 
 async function handleToggleItemSelect(phone, msg, session, env) {
-  if (!msg.id?.startsWith('tog_')) return startToggleFlow(phone, session, env);
+  // UX-11: pagination navigation.
+  if (msg.id === 'tog_page_next') {
+    session.adminCtx.pickerPage = (session.adminCtx.pickerPage || 0) + 1;
+    await saveSession(phone, session, env);
+    return showToggleItemPicker(phone, session, env);
+  }
+  if (msg.id === 'tog_page_prev') {
+    session.adminCtx.pickerPage = Math.max(0, (session.adminCtx.pickerPage || 0) - 1);
+    await saveSession(phone, session, env);
+    return showToggleItemPicker(phone, session, env);
+  }
+  if (!msg.id?.startsWith('tog_')) return showToggleItemPicker(phone, session, env);
 
   const itemId = parseInt(msg.id.replace('tog_', ''), 10);
   const item   = await env.DB.prepare(
     'SELECT id, name, is_available FROM MenuItems WHERE id = ?'
   ).bind(itemId).first();
 
-  if (!item) return sendText(phone, '⚠️ Item not found.', env);
+  if (!item) return sendAdminError(phone, '⚠️ Item not found.', env);
 
   const newAvail = item.is_available ? 0 : 1;
   await env.DB.prepare('UPDATE MenuItems SET is_available = ? WHERE id = ?')
@@ -1145,10 +1370,19 @@ async function handleToggleItemSelect(phone, msg, session, env) {
 // View Orders
 // ─────────────────────────────────────────────────────────────
 
-async function viewOrders(phone, session, env) {
-  const orders = await getPendingOrders(env);
+// UX-10: paginate the order-status update list. Page size 8 plus up to two
+// nav rows and one typed-ID fallback row — the order count is trimmed so the
+// total never exceeds WhatsApp's 10-row cap (no orders are silently lost).
+const ORDERS_PAGE_SIZE = 8;
 
-  if (!orders.length) {
+async function viewOrders(phone, session, env) {
+  const page   = Math.max(0, session.adminCtx.ordersPage || 0);
+  const offset = page * ORDERS_PAGE_SIZE;
+  const { orders, total } = await getActiveOrdersPaginated(env, ORDERS_PAGE_SIZE, offset);
+
+  if (!orders.length && page === 0) {
+    session.state = 'admin_idle';
+    await saveSession(phone, session, env);
     return sendButtons(
       phone,
       '📭 No pending orders right now.',
@@ -1157,20 +1391,38 @@ async function viewOrders(phone, session, env) {
     );
   }
 
-  const statusEmoji = { pending: '⏳', confirmed: '✅', preparing: '👨‍🍳' };
+  // If we paged past the end (e.g. orders cleared), step back to the last page.
+  if (!orders.length && page > 0) {
+    session.adminCtx.ordersPage = page - 1;
+    await saveSession(phone, session, env);
+    return viewOrders(phone, session, env);
+  }
 
+  const hasPrev = page > 0;
+  const hasNext = offset + ORDERS_PAGE_SIZE < total;
+
+  // Show ALL fetched orders — never trim them (orders must not be silently lost).
   const rows = orders.map(o => ({
     id: `astat_${o.id}`,
     title: `#${o.id} - ${o.status.toUpperCase()} (${formatPrice(o.total_price)})`,
-    description: `� ${o.payment_status.toUpperCase()} | �� ${o.user_phone} | 📍 ${(o.address || '').slice(0, 20)}`
+    description: `💳 ${o.payment_status.toUpperCase()} | 📱 ${o.user_phone} | 📍 ${(o.address || '').slice(0, 20)}`
   }));
+
+  if (hasPrev) rows.push({ id: 'orders_page_prev', title: '⬅️ Prev Page' });
+  if (hasNext) rows.push({ id: 'orders_page_next', title: '➡️ Next Page' });
+  // UX-12: typed-numeric-ID fallback row — only when it fits within the 10-row cap.
+  if (rows.length < 10) {
+    rows.push({ id: 'admin_update_status_id', title: '⌨️ Type Order ID', description: 'Enter an order ID manually' });
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / ORDERS_PAGE_SIZE));
 
   session.state = 'admin_orders_list';
   await saveSession(phone, session, env);
 
   return sendList(
     phone,
-    '📦 *Active Orders*\nSelect an order to update its status:',
+    `📦 *Active Orders* — Page ${page + 1} of ${totalPages}\nSelect an order to update its status:`,
     'Select Order',
     [{ title: 'Pending/Active', rows }],
     env
@@ -1178,6 +1430,18 @@ async function viewOrders(phone, session, env) {
 }
 
 async function handleAdminOrdersList(phone, msg, session, env) {
+  // UX-10: pagination navigation.
+  if (msg.id === 'orders_page_next') {
+    session.adminCtx.ordersPage = (session.adminCtx.ordersPage || 0) + 1;
+    await saveSession(phone, session, env);
+    return viewOrders(phone, session, env);
+  }
+  if (msg.id === 'orders_page_prev') {
+    session.adminCtx.ordersPage = Math.max(0, (session.adminCtx.ordersPage || 0) - 1);
+    await saveSession(phone, session, env);
+    return viewOrders(phone, session, env);
+  }
+
   if (msg.type === 'list_reply' && msg.id?.startsWith('astat_')) {
     const orderId = parseInt(msg.id.replace('astat_', ''), 10);
     const order = await getOrder(orderId, env);
@@ -1185,6 +1449,8 @@ async function handleAdminOrdersList(phone, msg, session, env) {
 
     session.adminCtx.updateOrderId = orderId;
     session.adminCtx.orderPhone    = order.user_phone;
+    session.adminCtx.orderCurrentStatus = order.status;
+    session.adminCtx.orderPaymentStatus = order.payment_status;
     session.state = 'admin_update_status_value';
     await saveSession(phone, session, env);
 
@@ -1198,10 +1464,11 @@ async function handleAdminOrdersList(phone, msg, session, env) {
     );
   }
 
-  if (msg.id === 'admin_update_status') {
+  // UX-12: typed-numeric-ID fallback.
+  if (msg.id === 'admin_update_status_id' || msg.id === 'admin_update_status') {
     session.state = 'admin_update_status_id';
     await saveSession(phone, session, env);
-    return sendText(phone, '📦 Enter the *Order ID* to update:', env);
+    return sendText(phone, '📦 Enter the *Order ID* to update:\n\nSend *CANCEL* to abort.', env);
   }
 
   session.state    = 'admin_idle';
@@ -1262,6 +1529,8 @@ async function handleUpdateStatusId(phone, msg, session, env) {
 
   session.adminCtx.updateOrderId = orderId;
   session.adminCtx.orderPhone    = order.user_phone;
+  session.adminCtx.orderCurrentStatus = order.status;
+  session.adminCtx.orderPaymentStatus = order.payment_status;
   session.state = 'admin_update_status_value';
   await saveSession(phone, session, env);
 
@@ -1276,24 +1545,75 @@ async function handleUpdateStatusId(phone, msg, session, env) {
 }
 
 async function handleUpdateStatusValue(phone, msg, session, env) {
-  if (!msg.id?.startsWith('status_')) {
-    return sendText(phone, '⚠️ Please select a status from the list.', env);
+  const orderId = session.adminCtx.updateOrderId;
+  const current = session.adminCtx.orderCurrentStatus;
+
+  // EDGE-11: re-render the status list instead of stranding the admin with text.
+  if (!msg.id?.startsWith('status_') || !VALID_STATUSES.includes(msg.id.replace('status_', ''))) {
+    if (!orderId) {
+      session.state = 'admin_idle';
+      await saveSession(phone, session, env);
+      return showAdminMenu(phone, env);
+    }
+    const rows = VALID_STATUSES.map(s => ({ id: `status_${s}`, title: s.toUpperCase() }));
+    return sendList(
+      phone,
+      `📦 *Order #${orderId}*\nPlease tap a status from the list:`,
+      'Choose Status',
+      [{ title: 'Order Statuses', rows }],
+      env
+    );
   }
 
   const newStatus = msg.id.replace('status_', '');
-  if (!VALID_STATUSES.includes(newStatus)) {
-    return sendText(phone, '⚠️ Invalid status.', env);
+
+  // EDGE-07: skip work (and the customer notification) when nothing changes.
+  if (current && newStatus === current) {
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `ℹ️ Order #${orderId} is already *${newStatus.toUpperCase()}* — no change made.`,
+      [
+        { id: 'admin_update_status', title: '📦 Update Status' },
+        { id: 'admin_home',          title: '🔧 Admin Menu'   },
+      ],
+      env
+    );
+  }
+
+  // EDGE-07: reject illegal transitions (delivered & cancelled are terminal).
+  if (current && !isAllowedTransition(current, newStatus)) {
+    return sendButtons(
+      phone,
+      `🚫 Cannot change order #${orderId} from *${current.toUpperCase()}* to *${newStatus.toUpperCase()}*.\n\n` +
+      'Delivered and cancelled orders are final.',
+      [
+        { id: 'admin_view_orders', title: '📦 View Orders' },
+        { id: 'admin_home',        title: '🔧 Admin Menu' },
+      ],
+      env
+    );
   }
 
   session.adminCtx.newStatus = newStatus;
-  
+
   // Ask for confirmation for destructive or final statuses
   if (newStatus === 'cancelled' || newStatus === 'delivered') {
     session.state = 'admin_update_status_confirm';
     await saveSession(phone, session, env);
+
+    // EDGE-08: warn the admin when cancelling a PAID order — manual refund needed.
+    let warn = '';
+    if (newStatus === 'cancelled' && session.adminCtx.orderPaymentStatus === 'paid') {
+      warn = '\n\n⚠️ This order is PAID — a manual refund is required.';
+      console.warn(`[Admin] Cancelling PAID order #${orderId} — manual refund required.`);
+    }
+
     return sendButtons(
       phone,
-      `⚠️ *Confirm Status Change*\n\nAre you sure you want to mark order #${session.adminCtx.updateOrderId} as *${newStatus.toUpperCase()}*?`,
+      `⚠️ *Confirm Status Change*\n\nAre you sure you want to mark order #${orderId} as *${newStatus.toUpperCase()}*?${warn}`,
       [
         { id: 'confirm_status_yes', title: 'Yes, Confirm' },
         { id: 'admin_back',         title: '⬅️ Back'        },
@@ -1315,29 +1635,98 @@ async function handleUpdateStatusConfirm(phone, msg, session, env) {
 }
 
 async function performStatusUpdate(phone, session, env) {
-  const { updateOrderId, orderPhone, newStatus } = session.adminCtx;
+  const { updateOrderId, orderPhone, newStatus, orderCurrentStatus, orderPaymentStatus } = session.adminCtx;
   if (!updateOrderId || !orderPhone || !newStatus) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
+  }
+
+  // EDGE-07: re-check for no-op / illegal transition before writing.
+  if (orderCurrentStatus && newStatus === orderCurrentStatus) {
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `ℹ️ Order #${updateOrderId} is already *${newStatus.toUpperCase()}* — no change made.`,
+      [
+        { id: 'admin_update_status', title: '📦 Update Status' },
+        { id: 'admin_home',          title: '🔧 Admin Menu'   },
+      ],
+      env
+    );
+  }
+  if (orderCurrentStatus && !isAllowedTransition(orderCurrentStatus, newStatus)) {
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `🚫 Cannot change order #${updateOrderId} from *${orderCurrentStatus.toUpperCase()}* to *${newStatus.toUpperCase()}*.`,
+      [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+      env
+    );
   }
 
   await updateOrderStatus(updateOrderId, newStatus, env);
 
-  // Notify customer — best effort
-  const customerMsg = statusMessage(updateOrderId, newStatus);
-  await sendText(orderPhone, customerMsg, env)
-    .catch(err => console.error('[Admin] Failed to notify customer:', err));
+  // EDGE-08: log the paid-cancel case so a manual refund is traceable.
+  const paidCancel = newStatus === 'cancelled' && orderPaymentStatus === 'paid';
+  if (paidCancel) {
+    console.warn(`[Admin] Order #${updateOrderId} cancelled while PAID — manual refund required.`);
+  }
+
+  // UX-09: notify the customer and only claim success when the send resolves.
+  const notified = await notifyCustomerStatus(orderPhone, updateOrderId, newStatus, env);
+
+  const notifyLine = notified
+    ? '✅ Customer notified.'
+    : "⚠️ Could not reach the customer (they'll see status next visit).";
+  const refundLine = paidCancel ? '\n⚠️ This order is PAID — a manual refund is required.' : '';
+
+  session.state    = 'admin_idle';
+  session.adminCtx = {};
+  await saveSession(phone, session, env);
 
   return sendButtons(
     phone,
-    `✅ Order #${updateOrderId} status updated to *${newStatus.toUpperCase()}*.\n\nCustomer notified.`,
+    `✅ Order #${updateOrderId} status updated to *${newStatus.toUpperCase()}*.\n\n${notifyLine}${refundLine}`,
     [
       { id: 'admin_update_status', title: '📦 Update Status' },
       { id: 'admin_home', title: '🔧 Admin Menu' },
     ],
     env
   );
+}
+
+/**
+ * UX-09: send a proactive order-status update to the customer.
+ * Prefers a configured WhatsApp template (ORDER_STATUS_TEMPLATE) for the
+ * proactive send, falling back to plain text. Returns true only when the
+ * send actually resolves so callers can report honestly.
+ */
+async function notifyCustomerStatus(orderPhone, orderId, newStatus, env) {
+  try {
+    const tpl = env.ORDER_STATUS_TEMPLATE;
+    if (tpl) {
+      const lang = env.ORDER_STATUS_TEMPLATE_LANG || 'en';
+      const components = [{
+        type: 'body',
+        parameters: [
+          { type: 'text', text: String(orderId) },
+          { type: 'text', text: newStatus.toUpperCase() },
+        ],
+      }];
+      await sendTemplate(orderPhone, tpl, lang, components, env);
+    } else {
+      await sendText(orderPhone, statusMessage(orderId, newStatus), env);
+    }
+    return true;
+  } catch (err) {
+    console.error('[Admin] Failed to notify customer of status change:', err);
+    return false;
+  }
 }
 
 function statusMessage(orderId, status) {
@@ -1398,10 +1787,11 @@ async function handleBulkMenu(phone, msg, session, env) {
 
   // ── Items: Add ──────────────────────────────────────────────
   if (id === 'bulk_items_add') {
-    session.state = 'admin_bulk_items_add_paste';
+    // UX-14: offer a category dropdown before forcing typed category names.
+    session.state = 'admin_bulk_items_add_category';
     session.adminCtx.bulk = { type: 'menu_items', action: 'add' };
     await saveSession(phone, session, env);
-    return showBulkItemAddTemplate(phone, env);
+    return showBulkAddCategoryStep(phone, session, env);
   }
 
   // ── Items: Remove ────────────────────────────────────────────
@@ -1543,12 +1933,7 @@ async function handleBulkOrdersSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bs_o_')) {
     const orderId = parseInt(msg.id.replace('bs_o_', ''), 10);
-    const idx = bulk.selectedIds.indexOf(orderId);
-    if (idx > -1) {
-      bulk.selectedIds.splice(idx, 1);
-    } else {
-      bulk.selectedIds.push(orderId);
-    }
+    toggleSelection(bulk, orderId); // BUG-11: de-duplicated, race-safe toggle
     await saveSession(phone, session, env);
     return showBulkOrdersList(phone, session, env);
   }
@@ -1559,16 +1944,17 @@ async function handleBulkOrdersSelect(phone, msg, session, env) {
       return sendText(phone, '⚠️ Please select at least one order first.', env);
     }
 
-    session.state = 'admin_bulk_orders_confirm';
-    await saveSession(phone, session, env);
-
-    const isRisky = ['delivered', 'cancelled'].includes(bulk.targetValue);
     let body = `📝 *Bulk Review*\n\nAction: *${bulk.targetValue.toUpperCase()}*\nTarget: ${bulk.selectedIds.length} orders (#${bulk.selectedIds.join(', #')})\n\n`;
-    
+
+    // UX-16: offer a canned reason list when cancelling, instead of free text.
     if (bulk.targetValue === 'cancelled') {
-      return sendText(phone, body + '❓ Why are these orders being cancelled?\n\n(Type the reason and send)', env);
+      session.state = 'admin_bulk_orders_reason';
+      await saveSession(phone, session, env);
+      return showBulkCancelReasonList(phone, env);
     }
 
+    session.state = 'admin_bulk_orders_confirm';
+    await saveSession(phone, session, env);
     return sendButtons(
       phone,
       body + `Notify customers?`,
@@ -1600,23 +1986,89 @@ async function handleBulkOrdersSelect(phone, msg, session, env) {
   );
 }
 
+// UX-16 / EDGE-17: canned bulk-cancel reason list.
+async function showBulkCancelReasonList(phone, env) {
+  return sendList(
+    phone,
+    '❓ *Why are these orders being cancelled?*\nPick a reason (it will be shown to the customer):',
+    'Choose Reason',
+    [{
+      title: 'Reasons',
+      rows: [
+        { id: 'ba_reason_out_of_stock', title: 'Out of stock',    description: 'Items are unavailable' },
+        { id: 'ba_reason_closed',       title: 'We are closed',    description: 'Outside opening hours' },
+        { id: 'ba_reason_unreachable',  title: 'Could not reach',  description: 'Customer unreachable' },
+        { id: 'ba_reason_payment',      title: 'Payment problem',  description: 'Payment issue' },
+        { id: 'ba_reason_other',        title: 'Other (type it)',  description: 'Enter a custom reason' },
+        { id: 'ba_reason_skip',         title: 'Skip / no reason', description: 'Cancel without a reason' },
+      ],
+    }],
+    env
+  );
+}
+
+async function handleBulkOrdersReason(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  // Awaiting a custom "Other" reason as free text.
+  if (bulk.awaitingCustomReason) {
+    if (msg.text && msg.text.trim()) {
+      bulk.cancellationReason = sanitize(msg.text, 200);
+      bulk.awaitingCustomReason = false;
+      return promptBulkCancelNotify(phone, session, env);
+    }
+    return sendText(phone, '❓ Please type the cancellation reason, or send *CANCEL* to abort.', env);
+  }
+
+  if (msg.id === 'ba_reason_other') {
+    bulk.awaitingCustomReason = true;
+    await saveSession(phone, session, env);
+    return sendText(phone, '✍️ Type the cancellation reason to show the customer:\n\nSend *CANCEL* to abort.', env);
+  }
+
+  if (msg.id === 'ba_reason_skip') {
+    bulk.cancellationReason = '';
+    return promptBulkCancelNotify(phone, session, env);
+  }
+
+  if (msg.id?.startsWith('ba_reason_')) {
+    const code = msg.id.replace('ba_reason_', '');
+    const sentence = BULK_CANCEL_REASONS[code];
+    if (sentence) {
+      bulk.cancellationReason = sentence;
+      return promptBulkCancelNotify(phone, session, env);
+    }
+  }
+
+  // EDGE-17: unexpected input — re-prompt instead of silently aborting.
+  return showBulkCancelReasonList(phone, env);
+}
+
+async function promptBulkCancelNotify(phone, session, env) {
+  const { bulk } = session.adminCtx;
+  session.state = 'admin_bulk_orders_confirm';
+  await saveSession(phone, session, env);
+  const reasonLine = bulk.cancellationReason ? `Reason: ${bulk.cancellationReason}\n` : 'Reason: (none)\n';
+  return sendButtons(
+    phone,
+    `Action: *CANCEL*\n${reasonLine}Target: ${bulk.selectedIds.length} orders\n\nNotify customers?`,
+    [
+      { id: 'bulk_confirm_notify', title: '✅ Yes, Notify' },
+      { id: 'bulk_confirm_silent', title: '🤫 No, Silent' },
+      { id: 'admin_back', title: '⬅️ Back' }
+    ],
+    env
+  );
+}
+
 async function handleBulkOrdersConfirm(phone, msg, session, env) {
   const { bulk } = session.adminCtx;
 
-  // Handle cancellation reason
-  if (bulk.targetValue === 'cancelled' && !bulk.cancellationReason && msg.text) {
-    bulk.cancellationReason = sanitize(msg.text, 200);
+  // EDGE-20: BACK returns to the order-selection list instead of dead-ending.
+  if (msg.id === 'admin_back' || (msg.text || '').toUpperCase() === 'BACK') {
+    session.state = 'admin_bulk_orders_select';
     await saveSession(phone, session, env);
-    return sendButtons(
-      phone,
-      `Action: *CANCEL*\nReason: ${bulk.cancellationReason}\nTarget: ${bulk.selectedIds.length} orders\n\nNotify customers?`,
-      [
-        { id: 'bulk_confirm_notify', title: '✅ Yes, Notify' },
-        { id: 'bulk_confirm_silent', title: '🤫 No, Silent' },
-        { id: 'admin_back', title: '⬅️ Back' }
-      ],
-      env
-    );
+    return showBulkOrdersList(phone, session, env);
   }
 
   if (msg.id === 'bulk_confirm_notify' || msg.id === 'bulk_confirm_silent') {
@@ -1624,19 +2076,27 @@ async function handleBulkOrdersConfirm(phone, msg, session, env) {
     return executeBulkOrders(phone, session, env);
   }
 
-  session.state    = 'admin_idle';
-  session.adminCtx = {};
-  await saveSession(phone, session, env);
-  return showAdminMenu(phone, env);
+  // Unexpected input — re-prompt rather than silently aborting.
+  return sendButtons(
+    phone,
+    `Action: *${bulk.targetValue.toUpperCase()}*\nTarget: ${bulk.selectedIds.length} orders\n\nNotify customers?`,
+    [
+      { id: 'bulk_confirm_notify', title: '✅ Yes, Notify' },
+      { id: 'bulk_confirm_silent', title: '🤫 No, Silent' },
+      { id: 'admin_back', title: '⬅️ Back' }
+    ],
+    env
+  );
 }
 
 async function executeBulkOrders(phone, session, env) {
   const { bulk } = session.adminCtx;
   const status = bulk.targetValue;
-  
+
   let successCount = 0;
   let skippedCount = 0;
   let failureCount = 0;
+  let paidCancelCount = 0;
   const failureDetails = [];
 
   for (const id of bulk.selectedIds) {
@@ -1647,22 +2107,41 @@ async function executeBulkOrders(phone, session, env) {
         continue;
       }
 
-      // Decision #4: Unpaid Paystack orders excluded from kitchen statuses by default
+      // EDGE-07: skip no-op and illegal transitions (delivered & cancelled are terminal).
+      if (order.status === status) {
+        skippedCount++;
+        continue;
+      }
+      if (!isAllowedTransition(order.status, status)) {
+        skippedCount++;
+        continue;
+      }
+
+      // Decision #4: unpaid (Flutterwave) orders excluded from kitchen statuses by default
       const isKitchenStatus = ['confirmed', 'preparing', 'ready'].includes(status);
       if (isKitchenStatus && order.payment_status !== 'paid') {
         skippedCount++;
         continue;
       }
 
+      // EDGE-08: a paid order being cancelled needs a manual refund — log it.
+      if (status === 'cancelled' && order.payment_status === 'paid') {
+        paidCancelCount++;
+        console.warn(`[Admin] Bulk-cancel of PAID order #${id} — manual refund required.`);
+      }
+
       await updateOrderStatus(id, status, env);
       successCount++;
 
       if (bulk.notifyCustomers) {
-        let msg = statusMessage(id, status);
+        let custMsg = statusMessage(id, status);
         if (status === 'cancelled' && bulk.cancellationReason) {
-          msg = `❌ Order #${id} cancelled.\nReason: ${bulk.cancellationReason}\n\nIf you already paid, our team will contact you about refund/support.`;
+          custMsg = `❌ Order #${id} cancelled.\nReason: ${bulk.cancellationReason}\n\nIf you already paid, our team will contact you about refund/support.`;
         }
-        await sendText(order.user_phone, msg, env).catch(() => {});
+        // UX-09: best-effort; never let a failed notify abort the batch.
+        await sendText(order.user_phone, custMsg, env).catch(
+          err => console.error(`[Admin] Bulk notify failed for #${id}:`, err)
+        );
       }
     } catch (err) {
       failureCount++;
@@ -1689,13 +2168,18 @@ async function executeBulkOrders(phone, session, env) {
   session.adminCtx = {};
   await saveSession(phone, session, env);
 
-  const summary = 
+  // EDGE-08: surface the manual-refund warning for paid cancellations.
+  const paidWarn = paidCancelCount > 0
+    ? `\n⚠️ ${paidCancelCount} PAID order(s) cancelled — manual refund required.`
+    : '';
+
+  const summary =
     `✅ *Bulk Action Complete*\n\n` +
     `Action: *${status.toUpperCase()}*\n` +
     `Updated: ${successCount}\n` +
     `Skipped: ${skippedCount}\n` +
     `Failed: ${failureCount}\n` +
-    `Notified: ${bulk.notifyCustomers ? successCount : 0}\n\n` +
+    `Notified: ${bulk.notifyCustomers ? successCount : 0}${paidWarn}\n\n` +
     `Log ID: ${logId}`;
 
   return sendButtons(
@@ -1778,12 +2262,7 @@ async function handleBulkItemsSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bs_i_')) {
     const itemId = parseInt(msg.id.replace('bs_i_', ''), 10);
-    const idx = bulk.selectedIds.indexOf(itemId);
-    if (idx > -1) {
-      bulk.selectedIds.splice(idx, 1);
-    } else {
-      bulk.selectedIds.push(itemId);
-    }
+    toggleSelection(bulk, itemId); // BUG-11: de-duplicated, race-safe toggle
     await saveSession(phone, session, env);
     return showBulkItemsList(phone, session, env);
   }
@@ -1856,7 +2335,7 @@ async function handleBulkItemsConfirm(phone, msg, session, env) {
       );
     } catch (err) {
       console.error('[Admin] Bulk item update failed:', err);
-      return sendText(phone, '⚠️ Failed to complete bulk update. Please try again.', env);
+      return sendAdminError(phone, '⚠️ Failed to complete bulk update. Please try again.', env);
     }
   }
 
@@ -1867,7 +2346,17 @@ async function handleBulkItemsConfirm(phone, msg, session, env) {
 // Bulk Parser Helpers
 // ─────────────────────────────────────────────────────────────
 
-function parseBulkItemPaste(rawText, categories, existingNames) {
+/**
+ * Parse a bulk item paste.
+ *
+ * UX-14: when `forcedCategory` is provided (admin picked one from a dropdown),
+ * the per-line category column is dropped — columns become
+ *   Name | Price | Description | Image URL | Available
+ * Otherwise the legacy column layout with an inline category is used.
+ *
+ * EDGE-21: prices are validated with parsePrice (rejects zero/over-ceiling).
+ */
+function parseBulkItemPaste(rawText, categories, existingNames, forcedCategory = null) {
   const catByName = {};
   for (const c of categories) catByName[c.name.toLowerCase()] = c;
   const existingLower = new Set((existingNames || []).map(n => n.toLowerCase()));
@@ -1881,20 +2370,25 @@ function parseBulkItemPaste(rawText, categories, existingNames) {
     const lineNum = i + 1;
     const rowErrors = [];
     const name = sanitize(parts[0] || '', 100);
-    const categoryRaw = parts[1] || '';
-    const priceRaw = parts[2] || '';
-    const description = sanitize(parts[3] || '', 300);
-    const imageUrl = (parts[4] || '').trim();
-    const availableRaw = (parts[5] || 'yes').trim().toLowerCase();
+
+    // Shift the column indices when the category comes from the dropdown.
+    const categoryRaw = forcedCategory ? '' : (parts[1] || '');
+    const priceRaw    = forcedCategory ? (parts[1] || '') : (parts[2] || '');
+    const description = sanitize((forcedCategory ? parts[2] : parts[3]) || '', 300);
+    const imageUrl    = ((forcedCategory ? parts[3] : parts[4]) || '').trim();
+    const availableRaw = ((forcedCategory ? parts[4] : parts[5]) || 'yes').trim().toLowerCase();
+
+    const cat = forcedCategory || catByName[categoryRaw.toLowerCase()];
 
     if (name.length < 2) rowErrors.push('name must be ≥2 chars');
-    const cat = catByName[categoryRaw.toLowerCase()];
-    if (!categoryRaw) rowErrors.push('category required');
-    else if (!cat) rowErrors.push(`category "${categoryRaw.slice(0, 20)}" not found`);
-    const price = parseFloat(priceRaw);
+    if (!forcedCategory) {
+      if (!categoryRaw) rowErrors.push('category required');
+      else if (!cat) rowErrors.push(`category "${categoryRaw.slice(0, 20)}" not found`);
+    }
+    // EDGE-21: parsePrice rejects non-numeric, zero, negative and over-ceiling.
+    const price = parsePrice(priceRaw);
     if (!priceRaw) rowErrors.push('price required');
-    else if (isNaN(price) || price < 0) rowErrors.push('invalid price');
-    else if (price > MAX_PRICE) rowErrors.push(`price exceeds max`);
+    else if (price === null) rowErrors.push('invalid price (1–' + MAX_PRICE + ')');
     if (imageUrl && !isValidHttpsUrl(imageUrl)) rowErrors.push('image URL must be https://');
     if (name.length >= 2 && existingLower.has(name.toLowerCase())) rowErrors.push('already exists in menu');
     if (name.length >= 2 && seenNames.has(name.toLowerCase())) rowErrors.push('duplicate in paste');
@@ -1944,7 +2438,87 @@ function parseBulkCategoryPaste(rawText, existingCategories) {
 // Bulk Items — Add (paste flow)
 // ─────────────────────────────────────────────────────────────
 
-async function showBulkItemAddTemplate(phone, env) {
+// UX-14: category dropdown step. Picking one drops the per-line category
+// column; "Per-line category" keeps the legacy typed-category format.
+async function showBulkAddCategoryStep(phone, session, env) {
+  const cats = await getCategories(env);
+  if (!cats.length) {
+    // EDGE-11: no categories — give the admin a way forward, don't strand.
+    return sendButtons(
+      phone,
+      '⚠️ No categories exist yet. Create one before bulk-adding items.',
+      [
+        { id: 'admin_add_cat',   title: '➕ Add Category' },
+        { id: 'admin_bulk_menu', title: '📦 Bulk Actions' },
+      ],
+      env
+    );
+  }
+  // Cap at 8 categories to leave room for the "Per-line" row within the 10-row cap.
+  const rows = cats.slice(0, 8).map(c => ({ id: `bac_${c.id}`, title: c.name }));
+  rows.push({ id: 'bac_per_line', title: '✍️ Per-line category', description: 'Type the category on each line' });
+  return sendList(
+    phone,
+    '📂 *Bulk Add Items*\nChoose ONE category for all pasted items, or pick per-line:',
+    'Choose Category',
+    [{ title: 'Categories', rows }],
+    env
+  );
+}
+
+async function handleBulkItemsAddCategory(phone, msg, session, env) {
+  const { bulk } = session.adminCtx;
+
+  if (msg.id === 'bac_per_line') {
+    bulk.forcedCategoryId = null;
+    bulk.forcedCategoryName = null;
+    session.state = 'admin_bulk_items_add_paste';
+    await saveSession(phone, session, env);
+    return showBulkItemAddTemplate(phone, session, env);
+  }
+
+  if (msg.id?.startsWith('bac_')) {
+    const catId = parseInt(msg.id.replace('bac_', ''), 10);
+    const cat = await getCategoryById(catId, env);
+    if (!cat) return showBulkAddCategoryStep(phone, session, env);
+    bulk.forcedCategoryId = catId;
+    bulk.forcedCategoryName = cat.name;
+    session.state = 'admin_bulk_items_add_paste';
+    await saveSession(phone, session, env);
+    return showBulkItemAddTemplate(phone, session, env);
+  }
+
+  // Unexpected input — re-show the dropdown.
+  return showBulkAddCategoryStep(phone, session, env);
+}
+
+async function showBulkItemAddTemplate(phone, session, env) {
+  // UX-14: when a category was picked, hide the category column from the format.
+  const forced = session?.adminCtx?.bulk?.forcedCategoryName;
+  if (forced) {
+    return sendText(
+      phone,
+      '📋 *Bulk Add Items*\n\n' +
+      `Category: *${forced}* (applies to every line)\n\n` +
+      'Paste items below, one per line:\n' +
+      '*Format:* Name | Price | Description | Image URL | Available\n\n' +
+      '*Examples:*\n' +
+      'Jollof Rice | 1500 | Rich tomato rice\n' +
+      'Fried Chicken | 2000 | Crispy | | no\n' +
+      'Suya | 800\n\n' +
+      '*Rules:*\n' +
+      '• Name is required (≥2 chars)\n' +
+      '• Price: number (e.g. 850 or 1200.50)\n' +
+      '• Available: yes/no (default: yes)\n' +
+      '• Image URL must start with https://\n\n' +
+      'Send *CANCEL* to abort.',
+      env
+    );
+  }
+  return showBulkItemAddTemplateLegacy(phone, env);
+}
+
+async function showBulkItemAddTemplateLegacy(phone, env) {
   return sendText(
     phone,
     '📋 *Bulk Add Items*\n\n' +
@@ -1967,16 +2541,21 @@ async function showBulkItemAddTemplate(phone, env) {
 
 async function handleBulkItemsAddPaste(phone, msg, session, env) {
   if (!msg.text || msg.type === 'button_reply' || msg.type === 'list_reply') {
-    return showBulkItemAddTemplate(phone, env);
+    return showBulkItemAddTemplate(phone, session, env);
   }
   const rawText = msg.text.trim();
-  if (rawText.length < 3) return showBulkItemAddTemplate(phone, env);
+  if (rawText.length < 3) return showBulkItemAddTemplate(phone, session, env);
 
   const [categories, allItems] = await Promise.all([getCategories(env), getAllMenuItems(env)]);
   const existingNames = allItems.map(i => i.name);
-  const parsed = parseBulkItemPaste(rawText, categories, existingNames);
+  // UX-14: when a category was chosen up front, pass it so the parser drops
+  // the per-line category column.
+  const forcedCat = session.adminCtx.bulk.forcedCategoryId
+    ? categories.find(c => c.id === session.adminCtx.bulk.forcedCategoryId)
+    : null;
+  const parsed = parseBulkItemPaste(rawText, categories, existingNames, forcedCat);
 
-  if (parsed.total === 0) return showBulkItemAddTemplate(phone, env);
+  if (parsed.total === 0) return showBulkItemAddTemplate(phone, session, env);
 
   session.adminCtx.bulk.parsedItems = parsed.valid;
   session.adminCtx.bulk.parseErrors = parsed.errors;
@@ -1986,7 +2565,7 @@ async function handleBulkItemsAddPaste(phone, msg, session, env) {
   let previewMsg = `📋 *Bulk Add Preview*\n\nTotal lines: ${parsed.total} | ✅ ${parsed.valid.length} valid | ❌ ${parsed.errors.length} invalid\n\n`;
 
   if (parsed.valid.length > 0) {
-    const preview = parsed.valid.slice(0, 5).map(i => `• *${i.name}* (${i.categoryName}, ₦${i.price.toFixed(2)})`).join('\n');
+    const preview = parsed.valid.slice(0, 5).map(i => `• *${i.name}* (${i.categoryName}, ${formatPrice(i.price)})`).join('\n');
     previewMsg += `*Items to add:*\n${preview}`;
     if (parsed.valid.length > 5) previewMsg += `\n_…and ${parsed.valid.length - 5} more_`;
   }
@@ -2025,18 +2604,22 @@ async function handleBulkItemsAddPaste(phone, msg, session, env) {
 async function handleBulkItemsAddReview(phone, msg, session, env) {
   const { bulk } = session.adminCtx;
 
-  if (msg.id === 'bulk_repaste' || msg.text) {
+  const reviewText = (msg.text || '').trim().toUpperCase();
+
+  // BUG-15: only an explicit re-paste request discards the ready batch — do NOT
+  // treat arbitrary text as a re-paste.
+  if (msg.id === 'bulk_repaste' || reviewText === 'REPASTE') {
     session.state = 'admin_bulk_items_add_paste';
     await saveSession(phone, session, env);
-    return showBulkItemAddTemplate(phone, env);
+    return showBulkItemAddTemplate(phone, session, env);
   }
 
-  if (msg.id === 'bulk_items_add_confirm') {
+  if (msg.id === 'bulk_items_add_confirm' || reviewText === 'CONFIRM') {
     const items = bulk.parsedItems || [];
     if (!items.length) {
       session.state = 'admin_bulk_items_add_paste';
       await saveSession(phone, session, env);
-      return showBulkItemAddTemplate(phone, env);
+      return showBulkItemAddTemplate(phone, session, env);
     }
 
     let successCount = 0;
@@ -2084,10 +2667,11 @@ async function handleBulkItemsAddReview(phone, msg, session, env) {
     );
   }
 
+  // BUG-15: re-prompt (keeping the batch) instead of discarding it.
   const n = (bulk.parsedItems || []).length;
   return sendButtons(
     phone,
-    `📋 Ready to add *${n}* valid items. Confirm or re-paste.`,
+    `📋 Ready to add *${n}* valid items.\n\nTap *Add* to confirm or *Re-paste* to start over. (Or type CONFIRM / REPASTE.)`,
     [
       { id: 'bulk_items_add_confirm', title: `✅ Add ${n} Items` },
       { id: 'bulk_repaste',           title: '🔄 Re-paste'       },
@@ -2136,8 +2720,7 @@ async function handleBulkItemsRemoveSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bsr_')) {
     const itemId = parseInt(msg.id.replace('bsr_', ''), 10);
-    const idx = bulk.selectedIds.indexOf(itemId);
-    if (idx > -1) bulk.selectedIds.splice(idx, 1); else bulk.selectedIds.push(itemId);
+    toggleSelection(bulk, itemId); // BUG-11: de-duplicated, race-safe toggle
     await saveSession(phone, session, env);
     return showBulkItemsRemoveList(phone, session, env);
   }
@@ -2346,16 +2929,21 @@ async function handleBulkItemsEditValue(phone, msg, session, env) {
   }
 
   if (editAction === 'adj_price' && bulk.editPriceType) {
+    const isPercent = bulk.editPriceType.includes('pct');
     const val = parseFloat(msg.text.trim());
+    // A percentage can't exceed 100 for a decrease; a fixed amount must be
+    // within the price ceiling. parsePrice covers the fixed-amount ceiling.
     if (isNaN(val) || val <= 0) return sendText(phone, '⚠️ Enter a positive number.\n\nSend *CANCEL* to abort.', env);
+    if (isPercent && val > 1000) return sendText(phone, '⚠️ Percentage seems too large.\n\nSend *CANCEL* to abort.', env);
+    if (!isPercent && parsePrice(msg.text.trim()) === null) return sendText(phone, `⚠️ Amount must be between 1 and ${formatPrice(MAX_PRICE)}.\n\nSend *CANCEL* to abort.`, env);
     bulk.editValue = val;
-    bulk.editValueLabel = `${bulk.editPriceType.includes('pct') ? val + '%' : '₦' + val.toFixed(2)} ${bulk.editPriceType.includes('inc') ? 'increase' : 'decrease'}`;
+    bulk.editValueLabel = `${isPercent ? val + '%' : formatPrice(val)} ${bulk.editPriceType.includes('inc') ? 'increase' : 'decrease'}`;
   } else if (editAction === 'set_price') {
-    const p = parseFloat(msg.text.trim());
-    if (isNaN(p) || p < 0) return sendText(phone, '⚠️ Enter a valid price (e.g. 1500).\n\nSend *CANCEL* to abort.', env);
-    if (p > MAX_PRICE) return sendText(phone, `⚠️ Price exceeds maximum ₦${MAX_PRICE}.\n\nSend *CANCEL* to abort.`, env);
+    // EDGE-21: validate with parsePrice — rejects non-numeric/zero/over-ceiling.
+    const p = parsePrice(msg.text.trim());
+    if (p === null) return sendText(phone, `⚠️ Enter a valid price (e.g. 1500). Must be between 1 and ${formatPrice(MAX_PRICE)}.\n\nSend *CANCEL* to abort.`, env);
     bulk.editValue = p;
-    bulk.editValueLabel = `₦${p.toFixed(2)}`;
+    bulk.editValueLabel = formatPrice(p);
   } else if (editAction === 'set_desc') {
     bulk.editValue = sanitize(msg.text.trim(), 300);
     bulk.editValueLabel = bulk.editValue.slice(0, 40) + (bulk.editValue.length > 40 ? '…' : '');
@@ -2411,8 +2999,7 @@ async function handleBulkItemsEditSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bie_')) {
     const itemId = parseInt(msg.id.replace('bie_', ''), 10);
-    const idx = bulk.selectedIds.indexOf(itemId);
-    if (idx > -1) bulk.selectedIds.splice(idx, 1); else bulk.selectedIds.push(itemId);
+    toggleSelection(bulk, itemId); // BUG-11: de-duplicated, race-safe toggle
     await saveSession(phone, session, env);
     return showBulkItemsEditList(phone, session, env);
   }
@@ -2676,7 +3263,7 @@ async function handleBulkCatsRenameSelect(phone, msg, session, env) {
 
   const catId = parseInt(msg.id.replace('bcrn_', ''), 10);
   const cat = await getCategoryById(catId, env);
-  if (!cat) return sendText(phone, '⚠️ Category not found.', env);
+  if (!cat) return sendAdminError(phone, '⚠️ Category not found.', env);
 
   session.adminCtx.bulk.renameCatId = catId;
   session.adminCtx.bulk.renameCatOldName = cat.name;
@@ -2691,7 +3278,7 @@ async function handleBulkCatsRenameValue(phone, msg, session, env) {
   if (!bulk.renameCatId) {
     session.state = 'admin_idle'; session.adminCtx = {};
     await saveSession(phone, session, env);
-    return sendText(phone, '⚠️ Session lost. Please start over.', env);
+    return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
   }
 
   if (!msg.text || msg.type !== 'text') {
@@ -2725,7 +3312,7 @@ async function handleBulkCatsRenameValue(phone, msg, session, env) {
       ], env);
   } catch (err) {
     console.error('[Admin] Category rename failed:', err);
-    return sendText(phone, '⚠️ Failed to rename category. Please try again.', env);
+    return sendAdminError(phone, '⚠️ Failed to rename category. Please try again.', env);
   }
 }
 
@@ -2759,8 +3346,7 @@ async function handleBulkCatsDeleteSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bcd_')) {
     const catId = parseInt(msg.id.replace('bcd_', ''), 10);
-    const idx = bulk.selectedIds.indexOf(catId);
-    if (idx > -1) bulk.selectedIds.splice(idx, 1); else bulk.selectedIds.push(catId);
+    toggleSelection(bulk, catId); // BUG-11: de-duplicated, race-safe toggle
     await saveSession(phone, session, env);
     return showBulkCatsDeleteList(phone, session, env);
   }
@@ -2843,7 +3429,7 @@ async function handleBulkCatsDeleteTarget(phone, msg, session, env) {
 
   const targetCatId = parseInt(msg.id.replace('bcdt_', ''), 10);
   const target = await getCategoryById(targetCatId, env);
-  if (!target) return sendText(phone, '⚠️ Category not found.', env);
+  if (!target) return sendAdminError(phone, '⚠️ Category not found.', env);
 
   bulk.deleteTargetCatId = targetCatId;
   bulk.deleteTargetCatName = target.name;
@@ -2881,6 +3467,8 @@ async function handleBulkCatsDeleteConfirm(phone, msg, session, env) {
   let deletedCats = 0;
   let movedItems = 0;
 
+  // BUG-16: wrap the cascade/move delete so an FK failure shows a clear message
+  // and an admin_home button instead of stranding the admin in a dead state.
   try {
     if (bulk.deleteMode === 'move' && bulk.deleteTargetCatId) {
       for (const catId of bulk.selectedIds) {
@@ -2892,7 +3480,19 @@ async function handleBulkCatsDeleteConfirm(phone, msg, session, env) {
     await bustMenuCache(env);
   } catch (err) {
     console.error('[Admin] Bulk category delete failed:', err);
-    return sendText(phone, `⚠️ Error during deletion: ${err.message?.slice(0, 60)}`, env);
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `⚠️ Could not delete those categories.\n\n` +
+      `Some items may still reference them. ${err.message?.slice(0, 60) || ''}`,
+      [
+        { id: 'admin_bulk_menu', title: '📦 Bulk Actions' },
+        { id: 'admin_home',      title: '🔧 Admin Menu'   },
+      ],
+      env
+    );
   }
 
   const logId = await logBulkAction({
@@ -2937,7 +3537,7 @@ async function handleBulkCatsMoveSource(phone, msg, session, env) {
 
   const srcId = parseInt(msg.id.replace('bcms_', ''), 10);
   const src = await getCategoryById(srcId, env);
-  if (!src) return sendText(phone, '⚠️ Category not found.', env);
+  if (!src) return sendAdminError(phone, '⚠️ Category not found.', env);
 
   session.adminCtx.bulk.moveSourceId = srcId;
   session.adminCtx.bulk.moveSourceName = src.name;
@@ -2966,7 +3566,7 @@ async function handleBulkCatsMoveTarget(phone, msg, session, env) {
 
   const targetId = parseInt(msg.id.replace('bcmt_', ''), 10);
   const target = await getCategoryById(targetId, env);
-  if (!target) return sendText(phone, '⚠️ Category not found.', env);
+  if (!target) return sendAdminError(phone, '⚠️ Category not found.', env);
 
   bulk.moveTargetId = targetId;
   bulk.moveTargetName = target.name;
@@ -3023,6 +3623,6 @@ async function handleBulkCatsMoveConfirm(phone, msg, session, env) {
       [{ id: 'bulk_cats_move', title: '🔀 Move More' }, { id: 'admin_bulk_menu', title: '📦 Bulk Actions' }], env);
   } catch (err) {
     console.error('[Admin] Move items failed:', err);
-    return sendText(phone, `⚠️ Failed to move items: ${err.message?.slice(0, 60)}`, env);
+    return sendAdminError(phone, `⚠️ Failed to move items: ${err.message?.slice(0, 60)}`, env);
   }
 }

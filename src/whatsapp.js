@@ -207,20 +207,47 @@ export function buttonPayload(bodyText, btns, header = null, footer = null) {
 /**
 
  * Interactive list message.
-
- * Max 10 sections, max 10 rows per section.
-
  *
-
+ * BUG-21 FIX: WhatsApp caps the TOTAL number of rows at 10 across ALL
+ * sections (NOT 10 per section). We flatten-count rows and keep only the
+ * first 10 across sections, preserving section grouping. Sections that end
+ * up empty after the cap are dropped. We console.warn how many rows were
+ * dropped so callers can paginate.
+ *
  * @param {string} bodyText  - Body text
-
  * @param {string} btnLabel  - Button label (≤ 20 chars)
-
  * @param {Array}  sections  - [{ title, rows: [{ id, title, description }] }]
-
  */
 
 export function listPayload(bodyText, btnLabel, sections) {
+
+  const MAX_TOTAL_ROWS = 10;
+  let remaining = MAX_TOTAL_ROWS;
+  let droppedRows = 0;
+
+  const cappedSections = [];
+  for (const s of (sections || []).slice(0, 10)) {
+    const allRows = s.rows || [];
+    const kept = remaining > 0 ? allRows.slice(0, remaining) : [];
+    droppedRows += allRows.length - kept.length;
+    remaining -= kept.length;
+
+    // Drop sections that have no rows left after the global cap.
+    if (kept.length === 0) continue;
+
+    cappedSections.push({
+      title: String(s.title).slice(0, 24),
+      rows: kept.map(r => ({
+        id:          String(r.id).slice(0, 256),
+        title:       String(r.title).slice(0, 24),
+        description: String(r.description || '').slice(0, 72),
+      })),
+    });
+  }
+
+  if (droppedRows > 0) {
+    console.warn(`[WhatsApp] listPayload: dropped ${droppedRows} row(s) to enforce 10-row total cap`);
+  }
 
   return {
 
@@ -236,21 +263,7 @@ export function listPayload(bodyText, btnLabel, sections) {
 
         button: String(btnLabel).slice(0, 20),
 
-        sections: sections.slice(0, 10).map(s => ({
-
-          title: String(s.title).slice(0, 24),
-
-          rows:  (s.rows || []).slice(0, 10).map(r => ({
-
-            id:          String(r.id).slice(0, 256),
-
-            title:       String(r.title).slice(0, 24),
-
-            description: String(r.description || '').slice(0, 72),
-
-          })),
-
-        })),
+        sections: cappedSections,
 
       },
 
@@ -321,6 +334,108 @@ export function imagePayload(imageUrl, caption = '') {
 
 
 /**
+ * Interactive CTA URL message (UX-01).
+ * Renders a body with a single tappable button that opens a URL.
+ *
+ * @param {string}      bodyText   - Message body
+ * @param {string}      buttonText - Button display text
+ * @param {string}      url        - HTTPS URL the button opens
+ * @param {string|null} header     - Optional header text (≤ 60 chars)
+ * @param {string|null} footer     - Optional footer text (≤ 60 chars)
+ */
+export function ctaUrlPayload(bodyText, buttonText, url, header = null, footer = null) {
+  const msg = {
+    type: 'interactive',
+    interactive: {
+      type: 'cta_url',
+      body: { text: bodyText },
+      action: {
+        name: 'cta_url',
+        parameters: {
+          display_text: String(buttonText).slice(0, 20),
+          url,
+        },
+      },
+    },
+  };
+  if (header) msg.interactive.header = { type: 'text', text: String(header).slice(0, 60) };
+  if (footer) msg.interactive.footer = { text: String(footer).slice(0, 60) };
+  return msg;
+}
+
+/**
+ * Interactive location-request message (UX-02).
+ * Prompts the user to share their location via a native button.
+ *
+ * @param {string} bodyText - Message body
+ */
+export function locationRequestPayload(bodyText) {
+  return {
+    type: 'interactive',
+    interactive: {
+      type: 'location_request_message',
+      body: { text: bodyText },
+      action: {
+        name: 'send_location',
+      },
+    },
+  };
+}
+
+/**
+ * Interactive WhatsApp Flow message (UX-04).
+ * Launches a hosted Flow (e.g. checkout / add-item form).
+ *
+ * @param {string}      bodyText - Message body
+ * @param {object}      opts     - { flowId, flowToken, flowCta, screenId, data }
+ * @param {string|null} footer   - Optional footer text (≤ 60 chars)
+ */
+export function flowPayload(bodyText, { flowId, flowToken, flowCta, screenId, data }, footer = null) {
+  const msg = {
+    type: 'interactive',
+    interactive: {
+      type: 'flow',
+      body: { text: bodyText },
+      action: {
+        name: 'flow',
+        parameters: {
+          flow_message_version: '3',
+          flow_token: flowToken,
+          flow_id: flowId,
+          flow_cta: flowCta,
+          flow_action: 'navigate',
+          flow_action_payload: {
+            screen: screenId,
+            data: data || {},
+          },
+        },
+      },
+    },
+  };
+  if (footer) msg.interactive.footer = { text: String(footer).slice(0, 60) };
+  return msg;
+}
+
+/**
+ * Template message (UX-09).
+ * Sends a pre-approved WhatsApp message template.
+ *
+ * @param {string} name         - Template name
+ * @param {string} languageCode - BCP-47 language code (e.g. 'en_US')
+ * @param {Array}  components    - Template components array
+ */
+export function templatePayload(name, languageCode, components) {
+  return {
+    type: 'template',
+    template: {
+      name,
+      language: { code: languageCode },
+      components: components || [],
+    },
+  };
+}
+
+/**
 
  * Mark a message as read.
 
@@ -364,6 +479,38 @@ export async function markRead(messageId, env) {
 
   }
 
+}
+
+
+
+/**
+ * Mark a message as read AND show a typing indicator (UX-06).
+ * Reuses the same /messages 'read' endpoint as markRead, adding the
+ * typing_indicator field. Best-effort — NEVER throws.
+ *
+ * @param {string} to        - Recipient phone (unused by API; kept for caller ergonomics)
+ * @param {string} messageId - The inbound message ID to mark read
+ * @param {object} env       - Worker env bindings
+ */
+export async function sendTypingIndicator(to, messageId, env) {
+  const url = `${graphBase(env)}/${env.PHONE_NUMBER_ID}/messages`;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${env.WHATSAPP_TOKEN}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        status: 'read',
+        message_id: messageId,
+        typing_indicator: { type: 'text' },
+      }),
+    });
+  } catch {
+    // best-effort — never throw on typing indicators
+  }
 }
 
 
@@ -458,6 +605,54 @@ export async function sendImage(to, imageUrl, caption, env) {
     caption = caption.slice(0, 1024);
   }
   return sendWhatsAppMessage(to, imagePayload(imageUrl, caption), env);
+}
+
+
+
+export async function sendCtaUrl(to, bodyText, buttonText, url, env, footer = null) {
+  if (!bodyText || typeof bodyText !== 'string' || bodyText.trim().length === 0) {
+    console.error('[WhatsApp] sendCtaUrl: body text is empty');
+    throw new Error('sendCtaUrl: body text is empty');
+  }
+  if (bodyText.length > 1024) {
+    console.error('[WhatsApp] sendCtaUrl: body text exceeds 1024 chars');
+    bodyText = bodyText.slice(0, 1024);
+  }
+  return sendWhatsAppMessage(to, ctaUrlPayload(bodyText, buttonText, url, null, footer), env);
+}
+
+
+
+export async function sendLocationRequest(to, bodyText, env) {
+  if (!bodyText || typeof bodyText !== 'string' || bodyText.trim().length === 0) {
+    console.error('[WhatsApp] sendLocationRequest: body text is empty');
+    throw new Error('sendLocationRequest: body text is empty');
+  }
+  if (bodyText.length > 1024) {
+    console.error('[WhatsApp] sendLocationRequest: body text exceeds 1024 chars');
+    bodyText = bodyText.slice(0, 1024);
+  }
+  return sendWhatsAppMessage(to, locationRequestPayload(bodyText), env);
+}
+
+
+
+export async function sendFlow(to, bodyText, opts, env) {
+  if (!bodyText || typeof bodyText !== 'string' || bodyText.trim().length === 0) {
+    console.error('[WhatsApp] sendFlow: body text is empty');
+    throw new Error('sendFlow: body text is empty');
+  }
+  if (bodyText.length > 1024) {
+    console.error('[WhatsApp] sendFlow: body text exceeds 1024 chars');
+    bodyText = bodyText.slice(0, 1024);
+  }
+  return sendWhatsAppMessage(to, flowPayload(bodyText, opts), env);
+}
+
+
+
+export async function sendTemplate(to, name, languageCode, components, env) {
+  return sendWhatsAppMessage(to, templatePayload(name, languageCode, components), env);
 }
 
 

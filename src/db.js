@@ -286,6 +286,16 @@ export async function createOrder(order, env) {
 
 
 
+  // EDGE-04 FIX: refuse to create an order with no items BEFORE any insert.
+
+  if (!Array.isArray(order.items) || order.items.length === 0) {
+
+    throw new Error('createOrder: empty items');
+
+  }
+
+
+
   // CRITICAL: Calculate total server-side in integer cents to avoid float errors
 
   const totalCents = order.items.reduce(
@@ -443,7 +453,7 @@ export async function getPendingOrders(env, limit = 20) {
   const result = await env.DB.prepare(
     `SELECT id, user_phone, total_price, status, payment_status, address, created_at
      FROM Orders
-     WHERE status IN ('pending','confirmed','preparing')
+     WHERE status IN ('pending','confirmed','preparing','ready')
      ORDER BY created_at ASC LIMIT ?`
   ).bind(limit).all();
   return result.results;
@@ -487,6 +497,39 @@ export async function getOrderByReference(reference, env) {
   return env.DB.prepare(
     `SELECT * FROM Orders WHERE payment_reference = ?`
   ).bind(reference).first();
+}
+
+/**
+ * BUG-07 FIX: Atomically mark an order paid exactly once.
+ *
+ * The WHERE guard (payment_status != 'paid') makes this idempotent — a
+ * duplicate webhook delivery will not re-run downstream side effects because
+ * { changed } is only true for the single update that actually flipped the row.
+ */
+export async function markOrderPaidAtomic(orderId, paidAt, env) {
+  const result = await env.DB.prepare(
+    `UPDATE Orders SET payment_status = 'paid', paid_at = ?, updated_at = datetime('now')
+     WHERE id = ? AND payment_status != 'paid'`
+  ).bind(paidAt, orderId).run();
+
+  return { changed: result.meta.changes === 1 };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Customer Addresses (KV-backed, no schema change)
+// ─────────────────────────────────────────────────────────────
+
+// UX-02: remember a customer's last delivery address for ~30 days.
+const ADDRESS_TTL_SECONDS = 60 * 60 * 24 * 30;
+
+export async function saveCustomerAddress(phone, address, env) {
+  await env.SESSION_KV.put('addr:' + phone, address, {
+    expirationTtl: ADDRESS_TTL_SECONDS,
+  });
+}
+
+export async function getCustomerAddress(phone, env) {
+  return env.SESSION_KV.get('addr:' + phone);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -647,12 +690,12 @@ export async function getActiveOrdersPaginated(env, limit = 8, offset = 0) {
   const result = await env.DB.prepare(
     `SELECT id, user_phone, total_price, status, payment_status, created_at
      FROM Orders
-     WHERE status IN ('pending','confirmed','preparing')
+     WHERE status IN ('pending','confirmed','preparing','ready')
      ORDER BY created_at ASC LIMIT ? OFFSET ?`
   ).bind(limit, offset).all();
 
   const count = await env.DB.prepare(
-    `SELECT COUNT(*) as total FROM Orders WHERE status IN ('pending','confirmed','preparing')`
+    `SELECT COUNT(*) as total FROM Orders WHERE status IN ('pending','confirmed','preparing','ready')`
   ).first('total');
 
   return { orders: result.results, total: count };
