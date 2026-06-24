@@ -41,9 +41,11 @@ FLUTTERWAVE_CALLBACK_URL = "https://flutterwave.com/pay"  # Redirect URL after p
 CHECKOUT_FLOW_ID = "1038848575351171"
 #
 # ADD_ITEM_FLOW_ID — admin Add-Item uses the WhatsApp Flow in flows/add-item.json. (UX-13)
-#   HELD until flows/add-item.json's category Dropdown is rebuilt with the real
-#   numeric MenuCategories.id values and re-published — the placeholder ids
-#   (mains/sides/…) parseInt to NaN and every category pick would fail.
+#   INTENTIONALLY LEFT OFF: Add-Item stays on the text/list flow, which renders
+#   live categories as a tappable WhatsApp list (no drift, nothing to re-publish).
+#   To switch to the Flow later, first rebuild flows/add-item.json's category
+#   Dropdown with the real numeric MenuCategories.id values (the placeholder ids
+#   mains/sides/… parseInt to NaN), re-publish it, then set:
 # ADD_ITEM_FLOW_ID = "1608620654017634"
 #
 # FLUTTERWAVE_WEBHOOK_SECRET — REQUIRED for webhook acceptance (hard-fail
