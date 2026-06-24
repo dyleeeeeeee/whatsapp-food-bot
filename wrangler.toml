@@ -38,13 +38,13 @@ FLUTTERWAVE_CALLBACK_URL = "https://flutterwave.com/pay"  # Redirect URL after p
 # ─── Optional feature flags (leave unset to keep current behavior) ──
 # CHECKOUT_FLOW_ID — customer checkout uses the WhatsApp Flow in
 #   flows/checkout.json instead of the text-based flow. (UX-04)
-CHECKOUT_FLOW_ID = "1038848575351171"
+CHECKOUT_FLOW_ID = "989465703956996"
 #
 # ADD_ITEM_FLOW_ID — admin Add-Item uses the WhatsApp Flow in flows/add-item.json. (UX-13)
 #   Dropdown rebuilt with real category IDs (8=Drinks, 9=Snacks, 10=Main Menu) and
 #   re-published. NOTE: the dropdown is static — re-publish the flow after adding
 #   any new category, or every pick of it will fail validation.
-ADD_ITEM_FLOW_ID = "1608620654017634"
+ADD_ITEM_FLOW_ID = "1577064570804706"
 #
 # FLUTTERWAVE_WEBHOOK_SECRET — REQUIRED for webhook acceptance (hard-fail
 #   if missing). It is a secret, so it is NOT set here. Set it with:
