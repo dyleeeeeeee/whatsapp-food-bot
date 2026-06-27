@@ -833,3 +833,11 @@ export async function addAdmin(phone, name, env) {
 
 }
 
+/** Every registered admin phone number (for broadcast alerts). */
+export async function getAdminPhones(env) {
+  const result = await env.DB.prepare(
+    'SELECT phone_number FROM AdminUsers'
+  ).all();
+  return (result.results || []).map(r => r.phone_number).filter(Boolean);
+}
+

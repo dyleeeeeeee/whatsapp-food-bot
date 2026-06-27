@@ -56,9 +56,10 @@ ADD_ITEM_FLOW_ID = "1577064570804706"
 #   if missing). It is a secret, so it is NOT set here. Set it with:
 #     wrangler secret put FLUTTERWAVE_WEBHOOK_SECRET
 #
-# ADMIN_ALERT_PHONE — OPTIONAL. WhatsApp number (E.164, e.g. 234XXXXXXXXXX)
-#   that receives best-effort admin alerts from src/lib/alert.js (reconcile
-#   mismatches, systemic failures). Leave unset to disable WhatsApp alerts.
+# ADMIN_ALERT_PHONE — OPTIONAL EXTRA recipient. Payment-critical alerts
+#   (reconcile mismatches, systemic failures) already go to EVERY registered
+#   admin in the AdminUsers table automatically (src/lib/alert.js). Set this
+#   only to also alert an additional number (e.g. an on-call/ops line).
 # ADMIN_ALERT_PHONE = "234XXXXXXXXXX"
 
 # ─── Staging ─────────────────────────────────────────────────
