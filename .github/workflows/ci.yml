@@ -1,0 +1,85 @@
+# ============================================================
+# CI — WhatsApp Food Bot
+# ------------------------------------------------------------
+# Runs on every push and pull request:
+#   1. install deps (npm ci)
+#   2. run the Node built-in test runner against tests/
+#   3. type-check the Worker bundle with a wrangler dry-run
+#      (--dry-run builds + validates without touching Cloudflare,
+#       so NO secrets / CF_API_TOKEN are needed here)
+#
+# A separate `deploy` job is gated behind `test`: it only runs on a
+# manual dispatch or a push to main, and only after tests pass. The
+# real deploy DOES need a CLOUDFLARE_API_TOKEN secret.
+# ============================================================
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test & dry-run build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # tests/ may be empty on a fresh checkout (the test suite lands
+      # in a sibling change). Skip gracefully rather than fail CI when
+      # there is nothing to run yet.
+      - name: Run tests
+        run: |
+          if ls tests/*.test.js >/dev/null 2>&1 || ls tests/**/*.test.js >/dev/null 2>&1; then
+            node --test tests/
+          else
+            echo "No test files found under tests/ — skipping."
+          fi
+
+      # Dry-run build: validates wrangler.toml + bundles the Worker into
+      # dist/ without deploying. No Cloudflare credentials required.
+      - name: Wrangler dry-run build
+        run: npx wrangler deploy --dry-run --outdir=dist
+
+  deploy:
+    name: Deploy (main)
+    needs: test
+    # Only deploy from main, and only on a push or an explicit manual run.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Real deploy needs a Cloudflare API token stored as a repo secret.
+      # Add it under Settings → Secrets and variables → Actions.
+      - name: Deploy to Cloudflare Workers
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

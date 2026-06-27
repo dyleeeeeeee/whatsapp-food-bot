@@ -20,6 +20,12 @@ binding       = "DB"
 database_name = "food-bot-db"
 database_id   = "0bcc31a6-ed24-4874-8cd8-ddf800c3e825"
 
+# ─── Cron Triggers ───────────────────────────────────────────
+# Drives the pending-payment reconciliation sweep (src/reconcile.js)
+# every 5 minutes via the scheduled() handler.
+[triggers]
+crons = ["*/5 * * * *"]
+
 # ─── R2 Bucket (optional, for menu images) ───────────────────
 # [[r2_buckets]]
 # binding     = "IMAGES"
@@ -49,6 +55,11 @@ ADD_ITEM_FLOW_ID = "1577064570804706"
 # FLUTTERWAVE_WEBHOOK_SECRET — REQUIRED for webhook acceptance (hard-fail
 #   if missing). It is a secret, so it is NOT set here. Set it with:
 #     wrangler secret put FLUTTERWAVE_WEBHOOK_SECRET
+#
+# ADMIN_ALERT_PHONE — OPTIONAL. WhatsApp number (E.164, e.g. 234XXXXXXXXXX)
+#   that receives best-effort admin alerts from src/lib/alert.js (reconcile
+#   mismatches, systemic failures). Leave unset to disable WhatsApp alerts.
+# ADMIN_ALERT_PHONE = "234XXXXXXXXXX"
 
 # ─── Staging ─────────────────────────────────────────────────
 [env.staging]
@@ -59,8 +70,23 @@ ENVIRONMENT       = "staging"
 GRAPH_API_VERSION = "v21.0"
 MENU_CACHE_TTL    = "60"
 
+# Staging bindings — mirror the top-level KV + D1 but MUST point at
+# SEPARATE staging resources. The ids below are PLACEHOLDERS.
+# TODO: replace with real staging KV namespace / D1 database ids
+#   (create via `wrangler kv namespace create SESSION_KV --env staging`
+#    and `wrangler d1 create food-bot-db-staging`).
+[[env.staging.kv_namespaces]]
+binding    = "SESSION_KV"
+id         = "PLACEHOLDER_STAGING_KV_ID"          # TODO: fill real staging id
+preview_id = "PLACEHOLDER_STAGING_KV_PREVIEW_ID"  # TODO: fill real staging id
+
+[[env.staging.d1_databases]]
+binding       = "DB"
+database_name = "food-bot-db-staging"
+database_id   = "PLACEHOLDER_STAGING_D1_ID"       # TODO: fill real staging id
+
 [observability]
-enabled = false
+enabled = true
 head_sampling_rate = 1
 
 [observability.logs]

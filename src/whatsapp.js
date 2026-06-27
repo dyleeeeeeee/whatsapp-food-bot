@@ -28,6 +28,8 @@
 
  */
 
+import { fetchWithRetry } from './lib/http.js';
+
 
 
 function graphBase(env) {
@@ -82,7 +84,12 @@ export async function sendWhatsAppMessage(to, payload, env) {
 
 
 
-  const res = await fetch(url, {
+  // Route through fetchWithRetry so a transient 5xx/429/network error
+  // retries with backoff instead of hard-failing. The throw-on-final-
+  // failure contract is preserved: we still throw, but only after retries
+  // are exhausted (fetchWithRetry returns the final Response / rethrows the
+  // last network error). Callers depend on this throw, so keep it intact.
+  const res = await fetchWithRetry(url, {
 
     method: 'POST',
 
@@ -391,6 +398,12 @@ export function locationRequestPayload(bodyText) {
  * @param {string|null} footer   - Optional footer text (≤ 60 chars)
  */
 export function flowPayload(bodyText, { flowId, flowToken, flowCta, screenId, data }, footer = null) {
+  // WhatsApp rejects an empty `data` object on a screen that declares no data
+  // model — include `data` only when there is actually something to pass.
+  const actionPayload = { screen: screenId };
+  if (data && typeof data === 'object' && Object.keys(data).length > 0) {
+    actionPayload.data = data;
+  }
   const msg = {
     type: 'interactive',
     interactive: {
@@ -404,10 +417,7 @@ export function flowPayload(bodyText, { flowId, flowToken, flowCta, screenId, da
           flow_id: flowId,
           flow_cta: flowCta,
           flow_action: 'navigate',
-          flow_action_payload: {
-            screen: screenId,
-            data: data || {},
-          },
+          flow_action_payload: actionPayload,
         },
       },
     },
@@ -449,7 +459,7 @@ export async function markRead(messageId, env) {
 
   try {
 
-    await fetch(url, {
+    await fetchWithRetry(url, {
 
       method: 'POST',
 
@@ -495,7 +505,7 @@ export async function markRead(messageId, env) {
 export async function sendTypingIndicator(to, messageId, env) {
   const url = `${graphBase(env)}/${env.PHONE_NUMBER_ID}/messages`;
   try {
-    await fetch(url, {
+    await fetchWithRetry(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

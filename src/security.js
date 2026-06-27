@@ -10,13 +10,16 @@
  * Returns true only if signature is cryptographically valid.
  */
 export async function verifyWebhookSignature(request, rawBody, env) {
-  // Development bypass — explicit opt-in only
-  if (env.ENVIRONMENT === 'development') return true;
+  const secret = env.WHATSAPP_APP_SECRET;
+
+  // Development bypass — only when there is NO secret to verify against.
+  // A real deploy always provisions WHATSAPP_APP_SECRET, so it can never
+  // skip verification even if ENVIRONMENT is misconfigured to 'development'.
+  if (env.ENVIRONMENT === 'development' && !secret) return true;
 
   const signature = request.headers.get('X-Hub-Signature-256');
   if (!signature) return false;
 
-  const secret = env.WHATSAPP_APP_SECRET;
   if (!secret) {
     // BUG-02 FIX: Hard fail. A missing secret means config is broken.
     // Returning true here would open the webhook to forgery by anyone.

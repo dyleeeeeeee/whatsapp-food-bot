@@ -65,8 +65,20 @@ console.log(`➕ Adding admin:`);
 console.log(`   Phone: +${phoneNumber}`);
 console.log(`   Name:  ${adminName}`);
 
-// Build SQL
-const sql = `INSERT OR IGNORE INTO AdminUsers (phone_number, name) VALUES ('${phoneNumber}', '${adminName}');`;
+// Build SQL via a parameterized template + bound args.
+// Wrangler's `d1 execute --command` has no server-side bind flag, so we bind
+// here: each value is rendered as a single-quoted SQL string literal with
+// embedded single quotes escaped (SQLite doubles them), so no value can break
+// out of its literal and inject SQL.
+function bindSqlLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+const sqlTemplate = 'INSERT OR IGNORE INTO AdminUsers (phone_number, name) VALUES (?, ?);';
+const sqlParams = [phoneNumber, adminName];
+
+let paramIndex = 0;
+const sql = sqlTemplate.replace(/\?/g, () => bindSqlLiteral(sqlParams[paramIndex++]));
 
 console.log(`\n📋 SQL to execute:`);
 console.log(sql);

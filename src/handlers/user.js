@@ -32,7 +32,8 @@ import {
 } from '../session.js';
 import {
   getFullMenu, getMenuItem, getAvailableMenuItem, createOrder, getUserOrders, getOrder,
-  updateOrderPayment, saveCustomerAddress, getCustomerAddress,
+  updateOrderPayment, markOrderPaidAtomic, getOrderByReference, persistTransactionId,
+  saveCustomerAddress, getCustomerAddress,
 } from '../db.js';
 import { initializeFlutterwaveTransaction } from '../payments/flutterwave.js';
 import { sanitize, hasMinAlphaNum } from '../security.js';
@@ -122,7 +123,8 @@ function inferStateFromMessage(msg, session) {
   if (id === 'cart_item_remove' || id === 'cart_item_qty' || id === 'cart_item_notes' || id === 'btn_cart_back') return 'cart_item_edit';
   if (id === 'confirm_cancel_yes' || id === 'confirm_cancel_no') return 'confirm_cancel';
   // UX-05: a Reorder tap is only ever offered on the order-detail view.
-  if (id.startsWith('reorder_') || (id.startsWith('track_') && msg.type === 'list_reply')) return 'order_tracking';
+  // genlink_ (re-init a failed payment) is likewise only offered there.
+  if (id.startsWith('reorder_') || id.startsWith('genlink_') || (id.startsWith('track_') && msg.type === 'list_reply')) return 'order_tracking';
   // UX-02/UX-04: saved-address tap, shared location, or a completed checkout
   // Flow all belong to the address-capture step (only meaningful with a cart).
   if (id === 'use_saved_address') return 'checkout_address';
@@ -176,6 +178,7 @@ async function handleGlobalCommand(phone, msg, session, env) {
       session.state = 'admin_idle';
       session.adminCtx = {};
       clearCart(session);
+      delete session.checkoutId; // BLOCKER #2: leaving user mode abandons checkout
       await saveSession(phone, session, env);
       return sendText(phone, '🔧 *User Mode Exited*\n\nReturning to Admin Panel.', env)
         .then(() => import('../handlers/admin.js').then(m => m.handleAdminMessage(phone, { type: 'button_reply', id: 'admin_home' }, env)));
@@ -199,6 +202,7 @@ async function handleGlobalCommand(phone, msg, session, env) {
     }
     clearCart(session);
     session.state = 'idle';
+    delete session.checkoutId; // BLOCKER #2: fresh cart → fresh idempotency key
     await saveSession(phone, session, env);
     return sendText(phone, '🚫 Order cancelled. Send *MENU* to start again.', env);
   }
@@ -628,22 +632,37 @@ async function handleCartItemEdit(phone, msg, session, env) {
 //          when we have a remembered address for this customer.
 async function startCheckout(phone, session, env) {
   session.state = 'checkout_address';
+
+  // BLOCKER #2 (idempotency): mint a stable checkout id ONCE, the first time
+  // this cart heads to checkout. It becomes the order's payment_reference
+  // (idempotencyKey) so a double-tap / webhook retry / KV-race re-entry on
+  // Place Order collides on the UNIQUE constraint instead of double-charging.
+  // It survives Back/Edit within this checkout and is only cleared once the
+  // order completes or the cart is cancelled.
+  if (!session.checkoutId) {
+    session.checkoutId = crypto.randomUUID();
+  }
   await saveSession(phone, session, env);
 
   // UX-04: hosted Flow path (only when the flag is set — falls back otherwise).
   if (env.CHECKOUT_FLOW_ID) {
-    return sendFlow(
-      phone,
-      '🧾 Tap below to enter your delivery details.',
-      {
-        flowId:   env.CHECKOUT_FLOW_ID,
-        flowToken: `checkout_${phone}_${Date.now()}`,
-        flowCta:  'Checkout',
-        screenId: env.CHECKOUT_FLOW_SCREEN_ID || 'CHECKOUT',
-        data:     {},
-      },
-      env
-    );
+    try {
+      return await sendFlow(
+        phone,
+        '🧾 Tap below to enter your delivery details.',
+        {
+          flowId:   env.CHECKOUT_FLOW_ID,
+          flowToken: `checkout_${phone}_${Date.now()}`,
+          flowCta:  'Checkout',
+          screenId: env.CHECKOUT_FLOW_SCREEN_ID || 'CHECKOUT',
+          data:     {},
+        },
+        env
+      );
+    } catch (err) {
+      console.error('[Checkout] Flow send failed, falling back to text address capture:', err);
+      // fall through to the native/text address capture so checkout never stalls
+    }
   }
 
   return promptForAddress(phone, session, env);
@@ -995,8 +1014,6 @@ async function placeOrder(phone, session, env) {
       }
     }
 
-    // BUG-08 + BUG-03: create the order, mint a deterministic tx_ref, PERSIST
-    // it before init, then initialize Flutterwave with that same reference.
     const amount = cartTotal(session.cart);
     if (!(amount > 0)) {
       session.state = 'cart_review';
@@ -1005,84 +1022,107 @@ async function placeOrder(phone, session, env) {
       return showCart(phone, session, env);
     }
 
-    const orderId = await createOrder(
-      {
-        userPhone:  phone,
-        address:    session.tempAddress || '',
-        orderNotes: session.tempOrderNotes || '',
-        items:      session.cart,
-        paymentStatus: 'unpaid',
-      },
-      env
-    );
+    // BLOCKER #2 (idempotency): the order's payment_reference IS the checkout
+    // id minted once at startCheckout. createOrder writes it into the UNIQUE
+    // payment_reference column in the same insert, so a duplicate placement
+    // (double-tap that beat the KV lock, webhook retry, KV-race re-entry)
+    // collides and throws .code='IDEMPOTENT_DUPLICATE' — we then fetch and
+    // REUSE the existing order's payment link instead of creating a second
+    // order (no double charge). Mint here too as a belt-and-suspenders guard
+    // in case confirm was reached via stale-state recovery.
+    if (!session.checkoutId) {
+      session.checkoutId = crypto.randomUUID();
+      await saveSession(phone, session, env);
+    }
+    const reference = `FCHOW-${session.checkoutId}`;
 
-    // BUG-03: deterministic, order-scoped reference persisted BEFORE init.
-    const txref = `FCHOW-${orderId}-${Date.now().toString(36)}`;
-    await updateOrderPayment(orderId, {
-      payment_reference: txref,
-      payment_status: 'pending',
-    }, env);
-
-    let payData;
+    let orderId;
+    let reused = false;
     try {
-      payData = await initializeFlutterwaveTransaction({
-        amount,
-        txRef: txref,
-        currency: 'NGN',
-        customer: {
-          email: 'customer@fastchow.bot',
-          phone_number: phone,
-          name: 'Customer'
+      orderId = await createOrder(
+        {
+          userPhone:  phone,
+          address:    session.tempAddress || '',
+          orderNotes: session.tempOrderNotes || '',
+          items:      session.cart,
+          idempotencyKey: reference,
         },
-        metadata: { orderId, phone }
-      }, env);
-
-      await updateOrderPayment(orderId, {
-        payment_url: payData.link,
-      }, env);
-    } catch (payErr) {
-      console.error('[Checkout] Flutterwave init failed:', payErr);
-      // Order + reference are already persisted; user can retry from My Orders.
+        env
+      );
+    } catch (createErr) {
+      if (createErr && createErr.code === 'IDEMPOTENT_DUPLICATE') {
+        // Same reference already produced an order — fetch + reuse it so we
+        // never create a duplicate or charge twice.
+        const existing = await getOrderByReference(reference, env);
+        if (!existing) throw createErr; // shouldn't happen; let outer catch handle
+        orderId = existing.id;
+        reused = true;
+        console.log('[Checkout] Reusing existing order', orderId, 'for', reference);
+      } else {
+        throw createErr;
+      }
     }
 
-    // UX-02: remember the address for next time, now that the order succeeded.
+    // Resolve a payment link: reuse the persisted one on a duplicate, otherwise
+    // init Flutterwave against the SAME reference and persist the link + tx id.
+    const link = await ensurePaymentLink(orderId, reference, amount, phone, env, reused);
+
+    // UX-02: remember the address for next time, now that the order exists.
     const placedAddress = session.tempAddress || '';
     if (placedAddress) {
       await saveCustomerAddress(phone, placedAddress, env);
     }
 
+    // Order is committed. Clear cart + checkout id so the next order is fresh,
+    // and so a future Place Order can't re-collide on this reference.
     clearCart(session);
     session.state = 'idle';
     delete session.tempAddress;
     delete session.tempOrderNotes;
     delete session.tempSavedAddress;
+    delete session.checkoutId;
     await saveSession(phone, session, env);
 
-    if (payData) {
-      // UX-01: send the detail first, then the pay link as a CTA URL button.
-      await sendText(
+    // BLOCKER (send-failure swallowed as order failure): the order is already
+    // created above. A 5xx from WhatsApp on these follow-up sends must NOT
+    // bubble to the outer catch and tell the user "order failed" — that would
+    // imply the order didn't happen when it did. Swallow send errors here; the
+    // user can always reach the order (and re-init the pay link) via ORDERS.
+    try {
+      if (link) {
+        // UX-01: send the detail first, then the pay link as a CTA URL button.
+        await sendText(
+          phone,
+          `🎉 *Order #${orderId} placed!*\n\n` +
+          `💰 Total: ${formatPrice(amount)}\n\n` +
+          `💳 *Action Required:* Tap *Pay Now* to complete your payment.\n\n` +
+          `Once paid, we will begin preparing your meal! Track anytime with *ORDERS*.`,
+          env
+        );
+        return await sendCtaUrl(
+          phone,
+          `💳 Complete payment for Order #${orderId} — ${formatPrice(amount)}`,
+          'Pay Now',
+          link,
+          env
+        );
+      }
+      // BLOCKER (failed-init dead-end): no link — offer an explicit retry that
+      // re-inits against the persisted reference from the order-tracking view.
+      return await sendButtons(
         phone,
         `🎉 *Order #${orderId} placed!*\n\n` +
-        `💰 Total: ${formatPrice(amount)}\n\n` +
-        `💳 *Action Required:* Tap *Pay Now* to complete your payment.\n\n` +
-        `Once paid, we will begin preparing your meal! Track anytime with *ORDERS*.`,
+        `⚠️ We had trouble creating your payment link. Tap *Generate payment link* to try again, or find it under *My Orders*.`,
+        [
+          { id: `genlink_${orderId}`, title: '💳 Generate link' },
+          { id: 'cmd_orders',         title: '📋 My Orders'     },
+        ],
         env
       );
-      return sendCtaUrl(
-        phone,
-        `💳 Complete payment for Order #${orderId} — ${formatPrice(amount)}`,
-        'Pay Now',
-        payData.link,
-        env
-      );
+    } catch (sendErr) {
+      console.error('[Checkout] Post-order follow-up send failed (order IS placed):', sendErr);
+      return; // order succeeded; do not report failure to the user
     }
-    return sendButtons(
-      phone,
-      `🎉 *Order #${orderId} placed!*\n\n` +
-      `⚠️ We had trouble creating your payment link. You can try paying again from *My Orders*.`,
-      [{ id: 'cmd_orders', title: '📋 My Orders' }],
-      env
-    );
   } catch (err) {
     console.error('[Checkout] placeOrder failed:', err);
     // Session unchanged — user stays in checkout_confirm and can retry
@@ -1101,6 +1141,49 @@ async function placeOrder(phone, session, env) {
   }
 }
 
+// Resolve a Flutterwave payment link for an order against its persisted
+// reference. Reuses the already-stored link on a duplicate (no second charge);
+// otherwise inits Flutterwave with the SAME reference and persists the link +
+// transaction id. Never throws — a failed init returns null so the caller can
+// offer a "Generate payment link" retry instead of dead-ending the order.
+async function ensurePaymentLink(orderId, reference, amount, phone, env, reused = false) {
+  if (reused) {
+    const existing = await getOrder(orderId, env).catch(() => null);
+    if (existing && existing.payment_url) return existing.payment_url;
+    // Duplicate order exists but never got a link (prior init failed) — fall
+    // through and init now against the same reference.
+  }
+
+  try {
+    const payData = await initializeFlutterwaveTransaction({
+      amount,
+      txRef: reference,
+      currency: 'NGN',
+      customer: {
+        email: 'customer@fastchow.bot',
+        phone_number: phone,
+        name: 'Customer',
+      },
+      metadata: { orderId, phone },
+    }, env);
+
+    await updateOrderPayment(orderId, { payment_url: payData.link }, env);
+
+    // Persist the Flutterwave transaction id when present (off the critical
+    // path — best effort, must not block the link from being returned).
+    if (payData.id != null) {
+      await persistTransactionId(orderId, payData.id, env).catch((e) =>
+        console.warn('[Checkout] persistTransactionId failed:', e && e.message)
+      );
+    }
+
+    return payData.link;
+  } catch (payErr) {
+    console.error('[Checkout] Flutterwave init failed:', payErr);
+    return null; // order + reference are persisted; user can Generate link later
+  }
+}
+
 async function handleConfirmCancel(phone, msg, session, env) {
   if (msg.id === 'confirm_cancel_yes') {
     const isCartClear = session.confirmCancelType === 'cart_clear';
@@ -1108,6 +1191,9 @@ async function handleConfirmCancel(phone, msg, session, env) {
     session.state = 'idle';
     delete session.confirmCancelType;
     delete session.confirmCancelReprompted;
+    // BLOCKER #2: cart is gone — drop the idempotency key so the next checkout
+    // mints a fresh one (a brand-new cart is a brand-new order).
+    delete session.checkoutId;
     await saveSession(phone, session, env);
     const doneMsg = isCartClear
       ? '🧹 Cart cleared!'
@@ -1422,8 +1508,21 @@ async function recoverPaymentIfNeeded(order, env) {
   try {
     const { verifyFlutterwaveTransaction } = await import('../payments/flutterwave.js');
     const data = await verifyFlutterwaveTransaction(order.payment_reference, env);
-    if (data.status === 'successful' && Math.abs(data.amount - order.total_price) <= 0.01) {
-      await updateOrderPayment(order.id, { payment_status: 'paid', paid_at: new Date().toISOString() }, env);
+    // Assert the verified transaction is genuinely successful, in the expected
+    // currency (NGN), and for the right amount before flipping to paid — a
+    // mismatched currency means the verified amount isn't comparable to our
+    // NGN total, so we must NOT mark it paid.
+    if (
+      data.status === 'successful' &&
+      data.currency === 'NGN' &&
+      Math.abs(data.amount - order.total_price) <= 0.01
+    ) {
+      // Route through the single paid-transition chokepoint so the flip is
+      // atomic + idempotent (won't double-fire side effects vs. the webhook).
+      const { changed } = await markOrderPaidAtomic(order.id, new Date().toISOString(), env);
+      if (changed && data.id != null) {
+        await persistTransactionId(order.id, data.id, env).catch(() => {});
+      }
       order.payment_status = 'paid';
     }
   } catch (err) {
@@ -1437,6 +1536,14 @@ async function handleOrderTracking(phone, msg, session, env) {
   if (msg.id?.startsWith('reorder_')) {
     const orderId = parseInt(msg.id.replace('reorder_', ''), 10);
     return reorder(phone, session, orderId, env);
+  }
+
+  // BLOCKER (failed-init dead-end): re-init Flutterwave against the order's
+  // PERSISTED reference and hand back a Pay Now link. Reuses the same reference
+  // so this never creates a second charge.
+  if (msg.id?.startsWith('genlink_')) {
+    const orderId = parseInt(msg.id.replace('genlink_', ''), 10);
+    return generatePaymentLink(phone, session, orderId, env);
   }
 
   if (msg.type === 'list_reply' && msg.id?.startsWith('track_')) {
@@ -1501,12 +1608,22 @@ async function handleOrderTracking(phone, msg, session, env) {
     // UX-01: send the detail first, then the pay link as a CTA URL button.
     await sendButtons(phone, body, buttons, env);
 
-    if (order.payment_status !== 'paid' && order.payment_url) {
-      return sendCtaUrl(
+    if (order.payment_status !== 'paid' && order.status !== 'cancelled') {
+      if (order.payment_url) {
+        return sendCtaUrl(
+          phone,
+          `💳 Complete payment for Order #${order.id} — ${formatPrice(order.total_price)}`,
+          'Pay Now',
+          order.payment_url,
+          env
+        );
+      }
+      // BLOCKER (failed-init dead-end): no link was ever created (init failed at
+      // checkout). Offer an explicit retry that re-inits the persisted reference.
+      return sendButtons(
         phone,
-        `💳 Complete payment for Order #${order.id} — ${formatPrice(order.total_price)}`,
-        'Pay Now',
-        order.payment_url,
+        `💳 No payment link yet for Order #${order.id}. Tap below to generate one.`,
+        [{ id: `genlink_${order.id}`, title: '💳 Generate link' }],
         env
       );
     }
@@ -1517,6 +1634,57 @@ async function handleOrderTracking(phone, msg, session, env) {
     await sendText(phone, STRAY_TEXT_NOTICE, env);
   }
   return showOrderHistory(phone, session, env);
+}
+
+// BLOCKER (failed-init dead-end): generate (or reuse) a Flutterwave payment
+// link for an existing unpaid order, keyed by its PERSISTED reference so we
+// never create a second charge. Sends a Pay Now CTA on success.
+async function generatePaymentLink(phone, session, orderId, env) {
+  const order = await getOrder(orderId, env);
+  if (!order) return showOrderHistory(phone, session, env);
+
+  if (order.payment_status === 'paid') {
+    return sendText(phone, `✅ Order #${orderId} is already paid. Nothing to do!`, env);
+  }
+  if (order.status === 'cancelled') {
+    return sendText(phone, `❌ Order #${orderId} was cancelled — no payment is needed.`, env);
+  }
+  if (!order.payment_reference) {
+    // No reference to re-init against (older order). Don't risk a mismatched
+    // charge — point them to support via order history.
+    return sendButtons(
+      phone,
+      `⚠️ We couldn't generate a payment link for Order #${orderId}. Please contact support.`,
+      [{ id: 'cmd_orders', title: '📋 My Orders' }],
+      env
+    );
+  }
+
+  const link = await ensurePaymentLink(
+    orderId,
+    order.payment_reference,
+    order.total_price,
+    phone,
+    env,
+    Boolean(order.payment_url) // reuse the stored link if one already exists
+  );
+
+  if (link) {
+    return sendCtaUrl(
+      phone,
+      `💳 Complete payment for Order #${orderId} — ${formatPrice(order.total_price)}`,
+      'Pay Now',
+      link,
+      env
+    );
+  }
+
+  return sendButtons(
+    phone,
+    `⚠️ We still couldn't reach the payment provider for Order #${orderId}. Please try again shortly.`,
+    [{ id: `genlink_${orderId}`, title: '🔄 Try again' }],
+    env
+  );
 }
 
 // UX-05: rebuild session.cart from a past order. Re-validate each line against

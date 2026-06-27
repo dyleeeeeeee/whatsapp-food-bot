@@ -49,8 +49,11 @@ import {
   bulkCreateCategories, bulkDeleteCategoriesWithItems,
   moveAllItemsFromCategory, bulkMoveItemsToCategory,
   getItemCountsByCategory,
+  logRefund, getStats,
 } from '../db.js';
 import { sanitize, isValidHttpsUrl } from '../security.js';
+import { alertAdmin } from '../lib/alert.js';
+import { refundFlutterwaveTransaction } from '../payments/flutterwave.js';
 
 const VALID_STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'delivered', 'cancelled'];
 
@@ -72,18 +75,100 @@ function isAllowedTransition(current, next) {
   return allowed.includes(next);
 }
 
+// GAP (admin selectedIds race): bulk selections live under their OWN KV key —
+// the same dedicated-key + read-merge pattern the cart already uses (see
+// session.js). The session blob is eventually consistent, so two rapid taps can
+// each read a stale blob and the second write clobbers the first, silently
+// dropping a selection. By making each toggle a read-modify-write against the
+// dedicated selection key, every tap merges against the latest persisted set.
+const SELECTION_TTL_SECONDS = 60 * 60; // selections are short-lived
+
+function selectionKey(phone) {
+  return 'bulksel:' + phone;
+}
+
 /**
- * BUG-11: robustly toggle an id in a bulk selection. We rebuild a de-duplicated
- * Set from the CURRENT selectedIds each tap and write it back, so rapid taps
- * (which may race on the same session object) can never produce duplicates or
- * mis-toggle. Mutates `bulk.selectedIds` in place and returns the new array.
+ * Toggle an id in the bulk selection with a read-modify-write on the dedicated
+ * KV key, then mirror the merged set onto `bulk.selectedIds` for rendering.
+ * De-duplicated (Set) so rapid taps can never double-add or mis-toggle.
  */
-function toggleSelection(bulk, id) {
-  const set = new Set(bulk.selectedIds || []);
+async function toggleSelection(phone, bulk, id, env) {
+  let persisted = bulk.selectedIds || [];
+  try {
+    const raw = await env.SESSION_KV.get(selectionKey(phone));
+    if (raw) persisted = JSON.parse(raw);
+  } catch { /* fall back to in-session copy */ }
+
+  const set = new Set(persisted);
   if (set.has(id)) set.delete(id);
   else set.add(id);
   bulk.selectedIds = [...set];
+
+  try {
+    await env.SESSION_KV.put(
+      selectionKey(phone),
+      JSON.stringify(bulk.selectedIds),
+      { expirationTtl: SELECTION_TTL_SECONDS }
+    );
+  } catch (err) {
+    console.error('[Admin] selection persist failed (continuing):', err && err.message);
+  }
   return bulk.selectedIds;
+}
+
+/**
+ * GAP (static-flow drift): the Add-Item WhatsApp Flow has a STATIC category
+ * dropdown baked into flows/add-item.json. When categories change (add/rename)
+ * that dropdown drifts out of sync with the DB. We can't edit the published
+ * Flow from here, so we set a 'flow:stale' KV flag (read by ops/monitoring) and
+ * warn the admin to re-sync the Flow's category list. Best-effort, never throws.
+ */
+const FLOW_STALE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
+async function markFlowStale(env, reason) {
+  if (!env || !env.SESSION_KV) return;
+  try {
+    await env.SESSION_KV.put(
+      'flow:stale',
+      JSON.stringify({ reason: reason || 'category change', at: new Date().toISOString() }),
+      { expirationTtl: FLOW_STALE_TTL_SECONDS }
+    );
+  } catch (err) {
+    console.error('[Admin] markFlowStale KV write failed (continuing):', err && err.message);
+  }
+}
+
+// Only nag the admin about Flow drift when the static Add-Item Flow is actually
+// in use; otherwise the warning is noise.
+function flowDriftNote(env) {
+  return env && env.ADD_ITEM_FLOW_ID
+    ? '\n\n⚠️ The Add-Item Flow category list is now out of date — update the Flow dropdown to match.'
+    : '';
+}
+
+/** Seed the dedicated selection key when a bulk flow starts (empty set). */
+async function resetSelection(phone, env) {
+  try {
+    await env.SESSION_KV.put(selectionKey(phone), '[]', { expirationTtl: SELECTION_TTL_SECONDS });
+  } catch { /* best effort */ }
+}
+
+/**
+ * Re-read the authoritative selection set from KV at commit time so a write
+ * that lost the race in the session blob is still honored. Returns an array.
+ */
+async function loadSelection(phone, bulk, env) {
+  try {
+    const raw = await env.SESSION_KV.get(selectionKey(phone));
+    if (raw) {
+      const ids = JSON.parse(raw);
+      if (Array.isArray(ids)) {
+        bulk.selectedIds = ids;
+        return ids;
+      }
+    }
+  } catch { /* fall back to in-session copy */ }
+  return bulk.selectedIds || [];
 }
 
 /**
@@ -148,6 +233,12 @@ export async function handleAdminMessage(phone, msg, env, preSession = null) {
     session.adminCtx = {};
     await saveSession(phone, session, env);
     return showAdminMenu(phone, env);
+  }
+
+  // GAP (/stats): a quick read-only summary surface, reachable by typing /STATS
+  // (or STATS) or via the admin menu row. Doesn't change session state.
+  if (text === '/STATS' || text === 'STATS' || msg.id === 'admin_stats') {
+    return showStats(phone, env);
   }
 
   // BACK command: go back one step in multi-step flows
@@ -269,6 +360,7 @@ async function showAdminMenu(phone, env) {
           { id: 'admin_view_orders',   title: 'View Orders',   description: 'See pending/active orders' },
           { id: 'admin_update_status', title: 'Update Status', description: 'Change an order status'    },
           { id: 'admin_bulk_menu',     title: 'Bulk Actions',  description: 'Manage multiple items/orders' },
+          { id: 'admin_stats',         title: 'Stats',         description: "Today's orders & paid rate" },
         ],
       },
       {
@@ -282,8 +374,32 @@ async function showAdminMenu(phone, env) {
   );
 }
 
+/**
+ * GAP (/stats): render a small read-only operations summary. getStats is a
+ * pure aggregate read (db.js) — no session mutation, so this is safe to call
+ * from any state.
+ */
+async function showStats(phone, env) {
+  const s = await getStats(env);
+  const pct = Math.round((s.paidRate || 0) * 100);
+  return sendButtons(
+    phone,
+    '📊 *Today at a glance*\n\n' +
+    `Orders today: *${s.ordersToday}*\n` +
+    `Paid today: *${s.paidToday}* (${pct}%)\n` +
+    `Pending payment: *${s.pendingCount}*`,
+    [
+      { id: 'admin_view_orders', title: '📦 View Orders' },
+      { id: 'admin_home',        title: '🔧 Admin Menu' },
+    ],
+    env
+  );
+}
+
 async function handleAdminIdle(phone, msg, session, env) {
   const id = msg.id || '';
+
+  if (id === 'admin_stats') return showStats(phone, env);
 
   if (id === 'admin_add_item') {
     session.adminCtx = {};
@@ -512,6 +628,7 @@ async function handleAddCategory(phone, msg, session, env) {
     ).bind(name).run();
     console.log('[Admin] Category created:', name, 'DB id:', result.meta?.last_row_id);
     await bustMenuCache(env);
+    await markFlowStale(env, `category added: ${name}`); // GAP: static Add-Item Flow drift
 
     // If admin came from the add-item flow (no categories existed), send them back there
     if (session.adminCtx.returnFlow === 'add_item' && session.adminCtx.newItem) {
@@ -528,7 +645,7 @@ async function handleAddCategory(phone, msg, session, env) {
     // Keep state as admin_add_category to allow adding multiple categories
     return sendButtons(
       phone,
-      `✅ Category *${name}* created!`,
+      `✅ Category *${name}* created!${flowDriftNote(env)}`,
       [
         { id: 'admin_add_another_cat', title: '➕ Add Another' },
         { id: 'admin_home', title: '🔧 Admin Menu' },
@@ -554,21 +671,29 @@ async function startAddItemFlow(phone, session, env) {
   session.state = 'admin_add_item_flow';
   await saveSession(phone, session, env);
 
-  // Hand the categories to the Flow so its dropdown can be populated.
-  const cats = await getCategories(env);
+  // The Flow's category dropdown is static (flows/add-item.json), so no data is
+  // passed. If the Flow send fails, fall back to the text add flow so the admin
+  // is never stranded.
   const flowToken = `add_item_${Date.now()}`;
-  return sendFlow(
-    phone,
-    '➕ *Add New Item*\nTap below to fill in the item details.',
-    {
-      flowId:   env.ADD_ITEM_FLOW_ID,
-      flowToken,
-      flowCta:  'Add Item',
-      screenId: env.ADD_ITEM_FLOW_SCREEN || 'ADD_ITEM',
-      data:     { categories: cats.map(c => ({ id: String(c.id), title: c.name })) },
-    },
-    env
-  );
+  try {
+    return await sendFlow(
+      phone,
+      '➕ *Add New Item*\nTap below to fill in the item details.',
+      {
+        flowId:   env.ADD_ITEM_FLOW_ID,
+        flowToken,
+        flowCta:  'Add Item',
+        screenId: env.ADD_ITEM_FLOW_SCREEN || 'ADD_ITEM',
+        data:     {},
+      },
+      env
+    );
+  } catch (err) {
+    console.error('[Admin] Add-Item Flow send failed, falling back to text flow:', err);
+    session.state = 'admin_add_item_name';
+    await saveSession(phone, session, env);
+    return sendText(phone, '➕ *Add New Item*\n\nEnter the item *name*:\n\nSend *CANCEL* to abort.', env);
+  }
 }
 
 async function handleAddItemFlowReply(phone, msg, session, env) {
@@ -1288,9 +1413,31 @@ async function handleDeleteItemConfirm(phone, msg, session, env) {
       return sendAdminError(phone, '⚠️ Session lost. Please start over.', env);
     }
 
-    await deleteMenuItem(deleteItemId, env);
+    // GAP (FK delete UX): deleteMenuItem returns { ok:false, reason:'in_use' }
+    // when the item is still referenced by historical OrderItems instead of
+    // throwing. Show a friendly message + an availability nudge rather than
+    // silently failing or 500-ing the admin flow.
+    const del = await deleteMenuItem(deleteItemId, env);
+    if (!del.ok && del.reason === 'in_use') {
+      session.state    = 'admin_idle';
+      session.adminCtx = {};
+      await saveSession(phone, session, env);
+      return sendButtons(
+        phone,
+        `🚫 Can't delete *${deleteItemName}* — it appears in existing orders.\n\n` +
+        'Mark it *unavailable* instead to hide it from customers while keeping order history intact.',
+        [
+          { id: 'admin_toggle_item', title: '🔄 Toggle Avail.' },
+          { id: 'admin_home',        title: '🔧 Admin Menu'    },
+        ],
+        env
+      );
+    }
     await bustMenuCache(env);
 
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
     return sendButtons(
       phone,
       `✅ *${deleteItemName}* deleted from menu.`,
@@ -1671,10 +1818,15 @@ async function performStatusUpdate(phone, session, env) {
 
   await updateOrderStatus(updateOrderId, newStatus, env);
 
-  // EDGE-08: log the paid-cancel case so a manual refund is traceable.
+  // GAP (automated refund): a paid order being cancelled triggers an automatic
+  // Flutterwave refund attempt (was warn-only). Fetch the order so we have the
+  // persisted transaction id; every step degrades gracefully.
   const paidCancel = newStatus === 'cancelled' && orderPaymentStatus === 'paid';
+  let refundLine = '';
   if (paidCancel) {
-    console.warn(`[Admin] Order #${updateOrderId} cancelled while PAID — manual refund required.`);
+    console.warn(`[Admin] Order #${updateOrderId} cancelled while PAID — attempting refund.`);
+    const order = await getOrder(updateOrderId, env);
+    refundLine = await attemptPaidCancelRefund(order || { id: updateOrderId, total_price: null }, env);
   }
 
   // UX-09: notify the customer and only claim success when the send resolves.
@@ -1683,7 +1835,6 @@ async function performStatusUpdate(phone, session, env) {
   const notifyLine = notified
     ? '✅ Customer notified.'
     : "⚠️ Could not reach the customer (they'll see status next visit).";
-  const refundLine = paidCancel ? '\n⚠️ This order is PAID — a manual refund is required.' : '';
 
   session.state    = 'admin_idle';
   session.adminCtx = {};
@@ -1738,6 +1889,49 @@ function statusMessage(orderId, status) {
     cancelled: `❌ Order #${orderId} *cancelled*. Contact us if you have questions.`,
   };
   return messages[status] || `📦 Order #${orderId} status: *${status.toUpperCase()}*`;
+}
+
+/**
+ * GAP (automated refund): when a PAID order is cancelled we now attempt a
+ * Flutterwave refund automatically instead of merely warning. The transaction
+ * id was persisted to the order's payment_access_code column at payment time
+ * (db.persistTransactionId). Every step is best-effort and degrades gracefully:
+ *
+ *   • no tx id        → log a refund row with status 'manual' + alert the admin
+ *   • refund attempted → log the result + alert the admin to verify
+ *   • refund throws    → log status 'error' + alert; never breaks the cancel
+ *
+ * Returns a short human line summarising the outcome for the admin reply.
+ */
+async function attemptPaidCancelRefund(order, env) {
+  const orderId = order?.id;
+  const txId = order?.payment_access_code;
+  const amount = order?.total_price ?? null;
+
+  // No persisted transaction id — we cannot auto-refund. Record + alert so a
+  // human can refund manually; don't pretend it happened.
+  if (!txId) {
+    await logRefund(env, { orderId, txId: null, amount, status: 'manual' });
+    await alertAdmin(env, 'paid_cancel_no_txid',
+      `Order #${orderId} cancelled while PAID but has no transaction id — manual refund required (₦${amount ?? '?'}).`);
+    return '\n⚠️ This order is PAID but no transaction id is on file — *manual refund required*.';
+  }
+
+  try {
+    const result = await refundFlutterwaveTransaction(txId, env, amount);
+    const ok = result && (result.status === 'success' || result.ok === true);
+    await logRefund(env, { orderId, txId, amount, status: ok ? 'refunded' : 'requested' });
+    await alertAdmin(env, 'paid_cancel_refund',
+      `Order #${orderId} (₦${amount ?? '?'}) refund ${ok ? 'succeeded' : 'requested'} via tx ${txId}.`);
+    return ok
+      ? '\n💸 Refund issued automatically — customer will be credited.'
+      : '\n💸 Refund requested — please verify it completed on Flutterwave.';
+  } catch (err) {
+    await logRefund(env, { orderId, txId, amount, status: 'error' });
+    await alertAdmin(env, 'paid_cancel_refund_failed',
+      `Order #${orderId} auto-refund FAILED (tx ${txId}): ${err && err.message}`);
+    return '\n⚠️ Automatic refund FAILED — *manual refund required* (admin alerted).';
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1798,6 +1992,7 @@ async function handleBulkMenu(phone, msg, session, env) {
   if (id === 'bulk_items_remove') {
     session.state = 'admin_bulk_items_remove_select';
     session.adminCtx.bulk = { type: 'menu_items', action: 'remove', selectedIds: [], page: 0 };
+    await resetSelection(phone, env); // GAP: seed the dedicated selection key
     await saveSession(phone, session, env);
     return showBulkItemsRemoveList(phone, session, env);
   }
@@ -1806,6 +2001,7 @@ async function handleBulkMenu(phone, msg, session, env) {
   if (id === 'bulk_items_edit') {
     session.state = 'admin_bulk_items_edit_action';
     session.adminCtx.bulk = { type: 'menu_items', action: 'edit', selectedIds: [], page: 0 };
+    await resetSelection(phone, env); // GAP: seed the dedicated selection key
     await saveSession(phone, session, env);
     return showBulkItemsEditActionMenu(phone, env);
   }
@@ -1814,6 +2010,7 @@ async function handleBulkMenu(phone, msg, session, env) {
   if (id === 'bulk_items') {
     session.state = 'admin_bulk_items_action';
     session.adminCtx.bulk = { type: 'menu_items', selectedIds: [], page: 0 };
+    await resetSelection(phone, env); // GAP: seed the dedicated selection key
     await saveSession(phone, session, env);
     return sendButtons(phone, '🍽️ *Bulk Menu*\nWhat do you want to do?',
       [{ id: 'ba_mi_avail', title: 'Mark Available' }, { id: 'ba_mi_unavail', title: 'Mark Unavail.' }, { id: 'admin_home', title: '❌ Cancel' }], env);
@@ -1835,6 +2032,7 @@ async function handleBulkMenu(phone, msg, session, env) {
   if (id === 'bulk_cats_delete') {
     session.state = 'admin_bulk_cats_delete_select';
     session.adminCtx.bulk = { type: 'categories', action: 'delete', selectedIds: [] };
+    await resetSelection(phone, env); // GAP: seed the dedicated selection key
     await saveSession(phone, session, env);
     return showBulkCatsDeleteList(phone, session, env);
   }
@@ -1872,7 +2070,9 @@ async function handleBulkOrdersAction(phone, msg, session, env) {
   const status = msg.id.replace('ba_os_', '');
   session.adminCtx.bulk.action = 'set_status';
   session.adminCtx.bulk.targetValue = status;
+  session.adminCtx.bulk.selectedIds = [];
   session.state = 'admin_bulk_orders_select';
+  await resetSelection(phone, env); // GAP: seed the dedicated selection key
   await saveSession(phone, session, env);
 
   return showBulkOrdersList(phone, session, env);
@@ -1933,13 +2133,14 @@ async function handleBulkOrdersSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bs_o_')) {
     const orderId = parseInt(msg.id.replace('bs_o_', ''), 10);
-    toggleSelection(bulk, orderId); // BUG-11: de-duplicated, race-safe toggle
+    await toggleSelection(phone, bulk, orderId, env); // GAP: KV read-modify-write, race-safe
     await saveSession(phone, session, env);
     return showBulkOrdersList(phone, session, env);
   }
 
   // Handle buttons
   if (msg.id === 'bulk_review' || (msg.text || '').toUpperCase() === 'REVIEW') {
+    await loadSelection(phone, bulk, env); // GAP: re-read authoritative selection at commit
     if (!bulk.selectedIds.length) {
       return sendText(phone, '⚠️ Please select at least one order first.', env);
     }
@@ -2092,6 +2293,7 @@ async function handleBulkOrdersConfirm(phone, msg, session, env) {
 async function executeBulkOrders(phone, session, env) {
   const { bulk } = session.adminCtx;
   const status = bulk.targetValue;
+  await loadSelection(phone, bulk, env); // GAP: re-read authoritative selection before writing
 
   let successCount = 0;
   let skippedCount = 0;
@@ -2099,9 +2301,23 @@ async function executeBulkOrders(phone, session, env) {
   let paidCancelCount = 0;
   const failureDetails = [];
 
+  // GAP (N+1): fetch every selected order in ONE query instead of getOrder()
+  // per id (which also issued a second query for items we never use here). Only
+  // the columns the loop needs are selected; payment_access_code carries the
+  // persisted Flutterwave transaction id for the auto-refund path.
+  const orderMap = new Map();
+  if (bulk.selectedIds.length) {
+    const placeholders = bulk.selectedIds.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+      `SELECT id, user_phone, total_price, status, payment_status, payment_access_code
+       FROM Orders WHERE id IN (${placeholders})`
+    ).bind(...bulk.selectedIds).all();
+    for (const row of rows.results) orderMap.set(row.id, row);
+  }
+
   for (const id of bulk.selectedIds) {
     try {
-      const order = await getOrder(id, env);
+      const order = orderMap.get(id);
       if (!order) {
         skippedCount++;
         continue;
@@ -2124,14 +2340,16 @@ async function executeBulkOrders(phone, session, env) {
         continue;
       }
 
-      // EDGE-08: a paid order being cancelled needs a manual refund — log it.
-      if (status === 'cancelled' && order.payment_status === 'paid') {
-        paidCancelCount++;
-        console.warn(`[Admin] Bulk-cancel of PAID order #${id} — manual refund required.`);
-      }
-
       await updateOrderStatus(id, status, env);
       successCount++;
+
+      // GAP (automated refund): a paid order being cancelled triggers an
+      // automatic Flutterwave refund attempt (was warn-only). Best-effort —
+      // attemptPaidCancelRefund never throws on the refund itself.
+      if (status === 'cancelled' && order.payment_status === 'paid') {
+        paidCancelCount++;
+        await attemptPaidCancelRefund(order, env);
+      }
 
       if (bulk.notifyCustomers) {
         let custMsg = statusMessage(id, status);
@@ -2168,9 +2386,9 @@ async function executeBulkOrders(phone, session, env) {
   session.adminCtx = {};
   await saveSession(phone, session, env);
 
-  // EDGE-08: surface the manual-refund warning for paid cancellations.
+  // GAP (automated refund): surface that paid cancellations triggered auto-refunds.
   const paidWarn = paidCancelCount > 0
-    ? `\n⚠️ ${paidCancelCount} PAID order(s) cancelled — manual refund required.`
+    ? `\n💸 ${paidCancelCount} PAID order(s) cancelled — auto-refund attempted (admin alerted to verify).`
     : '';
 
   const summary =
@@ -2262,7 +2480,7 @@ async function handleBulkItemsSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bs_i_')) {
     const itemId = parseInt(msg.id.replace('bs_i_', ''), 10);
-    toggleSelection(bulk, itemId); // BUG-11: de-duplicated, race-safe toggle
+    await toggleSelection(phone, bulk, itemId, env); // GAP: KV read-modify-write, race-safe
     await saveSession(phone, session, env);
     return showBulkItemsList(phone, session, env);
   }
@@ -2306,6 +2524,7 @@ async function handleBulkItemsConfirm(phone, msg, session, env) {
   if (msg.id === 'bulk_confirm_yes') {
     const { bulk } = session.adminCtx;
     const isAvail = bulk.targetValue === 1;
+    await loadSelection(phone, bulk, env); // GAP: re-read authoritative selection before writing
 
     try {
       await bulkUpdateMenuAvailability(bulk.selectedIds, isAvail, env);
@@ -2626,14 +2845,20 @@ async function handleBulkItemsAddReview(phone, msg, session, env) {
     let failureCount = 0;
     const failureDetails = [];
 
+    // GAP (N+1): one read of all existing item names instead of a SELECT per
+    // item. The dup-check then runs in-memory against this lowercased set.
+    const existingRows = await env.DB.prepare('SELECT name FROM MenuItems').all();
+    const existingNames = new Set(existingRows.results.map(r => r.name.toLowerCase()));
+
     for (const item of items) {
       try {
-        const dup = await env.DB.prepare('SELECT id FROM MenuItems WHERE LOWER(name) = LOWER(?)').bind(item.name).first();
-        if (dup) {
+        if (existingNames.has(item.name.toLowerCase())) {
           failureDetails.push({ name: item.name, error: 'duplicate' });
           failureCount++;
         } else {
           await createMenuItem({ categoryId: item.categoryId, name: item.name, description: item.description, price: item.price, imageUrl: item.imageUrl }, env);
+          // Guard against duplicates WITHIN the same paste batch too.
+          existingNames.add(item.name.toLowerCase());
           successCount++;
         }
       } catch (err) {
@@ -2720,7 +2945,7 @@ async function handleBulkItemsRemoveSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bsr_')) {
     const itemId = parseInt(msg.id.replace('bsr_', ''), 10);
-    toggleSelection(bulk, itemId); // BUG-11: de-duplicated, race-safe toggle
+    await toggleSelection(phone, bulk, itemId, env); // GAP: KV read-modify-write, race-safe
     await saveSession(phone, session, env);
     return showBulkItemsRemoveList(phone, session, env);
   }
@@ -2765,6 +2990,7 @@ async function handleBulkItemsRemoveConfirm(phone, msg, session, env) {
   }
 
   if (msg.id === 'bulk_remove_confirm') {
+    await loadSelection(phone, bulk, env); // GAP: re-read authoritative selection before writing
     if (!bulk.selectedIds.length) {
       session.state = 'admin_idle'; session.adminCtx = {};
       await saveSession(phone, session, env);
@@ -2999,7 +3225,7 @@ async function handleBulkItemsEditSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bie_')) {
     const itemId = parseInt(msg.id.replace('bie_', ''), 10);
-    toggleSelection(bulk, itemId); // BUG-11: de-duplicated, race-safe toggle
+    await toggleSelection(phone, bulk, itemId, env); // GAP: KV read-modify-write, race-safe
     await saveSession(phone, session, env);
     return showBulkItemsEditList(phone, session, env);
   }
@@ -3047,6 +3273,8 @@ async function handleBulkItemsEditConfirm(phone, msg, session, env) {
     return sendButtons(phone, `Apply edit to ${bulk.selectedIds.length} items?`,
       [{ id: 'bulk_edit_confirm', title: '✅ Apply Changes' }, { id: 'bulk_back_select', title: '⬅️ Back' }], env);
   }
+
+  await loadSelection(phone, bulk, env); // GAP: re-read authoritative selection before writing
 
   // Build fields object based on action
   let fields = {};
@@ -3217,7 +3445,10 @@ async function handleBulkCatsAddReview(phone, msg, session, env) {
       }
     }
 
-    if (successCount > 0) await bustMenuCache(env);
+    if (successCount > 0) {
+      await bustMenuCache(env);
+      await markFlowStale(env, `${successCount} categories bulk-added`); // GAP: static Add-Item Flow drift
+    }
 
     const logId = await logBulkAction({
       adminPhone: phone, actionType: 'bulk_add', targetType: 'categories',
@@ -3229,6 +3460,7 @@ async function handleBulkCatsAddReview(phone, msg, session, env) {
     await saveSession(phone, session, env);
 
     let summary = `✅ *Bulk Add Categories Complete*\n\nAdded: ${successCount}\nFailed: ${failureCount}\nLog ID: ${logId}`;
+    if (successCount > 0) summary += flowDriftNote(env);
     if (failureDetails.length) summary += '\n\n*Failures:*\n' + failureDetails.slice(0, 3).map(f => `• ${f.name}: ${f.error}`).join('\n');
     if (summary.length > 900) summary = summary.slice(0, 897) + '…';
 
@@ -3294,6 +3526,7 @@ async function handleBulkCatsRenameValue(phone, msg, session, env) {
 
     await updateCategory(bulk.renameCatId, { name: newName }, env);
     await bustMenuCache(env);
+    await markFlowStale(env, `category renamed: ${bulk.renameCatOldName} → ${newName}`); // GAP: static Add-Item Flow drift
 
     const logId = await logBulkAction({
       adminPhone: phone, actionType: 'rename', targetType: 'categories',
@@ -3305,7 +3538,7 @@ async function handleBulkCatsRenameValue(phone, msg, session, env) {
     await saveSession(phone, session, env);
 
     return sendButtons(phone,
-      `✅ Category renamed: *${bulk.renameCatOldName}* → *${newName}*\nLog ID: ${logId}`,
+      `✅ Category renamed: *${bulk.renameCatOldName}* → *${newName}*\nLog ID: ${logId}${flowDriftNote(env)}`,
       [
         { id: 'bulk_cats_rename', title: '✏️ Rename Again' },
         { id: 'admin_bulk_menu',  title: '📦 Bulk Actions'   },
@@ -3346,12 +3579,13 @@ async function handleBulkCatsDeleteSelect(phone, msg, session, env) {
 
   if (msg.id?.startsWith('bcd_')) {
     const catId = parseInt(msg.id.replace('bcd_', ''), 10);
-    toggleSelection(bulk, catId); // BUG-11: de-duplicated, race-safe toggle
+    await toggleSelection(phone, bulk, catId, env); // GAP: KV read-modify-write, race-safe
     await saveSession(phone, session, env);
     return showBulkCatsDeleteList(phone, session, env);
   }
 
   if (msg.id === 'bulk_review') {
+    await loadSelection(phone, bulk, env); // GAP: re-read authoritative selection at commit
     if (!bulk.selectedIds.length) return sendText(phone, '⚠️ Select at least one category first.', env);
 
     const itemCounts = await getItemCountsByCategory(env);
@@ -3463,6 +3697,8 @@ async function handleBulkCatsDeleteConfirm(phone, msg, session, env) {
     return sendButtons(phone, '⚠️ Confirm deletion?',
       [{ id: 'bcd_confirm_yes', title: '✅ Yes, Proceed' }, { id: 'bcd_back', title: '⬅️ Back' }], env);
   }
+
+  await loadSelection(phone, bulk, env); // GAP: re-read authoritative selection before writing
 
   let deletedCats = 0;
   let movedItems = 0;

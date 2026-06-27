@@ -50,6 +50,95 @@ This document provides guidance for restaurant operators and quality assurance t
 
 ---
 
+## Database Migrations
+
+Schema changes live in the `migrations/` folder as numbered, forward-only SQL files. The base schema is still `schema.sql` (full provisioning, safe to re-run); each `migrations/000N_*.sql` file carries only the additive changes introduced after it.
+
+- **Files are forward-only and idempotent.** Every statement is `CREATE TABLE/INDEX IF NOT EXISTS` (or `INSERT OR IGNORE`) — nothing alters or drops existing tables/columns. Re-running a migration is a no-op, so it is always safe to re-apply.
+- **Apply a migration to production:**
+  ```
+  wrangler d1 execute food-bot-db --remote --file=migrations/0002_prod_hardening.sql
+  ```
+  Omit `--remote` to apply against the local dev D1. Apply files in numeric order.
+- **Verify the table landed:**
+  ```
+  wrangler d1 execute food-bot-db --remote --command="SELECT name FROM sqlite_master WHERE type='table' AND name='RefundLog';"
+  ```
+
+### `0002_prod_hardening.sql`
+
+Adds the `RefundLog` table (+ `idx_refundlog_order` index) used for best-effort refund/dispute persistence.
+
+**Order placement does NOT depend on this migration.** Idempotency for order creation reuses the existing `payment_reference TEXT UNIQUE` column on `Orders` — no new column or table is on the critical path. `RefundLog` is written only inside `db.logRefund` under try/catch, so if the migration hasn't been applied yet the write degrades gracefully (logs and continues) instead of breaking a flow. This means code can deploy before or after the migration runs, in either order.
+
+> **Note:** There is no automatic migration runner or applied-version tracking table — migrations are applied manually and ordering is by filename. Keep new files strictly additive/idempotent so re-running the whole folder stays safe.
+
+---
+
+## Runbook
+
+Common production incidents and how to resolve them.
+
+### Webhook secret mismatch (401 in logs)
+**Symptom:** `/flutterwave/webhook` returns `401` in the Worker logs (`wrangler tail`); payments never auto-confirm to `paid`.
+
+**Cause:** The `verif-hash` header sent by Flutterwave does not match the `FLUTTERWAVE_WEBHOOK_SECRET` Worker secret (or the secret is unset — an unset secret always 401s).
+
+**Fix:**
+1. Confirm the secret exists: `wrangler secret list` (look for `FLUTTERWAVE_WEBHOOK_SECRET`).
+2. Re-set it if needed: `wrangler secret put FLUTTERWAVE_WEBHOOK_SECRET`.
+3. In the Flutterwave dashboard, set the webhook **Secret hash** to the EXACT same value (no trailing whitespace).
+4. Webhook URL must be `https://<your-worker-domain>/flutterwave/webhook` with the `charge.completed` event enabled.
+5. Any payments missed while the secret was wrong are recovered automatically by the reconciliation cron (below) — no manual replay needed.
+
+### WhatsApp Flow not published (`#131009`)
+**Symptom:** Sending a Flow message fails with WhatsApp error code `131009` ("Parameter value is not valid") and the interactive Flow never renders for the customer.
+
+**Cause:** The Flow referenced by the worker is in `DRAFT` and not `PUBLISHED`, or the `flow_id` / `flow_token` no longer matches the published Flow.
+
+**Fix:**
+1. Open WhatsApp Manager → Flows and confirm the Flow status is **Published** (not Draft).
+2. Re-publish if it reverted to draft after an edit.
+3. Verify the `flow_id` configured in the worker matches the published Flow's ID.
+4. Re-test by triggering the flow from a test number; watch `wrangler tail` for the error to clear.
+
+### KV / D1 outage
+**Symptom:** Reads/writes to session state (KV) or orders/menu (D1) intermittently fail; bot replies stall or error.
+
+**Behavior:** KV is used for transient session state and the menu cache; D1 holds orders. `markOrderPaidAtomic` is the single atomic chokepoint for paid-transitions, so a partial outage cannot double-confirm an order.
+
+**Fix:**
+1. Check Cloudflare status (https://www.cloudflarestatus.com) for KV/D1 incidents.
+2. During a KV outage, session state may reset mid-conversation — customers can restart by sending "Hi". The menu cache misses fall through to D1.
+3. During a D1 outage, order placement and admin actions will fail; do not retry writes blindly. Once D1 recovers, the reconciliation cron settles any payments that completed during the gap.
+4. If an outage caused stuck `pending` payments, let the cron run (or trigger a manual sweep) rather than hand-editing rows.
+
+### Reconciliation cron
+**What it does:** A scheduled sweep (`reconcilePendingPayments`) catches payments that completed at Flutterwave but whose webhook never landed (e.g. webhook-secret mismatch or a KV/D1 blip).
+
+- It selects recent `payment_status='pending'` orders with a `payment_reference`, re-verifies each against Flutterwave, and confirms (via `markOrderPaidAtomic`) only when status is `successful`, currency is `NGN`, and the amount matches the order total.
+- Stale `pending` orders older than ~1 day with no successful transaction are aged out to `failed`.
+- It never throws (per-order try/catch) and alerts the admin (`ADMIN_ALERT_PHONE`, if set) on amount mismatches or systemic failures.
+
+**If payments are not auto-confirming:** first fix the webhook secret (above); the cron is the safety net, not the primary path. Check `wrangler tail` for cron invocation logs and any `alertAdmin` messages.
+
+### Backups / DR
+- **D1 Time Travel (30 days):** D1 keeps a 30-day continuous backup. Restore to a point in time (or inspect a bookmark) with:
+  ```
+  wrangler d1 time-travel restore food-bot-db --timestamp="2026-06-27T12:00:00Z"
+  wrangler d1 time-travel info food-bot-db
+  ```
+  Use this for accidental deletes or bad bulk actions within the 30-day window.
+- **Recommended off-platform backup:** schedule a periodic `wrangler d1 export` and push the dump to R2 for retention beyond 30 days and for an off-D1 copy:
+  ```
+  wrangler d1 export food-bot-db --remote --output=backup-$(date +%F).sql
+  # then upload to R2:
+  wrangler r2 object put food-bot-backups/backup-$(date +%F).sql --file=backup-$(date +%F).sql
+  ```
+  Run this on a cron (e.g. daily) so there is always a recent, downloadable snapshot independent of Time Travel's retention window.
+
+---
+
 ## Manual QA Script (User Personas)
 
 ### 👤 Persona: The Hungry Student (First-time user)

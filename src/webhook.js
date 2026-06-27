@@ -69,7 +69,14 @@ export async function handleWebhookPost(body, env) {
         }
         preSession = sessions.get(from);
       }
-      await processMessage(message, env, preSession);
+      // Isolate each message: a thrown (poison) message deletes its own dedup
+      // key and re-throws so a re-delivery can retry it — but it must NOT abort
+      // the rest of the batch, which share the same preSession threading.
+      try {
+        await processMessage(message, env, preSession);
+      } catch (err) {
+        console.error('[Webhook] processMessage failed (dedup key cleared for retry):', err);
+      }
     }
   } catch (err) {
     console.error('[Webhook] handleWebhookPost error:', err);
@@ -90,11 +97,21 @@ async function processMessage(message, env, preSession = null) {
     return;
   }
 
-  console.log('[Webhook] Processing message:', { from, type, wamid: wamid?.slice(-8) });
+  // PII: never log the full phone or any free-text message body. Only the
+  // last 4 digits of the sender and the message type/id are safe to log.
+  const fromTail = from.slice(-4);
+  console.log('[Webhook] Processing message:', { from: fromTail, type, wamid: wamid?.slice(-8) });
 
   // BUG-03 FIX: Deduplicate using wamid in KV.
   // Meta retries webhooks on timeout — without this, a slow D1 write
   // during order placement causes createOrder to run twice.
+  //
+  // POISON-MESSAGE FIX: keep the pre-check read so true duplicates are
+  // dropped, but only WRITE the dedup key AFTER the handler resolves
+  // successfully. If the handler throws, Meta's retry must be allowed to
+  // re-deliver — so we drop the key (it was never written) and let the
+  // error propagate. Writing before processing would mark a failed message
+  // as "seen" and permanently suppress its retry.
   const dedupKey = `dedup:${wamid}`;
   try {
     const seen = await env.SESSION_KV.get(dedupKey);
@@ -102,12 +119,10 @@ async function processMessage(message, env, preSession = null) {
       console.log('[Webhook] Duplicate message ignored:', wamid);
       return;
     }
-    // Mark as seen before processing — 1h TTL is sufficient
-    await env.SESSION_KV.put(dedupKey, '1', { expirationTtl: 3600 });
   } catch (err) {
     // KV outage — log but continue. Risk: rare duplicate on KV failure.
     // Safer to process a potential duplicate than to drop all messages.
-    console.warn('[Webhook] KV dedup unavailable, processing anyway:', err);
+    console.warn('[Webhook] KV dedup read unavailable, processing anyway:', err);
   }
 
   // UX-06: best-effort read receipt + typing indicator so the user sees the
@@ -115,7 +130,9 @@ async function processMessage(message, env, preSession = null) {
   sendTypingIndicator(from, wamid, env).catch(() => {});
 
   const parsed = parseMessage(message);
-  console.log('[Webhook] Parsed:', JSON.stringify(parsed));
+  // PII: do NOT log the parsed payload — it carries the user's free-text
+  // message body. Only the message type is safe to log.
+  console.log('[Webhook] Parsed type:', parsed?.type ?? 'unsupported');
 
   if (!parsed) {
     // BP-01: Unsupported types (voice, sticker, contacts, etc.) previously
@@ -128,16 +145,41 @@ async function processMessage(message, env, preSession = null) {
       : '🤖 I understand text, button taps, and list selections.\n\nSend *MENU* to start ordering!';
     await sendText(from, fallback, env)
       .catch(err => console.error('[Webhook] Failed to send type-fallback reply:', err));
+    // An unsupported message was fully handled (acknowledged). Mark it seen
+    // so a retry doesn't re-send the fallback.
+    await markSeen(env, dedupKey);
     return;
   }
 
   // Route to admin or customer handler. BUG-13: pass the shared preSession so
   // batched messages from the same 'from' reuse one in-memory session object.
-  const admin = await isAdmin(from, env);
-  if (admin) {
-    await handleAdminMessage(from, parsed, env, preSession);
-  } else {
-    await handleUserMessage(from, parsed, env, preSession);
+  // POISON-MESSAGE FIX: on a thrown handler, DELETE the dedup key (best-effort)
+  // so Meta's retry can re-deliver, then re-throw to signal failure upstream.
+  try {
+    const admin = await isAdmin(from, env);
+    if (admin) {
+      await handleAdminMessage(from, parsed, env, preSession);
+    } else {
+      await handleUserMessage(from, parsed, env, preSession);
+    }
+  } catch (err) {
+    await env.SESSION_KV.delete(dedupKey).catch(() => {});
+    throw err;
+  }
+
+  // Handler resolved successfully — NOW mark the message as seen so Meta's
+  // retry is dropped as a true duplicate.
+  await markSeen(env, dedupKey);
+}
+
+// Mark a wamid as processed in KV (1h TTL is sufficient for Meta's retry
+// window). Best-effort: a KV write failure must not fail an already-handled
+// message — the worst case is a rare duplicate on retry.
+async function markSeen(env, dedupKey) {
+  try {
+    await env.SESSION_KV.put(dedupKey, '1', { expirationTtl: 3600 });
+  } catch (err) {
+    console.warn('[Webhook] KV dedup write failed:', err);
   }
 }
 

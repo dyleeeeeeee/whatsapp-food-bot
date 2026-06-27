@@ -2,6 +2,11 @@
 -- WhatsApp Food Bot — D1 Schema
 -- Run: wrangler d1 execute food-bot-db --file=schema.sql
 --
+-- SAFE TO RE-RUN: every statement is additive and idempotent
+-- (CREATE TABLE/INDEX IF NOT EXISTS, INSERT OR IGNORE). This
+-- file never alters or drops existing tables, so re-running it
+-- against an already-provisioned database is a no-op.
+--
 -- NOTE: D1 manages its own SQLite settings. Do not add PRAGMAs
 -- here — journal_mode and foreign_keys are D1-controlled and
 -- session-level PRAGMAs do not persist across connections.
@@ -108,6 +113,23 @@ CREATE TABLE IF NOT EXISTS BulkActionLogs (
 
 CREATE INDEX IF NOT EXISTS idx_bulk_logs_admin ON BulkActionLogs(admin_phone);
 CREATE INDEX IF NOT EXISTS idx_bulk_logs_created ON BulkActionLogs(created_at);
+
+-- ─────────────────────────────────────────
+-- Refund Log
+-- Graceful refund/dispute persistence. Written best-effort
+-- (under try/catch in db.logRefund), so a missing table never
+-- breaks a flow. Not referenced by any critical-path query.
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS RefundLog (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id       INTEGER,
+  transaction_id TEXT,
+  amount         REAL,
+  status         TEXT,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_refundlog_order ON RefundLog(order_id);
 
 -- ─────────────────────────────────────────
 -- Seed Data (safe to re-run)

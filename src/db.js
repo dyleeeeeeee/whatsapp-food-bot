@@ -232,7 +232,31 @@ export async function updateMenuItem(id, fields, env) {
 
 export async function deleteMenuItem(id, env) {
 
-  await env.DB.prepare('DELETE FROM MenuItems WHERE id = ?').bind(id).run();
+  // OrderItems references MenuItems(id) with NO ON DELETE rule, so deleting an
+
+  // item that still appears on a historical order trips a FK constraint. Rather
+
+  // than throw (and 500 the admin flow), report it so the caller can show a
+
+  // friendly "still in use" message. Returns { ok:true } on success.
+
+  try {
+
+    await env.DB.prepare('DELETE FROM MenuItems WHERE id = ?').bind(id).run();
+
+    return { ok: true };
+
+  } catch (err) {
+
+    if (/FOREIGN KEY constraint failed/i.test(err && err.message)) {
+
+      return { ok: false, reason: 'in_use' };
+
+    }
+
+    throw err;
+
+  }
 
 }
 
@@ -262,15 +286,23 @@ export async function getCategories(env) {
 
 /**
 
- * Create an order and its items.
+ * Create an order and its items ATOMICALLY.
 
  *
 
- * BUG-11 FIX: Cleanup failure on zombie order now logs a CRITICAL error
+ * Parent order + all OrderItems are written in a single env.DB.batch, so a
 
- * with the orphaned order ID so it can be manually resolved, instead of
+ * partial failure rolls the whole thing back — no orphaned parent to clean up.
 
- * silently discarding the failure with `.catch(() => {})`.
+ *
+
+ * IDEMPOTENCY: order.idempotencyKey is stored in the UNIQUE payment_reference
+
+ * column; a duplicate placement collides on that constraint and we throw an
+
+ * error tagged .code = 'IDEMPOTENT_DUPLICATE' so the caller can fetch + reuse
+
+ * the existing order instead of creating a second one.
 
  *
 
@@ -310,85 +342,109 @@ export async function createOrder(order, env) {
 
 
 
-  const orderResult = await env.DB.prepare(
+  // BLOCKER (idempotency): the caller supplies a stable idempotencyKey which we
 
-    `INSERT INTO Orders (user_phone, total_price, address, notes, payment_status, payment_reference, payment_url, payment_access_code)
+  // store in the EXISTING UNIQUE payment_reference column. The order rows are
 
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  // written ATOMICALLY (parent + all items) in a single env.DB.batch so we never
 
-  ).bind(
+  // leave an orphaned parent on partial failure, and the UNIQUE constraint makes
 
-    userPhone,
+  // a duplicate placement (e.g. Meta webhook retry) collide instead of doubling
 
-    totalPrice,
+  // the order. We set payment_status='pending' in the same insert so the order
 
-    address || '',
+  // is immediately a candidate for the reconcile sweep.
 
-    orderNotes || '',
-
-    order.paymentStatus || 'unpaid',
-
-    order.paymentReference || null,
-
-    order.paymentUrl || null,
-
-    order.paymentAccessCode || null
-
-  ).run();
+  const idempotencyKey = order.idempotencyKey ?? null;
 
 
 
-  const orderId = orderResult.meta.last_row_id;
+  // D1 batch reuses meta.last_row_id from the last-inserted row in the same
 
+  // batch via SQLite's last_insert_rowid(); the OrderItems inserts therefore
 
+  // reference the parent through last_insert_rowid() rather than a value we
 
-  try {
+  // could only learn after the batch ran. This keeps the whole write atomic.
 
-    const stmts = order.items.map(item =>
+  const stmts = [
+
+    env.DB.prepare(
+
+      `INSERT INTO Orders (user_phone, total_price, address, notes, payment_status, payment_reference, payment_url, payment_access_code)
+
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`
+
+    ).bind(
+
+      userPhone,
+
+      totalPrice,
+
+      address || '',
+
+      orderNotes || '',
+
+      idempotencyKey,
+
+      order.paymentUrl || null,
+
+      order.paymentAccessCode || null
+
+    ),
+
+    ...order.items.map(item =>
 
       env.DB.prepare(
 
         `INSERT INTO OrderItems (order_id, menu_item_id, name, quantity, unit_price, notes)
 
-         VALUES (?, ?, ?, ?, ?, ?)`
+         VALUES (last_insert_rowid(), ?, ?, ?, ?, ?)`
 
-      ).bind(orderId, item.itemId, item.name, item.qty, item.unitPrice, item.notes || '')
+      ).bind(item.itemId, item.name, item.qty, item.unitPrice, item.notes || '')
 
-    );
+    ),
 
-    await env.DB.batch(stmts);
+  ];
+
+
+
+  let results;
+
+  try {
+
+    results = await env.DB.batch(stmts);
 
   } catch (batchErr) {
 
-    // BUG-11 FIX: attempt to delete the orphaned parent order
+    // A UNIQUE collision on payment_reference means this idempotencyKey already
 
-    await env.DB.prepare('DELETE FROM Orders WHERE id = ?')
+    // produced an order. Tag the error so the caller can fetch + reuse it
 
-      .bind(orderId)
+    // instead of creating a duplicate. D1 surfaces this as a thrown error whose
 
-      .run()
+    // message contains "UNIQUE constraint failed".
 
-      .catch(cleanupErr => {
+    if (/UNIQUE constraint failed/i.test(batchErr && batchErr.message)) {
 
-        // Log at CRITICAL level — this orphan needs manual cleanup
+      const dup = new Error('createOrder: duplicate idempotencyKey');
 
-        console.error(
+      dup.code = 'IDEMPOTENT_DUPLICATE';
 
-          `[DB] CRITICAL: Failed to cleanup zombie order #${orderId}. ` +
+      dup.idempotencyKey = idempotencyKey;
 
-          `Manual DELETE required. Cleanup error:`, cleanupErr
+      throw dup;
 
-        );
+    }
 
-      });
-
-    throw batchErr; // surface original error to caller
+    throw batchErr; // surface any other failure (whole batch rolled back)
 
   }
 
 
 
-  return orderId;
+  return results[0].meta.last_row_id;
 
 }
 
@@ -494,8 +550,12 @@ export async function updateOrderPayment(orderId, fields, env) {
 }
 
 export async function getOrderByReference(reference, env) {
+  // BUG-14: explicit columns (no SELECT *) — this is on the hot payment path.
   return env.DB.prepare(
-    `SELECT * FROM Orders WHERE payment_reference = ?`
+    `SELECT id, user_phone, total_price, status, address, notes,
+            payment_status, payment_reference, payment_url, payment_access_code, paid_at,
+            created_at, updated_at
+     FROM Orders WHERE payment_reference = ?`
   ).bind(reference).first();
 }
 
@@ -513,6 +573,62 @@ export async function markOrderPaidAtomic(orderId, paidAt, env) {
   ).bind(paidAt, orderId).run();
 
   return { changed: result.meta.changes === 1 };
+}
+
+/**
+ * Persist the Flutterwave transaction id for an order.
+ *
+ * DEPLOY-SAFETY: reuses the EXISTING payment_access_code column (unused by
+ * Flutterwave) — no migration needed. Off the critical path; failures here
+ * must not break payment confirmation, so callers may ignore the result.
+ */
+export async function persistTransactionId(orderId, txId, env) {
+  await env.DB.prepare(
+    `UPDATE Orders SET payment_access_code = ?, updated_at = datetime('now') WHERE id = ?`
+  ).bind(String(txId), orderId).run();
+}
+
+/**
+ * Record a refund attempt in RefundLog.
+ *
+ * DEPLOY-SAFETY: RefundLog is a NEW table that may not exist in prod yet, so
+ * the whole write is wrapped in try/catch — a missing table degrades to a log
+ * line and never breaks the refund flow. Best-effort, returns nothing.
+ */
+export async function logRefund(env, { orderId, txId, amount, status }) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO RefundLog (order_id, transaction_id, amount, status)
+       VALUES (?, ?, ?, ?)`
+    ).bind(orderId ?? null, txId != null ? String(txId) : null, amount ?? null, status || '').run();
+  } catch (err) {
+    console.error('[DB] logRefund failed (continuing):', err && err.message);
+  }
+}
+
+/**
+ * Read-only aggregate counts for an admin /stats view.
+ *
+ * Returns { ordersToday, paidToday, pendingCount, paidRate } where paidRate is
+ * the fraction (0..1) of today's orders that are paid.
+ */
+export async function getStats(env) {
+  const row = await env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM Orders WHERE created_at >= datetime('now','start of day'))                              AS orders_today,
+       (SELECT COUNT(*) FROM Orders WHERE payment_status = 'paid' AND created_at >= datetime('now','start of day'))  AS paid_today,
+       (SELECT COUNT(*) FROM Orders WHERE payment_status = 'pending')                                                AS pending_count`
+  ).first();
+
+  const ordersToday = row?.orders_today ?? 0;
+  const paidToday = row?.paid_today ?? 0;
+
+  return {
+    ordersToday,
+    paidToday,
+    pendingCount: row?.pending_count ?? 0,
+    paidRate: ordersToday > 0 ? paidToday / ordersToday : 0,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────

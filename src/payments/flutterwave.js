@@ -3,7 +3,12 @@
  *
  * Direct REST API implementation (no SDK) for Cloudflare Workers.
  * Implements Standard Checkout flow for payment processing.
+ *
+ * All outbound calls go through fetchWithRetry so a slow/transient Flutterwave
+ * never hangs a Worker invocation and 429/5xx are retried with backoff.
  */
+
+import { fetchWithRetry } from '../lib/http.js';
 
 export async function initializeFlutterwaveTransaction(data, env) {
   const { amount, txRef, currency, customer, metadata } = data;
@@ -28,7 +33,7 @@ export async function initializeFlutterwaveTransaction(data, env) {
     throw new Error(`initializeFlutterwaveTransaction: amount must be >= 100 NGN (got ${amount})`);
   }
 
-  const response = await fetch('https://api.flutterwave.com/v3/payments', {
+  const response = await fetchWithRetry('https://api.flutterwave.com/v3/payments', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${secretKey}`,
@@ -66,7 +71,7 @@ export async function initializeFlutterwaveTransaction(data, env) {
 export async function verifyFlutterwaveTransaction(txRef, env) {
   const secretKey = env.FLUTTERWAVE_SECRET_KEY;
 
-  const response = await fetch(`https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=${encodeURIComponent(txRef)}`, {
+  const response = await fetchWithRetry(`https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=${encodeURIComponent(txRef)}`, {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${secretKey}`,
@@ -79,7 +84,54 @@ export async function verifyFlutterwaveTransaction(txRef, env) {
     throw new Error(result.message || 'Flutterwave verification failed');
   }
 
-  return result.data; // { status: "successful", amount, tx_ref, ... }
+  // Exposes the Flutterwave transaction id as `.id` (needed for refunds and
+  // persistTransactionId) alongside `.status`, `.amount`, `.currency`, `.tx_ref`.
+  return result.data; // { id, status: "successful", amount, currency, tx_ref, ... }
+}
+
+/**
+ * Refund a Flutterwave transaction.
+ *
+ * @param {string|number} transactionId - the Flutterwave transaction id (the
+ *   `id` field from a verify response), NOT the tx_ref.
+ * @param {object} env
+ * @param {number} [amount] - optional partial-refund amount; omit for a full refund.
+ * @returns {Promise<object>} the Flutterwave refund payload (result.data).
+ */
+export async function refundFlutterwaveTransaction(transactionId, env, amount) {
+  const secretKey = env.FLUTTERWAVE_SECRET_KEY;
+
+  if (!secretKey) {
+    throw new Error('FLUTTERWAVE_SECRET_KEY is not set');
+  }
+  if (transactionId === undefined || transactionId === null || transactionId === '') {
+    throw new Error('refundFlutterwaveTransaction: transactionId is required');
+  }
+
+  const body = {};
+  if (typeof amount === 'number' && Number.isFinite(amount) && amount > 0) {
+    body.amount = amount; // partial refund; full refund when omitted
+  }
+
+  const response = await fetchWithRetry(
+    `https://api.flutterwave.com/v3/transactions/${encodeURIComponent(transactionId)}/refund`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    }
+  );
+
+  const result = await response.json();
+  if (!response.ok || result.status !== 'success') {
+    console.error('[Flutterwave] Refund error:', result);
+    throw new Error(result.message || 'Flutterwave refund failed');
+  }
+
+  return result.data; // { id, status: "completed", amount_refunded, ... }
 }
 
 export async function verifyFlutterwaveWebhookSignature(signature, env) {

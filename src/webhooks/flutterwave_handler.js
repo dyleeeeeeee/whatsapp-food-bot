@@ -7,8 +7,9 @@
  */
 
 import { verifyFlutterwaveWebhookSignature, verifyFlutterwaveTransaction } from '../payments/flutterwave.js';
-import { getOrderByReference, updateOrderPayment, markOrderPaidAtomic } from '../db.js';
+import { getOrderByReference, updateOrderPayment, markOrderPaidAtomic, persistTransactionId, logRefund } from '../db.js';
 import { sendText } from '../whatsapp.js';
+import { alertAdmin } from '../lib/alert.js';
 
 export async function handleFlutterwaveWebhook(request, env, ctx) {
   const signature = request.headers.get('verif-hash');
@@ -29,20 +30,63 @@ export async function handleFlutterwaveWebhook(request, env, ctx) {
     const txRef = data.tx_ref;
     const amount = data.amount;
     const status = data.status;
+    const txId = data.id; // Flutterwave transaction id
 
     // Use ctx.waitUntil to process asynchronously and return 200 to Flutterwave immediately
-    ctx.waitUntil(processPaymentSuccess(txRef, amount, status, env));
+    ctx.waitUntil(processPaymentSuccess(txRef, amount, status, txId, env));
+  } else {
+    // Dispute / refund / chargeback (or any non-charge event): never silently
+    // 200 away money-affecting events. Log + alert so a human can reconcile.
+    ctx.waitUntil(processNonChargeEvent(event, body.data, env));
   }
 
   return new Response('OK', { status: 200 });
 }
 
-async function processPaymentSuccess(txRef, amount, status, env) {
+/**
+ * Handle dispute / refund / chargeback (any event !== 'charge.completed').
+ * Records the event in RefundLog (graceful if the table is absent) and alerts
+ * the admin — we do NOT silently acknowledge money-affecting events.
+ */
+async function processNonChargeEvent(event, data, env) {
+  try {
+    const txRef = data && data.tx_ref;
+    const txId = data && data.id;
+    const amount = data && data.amount;
+    const status = (data && data.status) || event;
+
+    let orderId = null;
+    if (txRef) {
+      try {
+        const order = await getOrderByReference(txRef, env);
+        orderId = order ? order.id : null;
+      } catch (err) {
+        console.error('[Flutterwave] Lookup failed for non-charge event:', err);
+      }
+    }
+
+    console.warn(`[Flutterwave] Non-charge event '${event}' (tx_ref=${txRef}, txId=${txId}, order #${orderId})`);
+    await logRefund(env, { orderId, txId, amount, status: event });
+    await alertAdmin(env, 'flutterwave_dispute', {
+      event,
+      txRef,
+      txId,
+      amount,
+      orderId,
+      status,
+    });
+  } catch (err) {
+    console.error('[Flutterwave] Error handling non-charge event:', err);
+  }
+}
+
+async function processPaymentSuccess(txRef, amount, status, txId, env) {
   try {
     // 1. Find the order by tx_ref (stored as payment_reference)
     const order = await getOrderByReference(txRef, env);
     if (!order) {
       console.error(`[Flutterwave] Order not found for tx_ref: ${txRef}`);
+      await alertAdmin(env, 'flutterwave_order_not_found', { txRef, txId, amount });
       return;
     }
 
@@ -55,9 +99,24 @@ async function processPaymentSuccess(txRef, amount, status, env) {
     // 3. Verify with Flutterwave API (Defense-in-depth)
     const verifiedData = await verifyFlutterwaveTransaction(txRef, env);
 
-    // Flutterwave status: "successful" (not "success")
-    if (verifiedData.status !== 'successful' || verifiedData.amount !== amount) {
+    // Flutterwave status: "successful" (not "success"). Compare amounts with a
+    // float tolerance — never strict !== on floats.
+    if (verifiedData.status !== 'successful' || Math.abs(verifiedData.amount - amount) > 0.01) {
       console.error(`[Flutterwave] Verification failed for order #${order.id}. Expected successful and ${amount}, got ${verifiedData.status} and ${verifiedData.amount}`);
+      return;
+    }
+
+    // 3b. Defense in depth: only NGN is accepted. A non-NGN settlement with a
+    // matching numeric amount must never mark an order paid.
+    if (verifiedData.currency !== 'NGN') {
+      console.error(`[Flutterwave] CRITICAL: Non-NGN currency for order #${order.id}: ${verifiedData.currency}`);
+      await alertAdmin(env, 'flutterwave_currency_mismatch', {
+        orderId: order.id,
+        txRef,
+        txId: verifiedData.id ?? txId,
+        currency: verifiedData.currency,
+        amount,
+      });
       return;
     }
 
@@ -67,6 +126,13 @@ async function processPaymentSuccess(txRef, amount, status, env) {
     if (Math.abs(amount - expectedAmount) > 0.01) {
       console.error(`[Flutterwave] CRITICAL: Amount mismatch for order #${order.id}. Expected ${expectedAmount}, got ${amount}`);
       await updateOrderPayment(order.id, { payment_status: 'failed' }, env);
+      await alertAdmin(env, 'flutterwave_amount_mismatch', {
+        orderId: order.id,
+        txRef,
+        txId: verifiedData.id ?? txId,
+        expected: expectedAmount,
+        got: amount,
+      });
       await sendText(order.user_phone, `⚠️ We received a payment for order #${order.id}, but the amount was incorrect. Our team will contact you shortly.`, env);
       return;
     }
@@ -78,6 +144,14 @@ async function processPaymentSuccess(txRef, amount, status, env) {
     if (!changed) {
       console.log(`[Flutterwave] Order #${order.id} already paid; skipping duplicate confirmation.`);
       return;
+    }
+
+    // 5b. Persist the Flutterwave transaction id for reconciliation / refunds.
+    // Best-effort: a failure here must not block the customer notification.
+    try {
+      await persistTransactionId(order.id, verifiedData.id ?? txId, env);
+    } catch (err) {
+      console.error(`[Flutterwave] Failed to persist transaction id for order #${order.id}:`, err);
     }
 
     // 6. Notify customer — only on the delivery that actually changed the row.
