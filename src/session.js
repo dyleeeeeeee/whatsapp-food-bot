@@ -58,30 +58,69 @@ function sessionKey(phone) {
   return `session:${phone}`;
 }
 
-/** Load session from KV; return a fresh default if missing or corrupt */
-export async function getSession(phone, env) {
-  const raw = await env.SESSION_KV.get(sessionKey(phone));
-  if (raw) {
-    try { return JSON.parse(raw); } catch { /* corrupt — fall through */ }
-  }
-  return defaultSession();
+// CART-LOSS FIX (BUG-09): the cart lives in its OWN KV key, separate from the
+// session blob. Every navigation tap (browse category, open item, …) does a
+// read-modify-write of the session blob; on KV's eventually-consistent reads
+// that re-persisted a STALE (empty) cart, wiping items added moments earlier —
+// so the cart appeared to only ever hold one item. By storing the cart on its
+// own key and writing it ONLY when it actually changed (change-detection in
+// saveSession), navigation saves never touch — and never clobber — the cart.
+function cartKey(phone) {
+  return `cart:${phone}`;
 }
 
-/** Persist session to KV, resetting the 2-hour TTL */
+/** Load session from KV; return a fresh default if missing or corrupt. */
+export async function getSession(phone, env) {
+  const raw = await env.SESSION_KV.get(sessionKey(phone));
+  let session = defaultSession();
+  if (raw) {
+    try { session = JSON.parse(raw); } catch { /* corrupt — keep default */ }
+  }
+
+  // Load the cart from its dedicated key (source of truth for the cart).
+  const cartRaw = await env.SESSION_KV.get(cartKey(phone));
+  let cart;
+  if (cartRaw) {
+    try { cart = JSON.parse(cartRaw); } catch { cart = []; }
+  } else if (Array.isArray(session.cart) && session.cart.length) {
+    // One-time migration: a legacy session that still has the cart inline.
+    cart = session.cart;
+  } else {
+    cart = [];
+  }
+  session.cart = Array.isArray(cart) ? cart : [];
+
+  // Baseline lets saveSession write the cart key ONLY when it changed.
+  session.__cartBaseline = JSON.stringify(session.cart);
+  return session;
+}
+
+/** Persist session to KV, resetting the 2-hour TTL. */
 // BUG-20 policy note: every save SLIDES the 2h TTL — an active user's
 // session stays alive as long as they keep interacting; it only expires
 // after 2h of inactivity.
 export async function saveSession(phone, session, env) {
+  // Write the cart to its own key ONLY when it actually changed this request.
+  // Navigation taps don't change the cart, so they never write (or clobber) it.
+  const currentCart = JSON.stringify(session.cart || []);
+  if (currentCart !== session.__cartBaseline) {
+    await env.SESSION_KV.put(cartKey(phone), currentCart, { expirationTtl: SESSION_TTL });
+    session.__cartBaseline = currentCart;
+  }
+
+  // The session blob never carries the cart (or the internal baseline marker).
+  const { cart, __cartBaseline, ...rest } = session;
   await env.SESSION_KV.put(
     sessionKey(phone),
-    JSON.stringify(session),
+    JSON.stringify(rest),
     { expirationTtl: SESSION_TTL }
   );
 }
 
-/** Delete session on order complete or explicit cancel */
+/** Delete session AND cart on order complete or explicit cancel. */
 export async function clearSession(phone, env) {
   await env.SESSION_KV.delete(sessionKey(phone));
+  await env.SESSION_KV.delete(cartKey(phone));
 }
 
 function defaultSession() {
