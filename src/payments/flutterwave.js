@@ -80,8 +80,19 @@ export async function verifyFlutterwaveTransaction(txRef, env) {
 
   const result = await response.json();
   if (!response.ok || result.status !== 'success') {
-    console.error('[Flutterwave] Verification error:', result);
-    throw new Error(result.message || 'Flutterwave verification failed');
+    const message = result.message || 'Flutterwave verification failed';
+    const err = new Error(message);
+    // "No transaction was found for this id" is the NORMAL response for a
+    // reference that simply hasn't been paid yet (customer still on the hosted
+    // page, or abandoned). Tag it as TX_NOT_FOUND and do NOT log it at error
+    // level — callers (e.g. the reconcile sweep) treat it as benign so it
+    // doesn't spam logs every cron tick.
+    if (/no transaction was found/i.test(message)) {
+      err.code = 'TX_NOT_FOUND';
+    } else {
+      console.error('[Flutterwave] Verification error:', result);
+    }
+    throw err;
   }
 
   // Exposes the Flutterwave transaction id as `.id` (needed for refunds and

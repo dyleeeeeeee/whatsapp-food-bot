@@ -28,7 +28,7 @@ const PENDING_SCAN_LIMIT = 50;
 const AMOUNT_TOLERANCE = 0.01;
 
 export async function reconcilePendingPayments(env) {
-  const summary = { scanned: 0, confirmed: 0, aged_out: 0, mismatched: 0, errors: 0 };
+  const summary = { scanned: 0, confirmed: 0, aged_out: 0, mismatched: 0, unpaid: 0, errors: 0 };
 
   let rows;
   try {
@@ -102,8 +102,16 @@ export async function reconcilePendingPayments(env) {
       // Otherwise the tx is still pending/failed at Flutterwave — the age-out
       // pass below handles long-stale orders.
     } catch (err) {
-      // Per-order isolation: a verify failure on one order must not stop the
-      // rest of the sweep.
+      // "No transaction was found" just means this order hasn't been paid yet
+      // (customer still paying, or abandoned). That is the NORMAL pending state,
+      // not an error — the age-out pass reaps it after a day. Skip quietly so we
+      // don't spam the logs / inflate the error count every cron tick.
+      if (err && (err.code === 'TX_NOT_FOUND' || /no transaction was found/i.test(String(err.message)))) {
+        summary.unpaid++;
+        continue;
+      }
+      // Per-order isolation: a genuine/unexpected verify failure on one order
+      // (network, API down) must not stop the rest of the sweep.
       summary.errors++;
       console.error(`[Reconcile] order #${order.id} verify failed:`, err);
     }
