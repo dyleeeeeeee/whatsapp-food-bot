@@ -356,17 +356,20 @@ export async function createOrder(order, env) {
 
   // is immediately a candidate for the reconcile sweep.
 
-  const idempotencyKey = order.idempotencyKey ?? null;
+  // A non-null, UNIQUE reference is required: each item row links to the parent
+  // via a subquery on payment_reference (below). Generate one if the caller
+  // didn't supply an idempotencyKey so the subquery always resolves.
+  const idempotencyKey = order.idempotencyKey ?? ('AUTO-' + crypto.randomUUID());
 
 
 
-  // D1 batch reuses meta.last_row_id from the last-inserted row in the same
-
-  // batch via SQLite's last_insert_rowid(); the OrderItems inserts therefore
-
-  // reference the parent through last_insert_rowid() rather than a value we
-
-  // could only learn after the batch ran. This keeps the whole write atomic.
+  // Each OrderItems row references the parent via a subquery on the UNIQUE
+  // payment_reference inserted in the statement above. NOTE: last_insert_rowid()
+  // is UNRELIABLE inside D1's batch() (it can return 0, which then fails the
+  // OrderItems -> Orders foreign key and surfaces as "system error"); the
+  // subquery resolves within the SAME batch transaction and is robust. The
+  // parent id we return still comes from results[0].meta.last_row_id, which IS
+  // reliable per-statement.
 
   const stmts = [
 
@@ -400,9 +403,9 @@ export async function createOrder(order, env) {
 
         `INSERT INTO OrderItems (order_id, menu_item_id, name, quantity, unit_price, notes)
 
-         VALUES (last_insert_rowid(), ?, ?, ?, ?, ?)`
+         VALUES ((SELECT id FROM Orders WHERE payment_reference = ?), ?, ?, ?, ?, ?)`
 
-      ).bind(item.itemId, item.name, item.qty, item.unitPrice, item.notes || '')
+      ).bind(idempotencyKey, item.itemId, item.name, item.qty, item.unitPrice, item.notes || '')
 
     ),
 
