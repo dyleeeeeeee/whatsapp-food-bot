@@ -311,7 +311,8 @@ async function handleSelectingItem(phone, msg, session, env) {
     await sendText(phone, STRAY_TEXT_NOTICE, env);
     if (session.tempCategoryId) {
       return showItemsForCategory(
-        phone, session.tempCategoryId, session.tempCategoryName || 'Menu', session, env
+        phone, session.tempCategoryId, session.tempCategoryName || 'Menu', session, env,
+        session.tempCategoryPage || 0
       );
     }
   }
@@ -353,7 +354,8 @@ async function handleItemDetail(phone, msg, session, env) {
     // Return to the category the user came from, not the top-level menu
     if (session.tempCategoryId) {
       return showItemsForCategory(
-        phone, session.tempCategoryId, session.tempCategoryName || 'Menu', session, env
+        phone, session.tempCategoryId, session.tempCategoryName || 'Menu', session, env,
+        session.tempCategoryPage || 0
       );
     }
     return showMenuCategories(phone, session, env);
@@ -1302,9 +1304,49 @@ async function showMenuCategories(phone, session, env) {
   );
 }
 
-// WhatsApp hard limit: 10 rows total per list message (not per section).
-// For categories with >10 items we paginate: 9 items + 1 "Next Page" nav row.
-const ITEMS_PER_PAGE = 9;
+// WhatsApp hard-caps an interactive list at 10 TOTAL rows across all sections
+// and SILENTLY DROPS the overflow (see listPayload). A middle page carries up
+// to three nav rows — Previous + Next + Categories — so we reserve those slots
+// and show at most 7 items per page. This is what makes multi-page navigation
+// work: at 9 items/page the "Next" row was the 11th row and got dropped,
+// stranding users on page 2 (they could go back but never forward).
+const LIST_MAX_ROWS = 10;
+const MAX_NAV_ROWS  = 3; // Previous + Next + Categories (worst case, a middle page)
+const ITEMS_PER_PAGE = LIST_MAX_ROWS - MAX_NAV_ROWS; // 7
+
+// Pure row-builder for one page of a category's item list. Exported for tests.
+// Guarantees rows.length <= LIST_MAX_ROWS and clamps an out-of-range `page`
+// (e.g. a stale nav tap after the menu shrank) to a valid page instead of
+// rendering an empty list.
+export function buildMenuListRows(items, categoryId, page = 0) {
+  const totalPages = Math.max(1, Math.ceil(items.length / ITEMS_PER_PAGE));
+  const safePage   = Math.min(Math.max(page | 0, 0), totalPages - 1);
+  const pageItems  = items.slice(safePage * ITEMS_PER_PAGE, (safePage + 1) * ITEMS_PER_PAGE);
+
+  const rows = pageItems.map(item => {
+    const priceStr = `₦${item.price.toFixed(2)}`;
+    const maxDesc  = 72 - priceStr.length - 3;
+    const desc     = (item.description || '').slice(0, Math.max(0, maxDesc));
+    return {
+      id:          `item_${item.id}`,
+      title:       item.name.slice(0, 24),
+      description: `${priceStr} — ${desc || 'Tap to order'}`,
+    };
+  });
+
+  // Pagination controls, then a persistent escape to the category list. The
+  // last page omits "Next" and the first omits "Previous" — WhatsApp lists have
+  // no disabled/greyed state, so an unavailable direction is simply not shown.
+  if (safePage > 0) {
+    rows.push({ id: `page_prev_${categoryId}_${safePage - 1}`, title: '⬅️ Previous', description: `Back to page ${safePage} of ${totalPages}` });
+  }
+  if (safePage < totalPages - 1) {
+    rows.push({ id: `page_next_${categoryId}_${safePage + 1}`, title: '➡️ Next', description: `Go to page ${safePage + 2} of ${totalPages}` });
+  }
+  rows.push({ id: 'cmd_menu', title: '🗂️ Categories', description: 'Back to all categories' });
+
+  return { rows, totalPages, page: safePage };
+}
 
 async function showItemsForCategory(phone, categoryId, categoryName, session, env, page = 0) {
   const menu  = await getMenuCached(env);
@@ -1319,35 +1361,16 @@ async function showItemsForCategory(phone, categoryId, categoryName, session, en
     );
   }
 
-  const totalPages = Math.ceil(items.length / ITEMS_PER_PAGE);
-  const pageItems  = items.slice(page * ITEMS_PER_PAGE, (page + 1) * ITEMS_PER_PAGE);
-
-  const rows = pageItems.map(item => {
-    const priceStr = `₦${item.price.toFixed(2)}`;
-    const maxDesc  = 72 - priceStr.length - 3;
-    const desc     = (item.description || '').slice(0, Math.max(0, maxDesc));
-    return {
-      id:          `item_${item.id}`,
-      title:       item.name.slice(0, 24),
-      description: `${priceStr} — ${desc || 'Tap to order'}`,
-    };
-  });
-
-  // Add navigation rows when there are multiple pages
-  if (page > 0) {
-    rows.push({ id: `page_prev_${categoryId}_${page - 1}`, title: '⬅️ Previous Page', description: `Page ${page} of ${totalPages}` });
-  }
-  if (page < totalPages - 1) {
-    rows.push({ id: `page_next_${categoryId}_${page + 1}`, title: '➡️ Next Page', description: `Page ${page + 2} of ${totalPages}` });
-  }
+  const { rows, totalPages, page: safePage } = buildMenuListRows(items, categoryId, page);
 
   session.state            = 'selecting_item';
   session.tempCategoryId   = categoryId;
   session.tempCategoryName = categoryName;
+  session.tempCategoryPage = safePage; // so "Back" from item detail returns here
   await saveSession(phone, session, env);
 
-  const pageLabel = totalPages > 1 ? ` — Page ${page + 1}/${totalPages}` : '';
-  console.log('[User] showItemsForCategory:', categoryName, '| page:', page, '| rows:', rows.length);
+  const pageLabel = totalPages > 1 ? ` — Page ${safePage + 1}/${totalPages}` : '';
+  console.log('[User] showItemsForCategory:', categoryName, '| page:', safePage, '| rows:', rows.length);
 
   return sendList(
     phone,
