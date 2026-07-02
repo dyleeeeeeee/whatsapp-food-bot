@@ -35,7 +35,9 @@ test('createOrder computes total server-side in integer cents', async () => {
   const env = { DB: makeD1() };
   const id = await createOrder(sampleOrder('idem-key-1'), env);
   const order = env.DB.orders.find(o => o.id === id);
-  assert.equal(order.total_price, 2500 * 2 + 1500); // 6500
+  // Subtotal 6500 (>= 5000) => ₦1000 service fee added server-side => 7500.
+  assert.equal(order.total_price, 2500 * 2 + 1500 + 1000); // 6500 + 1000
+
   assert.equal(order.payment_status, 'pending');
   assert.equal(order.payment_reference, 'idem-key-1');
   // Items written atomically alongside the parent.

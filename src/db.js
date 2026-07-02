@@ -14,6 +14,8 @@
 
  */
 
+import { serviceFee } from './session.js';
+
 
 
 // ─────────────────────────────────────────────────────────────
@@ -338,7 +340,11 @@ export async function createOrder(order, env) {
 
   );
 
-  const totalPrice = Math.round(totalCents) / 100;
+  // Fee is added server-side on top of the item subtotal (FastChow tiers).
+  // Uses the same serviceFee() as the checkout display + charged amount so
+  // the persisted total_price always matches what the customer was shown/charged.
+  const subtotal   = Math.round(totalCents) / 100;
+  const totalPrice = subtotal + serviceFee(subtotal);
 
 
 

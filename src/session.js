@@ -156,18 +156,42 @@ export function cartTotal(cart) {
 }
 
 /**
+ * FastChow service fee. Charged on top of the item subtotal:
+ * subtotal of ₦5,000 or more → ₦1,000, anything below → ₦600.
+ * Single source of truth — used at checkout display, the charged
+ * amount, and the persisted order total so all three always agree.
+ * @param {number} subtotal - Item subtotal (before fee), in Naira
+ * @returns {number} Fee in Naira
+ */
+export function serviceFee(subtotal) {
+  return subtotal >= 5000 ? 1000 : 600;
+}
+
+/**
+ * Grand total the customer pays: item subtotal + service fee.
+ * @param {Array} cart
+ * @returns {number} Total in Naira
+ */
+export function orderTotal(cart) {
+  const subtotal = cartTotal(cart);
+  return subtotal + serviceFee(subtotal);
+}
+
+/**
  * Human-readable cart summary for WhatsApp messages.
  *
  * BUG-30 FIX: Item names capped at 40 chars in display to prevent
  * excessively wide lines from 100-char DB names blowing message limits.
  */
-export function cartSummary(cart) {
+export function cartSummary(cart, { withTotal = true } = {}) {
   if (!cart.length) return '_Your cart is empty._';
   const lines = cart.map(i => {
     const displayName = i.name.length > 40 ? i.name.slice(0, 37) + '…' : i.name;
     return `• ${displayName} ×${i.qty}  ${formatPrice(Math.round(i.unitPrice * 100) * i.qty / 100)}`;
   });
-  lines.push(`\n*Total: ${formatPrice(cartTotal(cart))}*`);
+  // Checkout confirm renders its own subtotal/fee/total breakdown, so it
+  // passes withTotal:false to avoid a duplicate (and misleading) total line.
+  if (withTotal) lines.push(`\n*Total: ${formatPrice(cartTotal(cart))}*`);
   return lines.join('\n');
 }
 

@@ -15,10 +15,27 @@ import {
   saveSession,
   addToCart,
   cartTotal,
+  serviceFee,
+  orderTotal,
 } from '../src/session.js';
 import { makeKV } from './helpers.mjs';
 
 const PHONE = '2348000000001';
+
+test('serviceFee: ₦5000 boundary and both tiers', () => {
+  assert.equal(serviceFee(4999.99), 600, 'below 5000 -> 600');
+  assert.equal(serviceFee(5000), 1000, 'exactly 5000 -> 1000');
+  assert.equal(serviceFee(6000), 1000, 'above 5000 -> 1000');
+  assert.equal(serviceFee(0), 600, 'empty subtotal -> 600');
+});
+
+test('orderTotal: subtotal plus the correct fee tier', () => {
+  const cheap = [{ itemId: 1, name: 'Fries', qty: 1, unitPrice: 1500, notes: '' }];
+  assert.equal(orderTotal(cheap), 1500 + 600);
+
+  const pricey = [{ itemId: 2, name: 'Feast', qty: 1, unitPrice: 5000, notes: '' }];
+  assert.equal(orderTotal(pricey), 5000 + 1000);
+});
 
 test('two adds accumulate into the same cart key', async () => {
   const env = { SESSION_KV: makeKV() };

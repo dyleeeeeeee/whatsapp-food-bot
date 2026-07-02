@@ -25,7 +25,7 @@ import {
 } from '../whatsapp.js';
 import {
   getSession, saveSession,
-  addToCart, cartSummary, cartTotal, clearCart,
+  addToCart, cartSummary, cartTotal, serviceFee, clearCart,
   getCachedMenu,  // BUG-01 FIX: was wrongly imported from db.js
   cacheMenu,      // BUG-01 FIX: was wrongly imported from db.js
   formatPrice,
@@ -850,20 +850,26 @@ async function renderCheckoutConfirm(phone, session, env) {
 
   // BUG-08 FIX: Checkout confirm body can exceed 1024 chars with many items.
   // We build the summary first and truncate intelligently if needed.
-  const total   = cartTotal(session.cart).toFixed(2);
-  let   summary = cartSummary(session.cart);
+  const subtotal = cartTotal(session.cart);
+  const fee      = serviceFee(subtotal);
+  const grand    = subtotal + fee;
+  // Item lines only — the subtotal/fee/total breakdown lives in the suffix.
+  let   summary  = cartSummary(session.cart, { withTotal: false });
 
   // Budget: prefix + summary + address + notes + suffix
   const prefix  = `🧾 *Order Summary*\n\n`;
   let middle    = `\n\n📍 *Address:* ${address}`;
   if (orderNotes) middle += `\n📝 *Instructions:* ${orderNotes}`;
-  const suffix  = `\n\n💳 *Total: ₦${total}*\n\nReady to place your order?`;
+  const suffix  =
+    `\n\n🧮 *Subtotal: ₦${subtotal.toFixed(2)}*` +
+    `\n➕ *Service fee: ₦${fee.toFixed(2)}*` +
+    `\n💳 *Total: ₦${grand.toFixed(2)}*` +
+    `\n\nReady to place your order?`;
   const budget  = CONFIRM_BODY_MAX - prefix.length - middle.length - suffix.length;
 
   if (summary.length > budget) {
     const count  = session.cart.length;
-    const ttl    = cartTotal(session.cart).toFixed(2);
-    summary = `${count} item${count !== 1 ? 's' : ''} in your order.\n\n*Total: ₦${ttl}*`;
+    summary = `${count} item${count !== 1 ? 's' : ''} in your order.`;
   }
 
   return sendButtons(
@@ -1014,13 +1020,16 @@ async function placeOrder(phone, session, env) {
       }
     }
 
-    const amount = cartTotal(session.cart);
-    if (!(amount > 0)) {
+    const subtotal = cartTotal(session.cart);
+    if (!(subtotal > 0)) {
       session.state = 'cart_review';
       await saveSession(phone, session, env);
       await sendText(phone, '⚠️ Your order total is invalid. Please review your cart.', env);
       return showCart(phone, session, env);
     }
+    // Charge the fee-inclusive total. createOrder computes the same fee from
+    // the same items server-side, so the charged amount matches total_price.
+    const amount = subtotal + serviceFee(subtotal);
 
     // BLOCKER #2 (idempotency): the order's payment_reference IS the checkout
     // id minted once at startCheckout. createOrder writes it into the UNIQUE
