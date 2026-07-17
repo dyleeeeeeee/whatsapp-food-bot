@@ -1,4 +1,4 @@
-# Flutterwave Integration - Deployment Guide
+# Flutterwave (Ravepay) Integration - Deployment Guide
 
 ## Overview
 Successfully replaced Paystack with Flutterwave for payment processing.
