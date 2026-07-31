@@ -57,14 +57,45 @@ function parseQuantity(text) {
   return null;
 }
 
-// UX-07: a List of quantities 1–10 (ids qty_1..qty_10) so the user can tap
-// instead of typing. Used from the "Choose Qty" branch.
-function quantityListSections() {
+// UX-07: a List of quantities 1–10 so the user can tap instead of typing.
+//
+// WRONG-ITEM FIX: the row id names its own target, so a stale session can
+// never redirect the tap — `qty_{n}_{itemId}` adds a menu item,
+// `cartqty_{n}_{idx}_{itemId}` re-quantifies an existing cart line. Plain
+// `qty_{n}` rows (rendered before this change) are still accepted on the way in.
+function quantityListSections(target) {
+  const isEdit = target.cartIdx !== undefined;
   const rows = [];
   for (let n = 1; n <= 10; n++) {
-    rows.push({ id: `qty_${n}`, title: String(n), description: `Add ${n}` });
+    rows.push({
+      id: isEdit
+        ? `cartqty_${n}_${target.cartIdx}_${target.itemId}`
+        : `qty_${n}_${target.itemId}`,
+      title: String(n),
+      description: isEdit ? `Set to ${n}` : `Add ${n}`,
+    });
   }
   return [{ title: 'Quantity', rows }];
+}
+
+// The session no longer knows which item or cart line a quantity belongs to.
+// Park the user somewhere they can act instead of re-prompting forever.
+async function lostQuantityTarget(phone, session, env) {
+  session.state = 'idle';
+  delete session.cartQtyEdit;
+  delete session.tempCartIdx;
+  await saveSession(phone, session, env);
+  return sendText(phone, '⚠️ Something went wrong. Send *MENU* to start over.', env);
+}
+
+// Rebuild the quantity-list target when re-prompting after unusable text —
+// a typed reply carries no id, so the session is all we have to go on.
+function qtyTargetFromSession(session) {
+  const idx = session.tempCartIdx;
+  if (session.cartQtyEdit && idx !== undefined && session.cart[idx]) {
+    return { cartIdx: idx, itemId: session.cart[idx].itemId };
+  }
+  return { itemId: session.tempItemId };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -112,14 +143,14 @@ function inferStateFromMessage(msg, session) {
   const id = msg.id || '';
 
   if (id.startsWith('qty_1_') || id.startsWith('qty_custom_')) return 'item_detail';
-  if (id.startsWith('qty_') && /^qty_\d+$/.test(id)) return 'entering_quantity';
+  if (/^qty_\d+(?:_\d+)?$/.test(id) || /^cartqty_\d+_\d+_\d+$/.test(id)) return 'entering_quantity';
   if (id === 'btn_checkout_start' || id === 'btn_keep_shopping' || id === 'btn_manage_cart' || id === 'btn_clear_cart') return 'cart_review';
   if (id === 'btn_place_order' || id === 'btn_edit_cart') return 'checkout_confirm';
   if (id === 'delivery_notes_skip') return 'checkout_delivery_notes';
   if (id.startsWith('item_') && msg.type === 'list_reply') return 'selecting_item';
   if ((id.startsWith('page_next_') || id.startsWith('page_prev_')) && msg.type === 'list_reply') return 'selecting_item';
-  if (id.startsWith('cat_') && msg.type === 'list_reply') return 'browsing_menu';
-  if ((id.startsWith('cart_idx_') || id === 'cart_clear_all') && msg.type === 'list_reply') return 'cart_manage';
+  if ((id.startsWith('cat_') || id.startsWith('catpage_')) && msg.type === 'list_reply') return 'browsing_menu';
+  if ((id.startsWith('cart_idx_') || id.startsWith('cartpage_') || id === 'cart_clear_all') && msg.type === 'list_reply') return 'cart_manage';
   if (id === 'cart_item_remove' || id === 'cart_item_qty' || id === 'cart_item_notes' || id === 'btn_cart_back') return 'cart_item_edit';
   if (id === 'confirm_cancel_yes' || id === 'confirm_cancel_no') return 'confirm_cancel';
   // UX-05: a Reorder tap is only ever offered on the order-detail view.
@@ -134,19 +165,24 @@ function inferStateFromMessage(msg, session) {
 
   // KV stale-state recovery for checkout text input.
   // Button IDs are ground truth, but plain text during checkout has no ID.
-  // If KV state hasn't propagated yet, we infer based on cart + tempAddress.
+  // If KV state hasn't propagated yet, we infer based on checkoutId + tempAddress.
   // Exception: numeric text (1-20) while in item_detail/entering_quantity is a qty, not an address.
+  //
+  // ADDRESS-HIJACK FIX: this used to fire on nothing more than "the cart is not
+  // empty", so ANY message typed while browsing with items in the cart was
+  // swallowed as a delivery address — "do you have coke" became the address and
+  // silently pushed the user into checkout. A checkoutId is minted the moment
+  // the user taps Checkout and dropped when the order completes or is cancelled,
+  // so its presence is what actually marks free text as checkout input.
   const browsingStates = ['browsing_menu', 'selecting_item', 'cart_review'];
   const isNumericQty = msg.type === 'text' && /^\d+$/.test((msg.text || '').trim()) && parseInt(msg.text, 10) >= 1 && parseInt(msg.text, 10) <= 20;
-  if (msg.type === 'text' && !id && session.cart && session.cart.length > 0 && !isNumericQty) {
-    // tempAddress not yet set → user is typing their address
-    if (!session.tempAddress && browsingStates.includes(session.state)) {
-      return 'checkout_address';
-    }
-    // tempAddress already set → user is typing delivery instructions
-    if (session.tempAddress && browsingStates.includes(session.state)) {
-      return 'checkout_delivery_notes';
-    }
+  if (
+    msg.type === 'text' && !id && !isNumericQty &&
+    session.checkoutId && session.cart && session.cart.length > 0 &&
+    browsingStates.includes(session.state)
+  ) {
+    // tempAddress set → user is typing delivery instructions; else the address.
+    return session.tempAddress ? 'checkout_delivery_notes' : 'checkout_address';
   }
 
   return null;
@@ -171,6 +207,15 @@ function isGlobalCommand(msg) {
 async function handleGlobalCommand(phone, msg, session, env) {
   const t  = (msg.text || '').toUpperCase().trim();
   const id = msg.id || '';
+
+  // WRONG-ITEM FIX: every global command except HELP navigates away from the
+  // cart-line edit flow, so a pending "change this line" target must not
+  // survive it — otherwise the next quantity the user picks, for whatever item
+  // they browse to, still lands on the abandoned cart line.
+  if (t !== 'HELP' && id !== 'cmd_help') {
+    delete session.cartQtyEdit;
+    delete session.tempCartIdx;
+  }
 
   if (t === 'EXIT' || t === 'EXIT USER MODE' || id === 'exit_user_mode') {
     if (session.adminUserMode) {
@@ -280,6 +325,11 @@ function isStrayText(msg) {
 }
 
 async function handleBrowsingMenu(phone, msg, session, env) {
+  // Category pagination: catpage_(next|prev)_{page}
+  if (msg.type === 'list_reply' && msg.id?.startsWith('catpage_')) {
+    return showMenuCategories(phone, session, env, parseInt(msg.id.split('_')[2], 10));
+  }
+
   // BUG-16 FIX: removed dead `cmd_checkout` branch — no button with that ID exists
   if (msg.type === 'list_reply' && msg.id?.startsWith('cat_')) {
     const categoryId = parseInt(msg.id.replace('cat_', ''), 10);
@@ -320,13 +370,20 @@ async function handleSelectingItem(phone, msg, session, env) {
 }
 
 async function handleItemDetail(phone, msg, session, env) {
-  // Recover item ID from button ID if KV is stale (btn format: qty_1_{itemId})
+  // The item ID embedded in the button (qty_1_{itemId} / qty_custom_{itemId})
+  // is ground truth and ALWAYS wins.
+  //
+  // WRONG-ITEM FIX: this used to adopt the embedded id only when tempItemId was
+  // empty, so a stale KV read — Workers KV is eventually consistent — silently
+  // added the previously viewed item instead of the one the user just tapped.
   const id = msg.id || '';
   if (id.startsWith('qty_1_') || id.startsWith('qty_custom_')) {
     const parts = id.split('_');
     const embeddedId = parseInt(parts[parts.length - 1], 10);
-    if (!isNaN(embeddedId) && !session.tempItemId) {
+    if (!isNaN(embeddedId)) {
       session.tempItemId = embeddedId;
+      delete session.cartQtyEdit;
+      delete session.tempCartIdx;
     }
   }
 
@@ -337,13 +394,16 @@ async function handleItemDetail(phone, msg, session, env) {
 
   // Custom quantity: UX-07 — send a List of quantities 1–10 (still accept text).
   if (id.startsWith('qty_custom_')) {
+    // No item to attach a quantity to (garbled id + empty session): bail
+    // instead of rendering a list whose rows name no item.
+    if (!session.tempItemId) return lostQuantityTarget(phone, session, env);
     session.state = 'entering_quantity';
     await saveSession(phone, session, env);
     return sendList(
       phone,
       '🔢 How many would you like?\n\nPick a quantity, or type any number (1–20):',
       'Choose Qty',
-      quantityListSections(),
+      quantityListSections({ itemId: session.tempItemId }),
       env
     );
   }
@@ -376,10 +436,39 @@ async function handleItemDetail(phone, msg, session, env) {
 }
 
 async function handleEnteringQuantity(phone, msg, session, env) {
-  // Button/list qty selection (qty_1..qty_10 from UX-07, plus legacy qty_N)
-  if (msg.id?.startsWith('qty_') && /^qty_\d+$/.test(msg.id)) {
-    const picked = parseInt(msg.id.replace('qty_', ''), 10);
+  const id = msg.id || '';
+
+  // Cart-line edit: cartqty_{n}_{idx}_{itemId}. The row names the line it
+  // targets, so an abandoned or stale edit can never hit a different line.
+  const edit = /^cartqty_(\d+)_(\d+)_(\d+)$/.exec(id);
+  if (edit) {
+    const idx  = parseInt(edit[2], 10);
+    const line = session.cart[idx];
+    // EDGE-05: cart mutated since the list was rendered — drop the stale target.
+    if (!line || line.itemId !== parseInt(edit[3], 10)) {
+      session.state = 'cart_review';
+      delete session.tempCartIdx;
+      delete session.cartQtyEdit;
+      await saveSession(phone, session, env);
+      return showCart(phone, session, env);
+    }
+    session.tempCartIdx = idx;
+    session.cartQtyEdit = true;
+    return updateCartQty(phone, session, parseInt(edit[1], 10), env);
+  }
+
+  // Add to cart: qty_{n}_{itemId}, or a legacy qty_{n} row rendered before ids
+  // carried their target (an in-flight list at deploy time).
+  const pick = /^qty_(\d+)(?:_(\d+))?$/.exec(id);
+  if (pick) {
+    const picked = parseInt(pick[1], 10);
     if (picked >= 1 && picked <= 20) {
+      if (pick[2]) {
+        session.tempItemId = parseInt(pick[2], 10);
+        delete session.cartQtyEdit;
+        delete session.tempCartIdx;
+        return addItemToCartAndConfirm(phone, session, picked, env);
+      }
       if (session.cartQtyEdit) return updateCartQty(phone, session, picked, env);
       return addItemToCartAndConfirm(phone, session, picked, env);
     }
@@ -388,11 +477,15 @@ async function handleEnteringQuantity(phone, msg, session, env) {
   // Text-based qty (EDGE-03: shared parse + shared warning copy)
   const qty = parseQuantity(msg.text);
   if (qty === null) {
+    const target = qtyTargetFromSession(session);
+    // Every row must name its target; with nothing to name, re-prompting would
+    // hand back rows we can't parse on the way in — an unbreakable loop.
+    if (target.itemId == null) return lostQuantityTarget(phone, session, env);
     return sendList(
       phone,
       `${QTY_ERROR}, or pick one below:`,
       'Choose Qty',
-      quantityListSections(),
+      quantityListSections(target),
       env
     );
   }
@@ -413,7 +506,11 @@ async function updateCartQty(phone, session, qty, env) {
     return sendText(phone, `✅ Updated *${name}* quantity to ${qty}.`, env)
       .then(() => showCart(phone, session, env));
   }
+  // Target line is gone — drop the edit intent rather than leaving it armed
+  // for the user's next quantity pick.
   session.state = 'cart_review';
+  delete session.tempCartIdx;
+  delete session.cartQtyEdit;
   await saveSession(phone, session, env);
   return showCart(phone, session, env);
 }
@@ -465,30 +562,7 @@ async function handleCartReview(phone, msg, session, env) {
   if (msg.id === 'btn_keep_shopping') return showMenuCategories(phone, session, env);
   
   if (msg.id === 'btn_manage_cart') {
-    if (!session.cart.length) return showCart(phone, session, env);
-    session.state = 'cart_manage';
-    await saveSession(phone, session, env);
-    
-    // EDGE-05: embed the itemId in the row id so a stale list (cart mutated
-    // since render) is detected before we mutate the wrong line.
-    const rows = session.cart.map((item, idx) => ({
-      id: `cart_idx_${idx}_${item.itemId}`,
-      title: `${item.name} (x${item.qty})`,
-      description: `Notes: ${item.notes || 'None'}`
-    }));
-    rows.push({
-      id: 'cart_clear_all',
-      title: '🧹 Clear Cart',
-      description: 'Remove all items from cart'
-    });
-
-    return sendList(
-      phone,
-      '✏️ *Manage Cart*\nSelect an item to change or remove:',
-      'Manage Items',
-      [{ title: 'Your Items', rows }],
-      env
-    );
+    return showCartManage(phone, session, env);
   }
 
   if (msg.id === 'btn_clear_cart') {
@@ -509,6 +583,11 @@ async function handleCartReview(phone, msg, session, env) {
 }
 
 async function handleCartManage(phone, msg, session, env) {
+  // Manage Cart pagination: cartpage_(next|prev)_{page}
+  if (msg.type === 'list_reply' && msg.id?.startsWith('cartpage_')) {
+    return showCartManage(phone, session, env, parseInt(msg.id.split('_')[2], 10));
+  }
+
   if (msg.type === 'list_reply' && msg.id === 'cart_clear_all') {
     session.state = 'confirm_cancel';
     session.confirmCancelType = 'cart_clear';
@@ -601,7 +680,7 @@ async function handleCartItemEdit(phone, msg, session, env) {
       phone,
       `🔢 New quantity for *${session.cart[idx].name}*?\n\nPick one, or type a number (1–20):`,
       'Choose Qty',
-      quantityListSections(),
+      quantityListSections({ cartIdx: idx, itemId: session.cart[idx].itemId }),
       env
     );
   }
@@ -1277,7 +1356,7 @@ async function showWelcome(phone, env) {
   );
 }
 
-async function showMenuCategories(phone, session, env) {
+async function showMenuCategories(phone, session, env, page = 0) {
   const menu = await getMenuCached(env);
 
   // BUG-07 FIX: empty category list would cause the WhatsApp API to reject
@@ -1286,18 +1365,17 @@ async function showMenuCategories(phone, session, env) {
     return sendText(phone, '📭 Our menu is being set up. Check back soon!', env);
   }
 
-  const rows = menu.categories.map(cat => ({
-    id:          `cat_${cat.id}`,
-    title:       cat.name,
-    description: `${(menu.itemsByCategory[cat.id] || []).length} items`,
-  }));
+  const { rows, totalPages, page: safePage } =
+    buildCategoryListRows(menu.categories, menu.itemsByCategory, page);
 
   session.state = 'browsing_menu';
   await saveSession(phone, session, env);
 
+  const pageLabel = totalPages > 1 ? ` — Page ${safePage + 1}/${totalPages}` : '';
+
   return sendList(
     phone,
-    '🗂️ Choose a *category* to browse:',
+    `🗂️ Choose a *category* to browse:${pageLabel}`,
     'Browse Menu',
     [{ title: 'Menu Categories', rows }],
     env
@@ -1348,6 +1426,83 @@ export function buildMenuListRows(items, categoryId, page = 0) {
   return { rows, totalPages, page: safePage };
 }
 
+// The category list hits the SAME silent 10-row cap as the item list. It was
+// unpaginated, so a menu with more than 10 categories simply lost the tail —
+// those categories were unreachable, with nothing on screen to say so. Only
+// Previous/Next can appear here (there is no parent list to escape to), so we
+// reserve two slots and show at most 8 categories per page.
+const CATS_PER_PAGE = LIST_MAX_ROWS - 2; // 8
+
+export function buildCategoryListRows(categories, itemsByCategory, page = 0) {
+  const totalPages = Math.max(1, Math.ceil(categories.length / CATS_PER_PAGE));
+  const safePage   = Math.min(Math.max(page | 0, 0), totalPages - 1);
+  const pageCats   = categories.slice(safePage * CATS_PER_PAGE, (safePage + 1) * CATS_PER_PAGE);
+
+  const rows = pageCats.map(cat => ({
+    id:          `cat_${cat.id}`,
+    title:       cat.name.slice(0, 24),
+    description: `${(itemsByCategory[cat.id] || []).length} items`,
+  }));
+
+  if (safePage > 0) {
+    rows.push({ id: `catpage_prev_${safePage - 1}`, title: '⬅️ Previous', description: `Back to page ${safePage} of ${totalPages}` });
+  }
+  if (safePage < totalPages - 1) {
+    rows.push({ id: `catpage_next_${safePage + 1}`, title: '➡️ Next', description: `Go to page ${safePage + 2} of ${totalPages}` });
+  }
+
+  return { rows, totalPages, page: safePage };
+}
+
+// Manage Cart was likewise unpaginated: one row per cart line plus a Clear Cart
+// row. At 10 lines the Clear Cart row fell off the end; past that, the trailing
+// items could not be edited or removed at all. Same nav budget as the item list
+// (Previous + Next + Clear Cart).
+const CART_LINES_PER_PAGE = LIST_MAX_ROWS - MAX_NAV_ROWS; // 7
+
+export function buildCartManageRows(cart, page = 0) {
+  const totalPages = Math.max(1, Math.ceil(cart.length / CART_LINES_PER_PAGE));
+  const safePage   = Math.min(Math.max(page | 0, 0), totalPages - 1);
+  const start      = safePage * CART_LINES_PER_PAGE;
+
+  // EDGE-05: the row id carries the ABSOLUTE cart index plus the itemId, so a
+  // stale list (cart mutated since render) is caught before we mutate a line.
+  const rows = cart.slice(start, start + CART_LINES_PER_PAGE).map((item, i) => ({
+    id:          `cart_idx_${start + i}_${item.itemId}`,
+    title:       `${item.name} (x${item.qty})`,
+    description: `Notes: ${item.notes || 'None'}`,
+  }));
+
+  if (safePage > 0) {
+    rows.push({ id: `cartpage_prev_${safePage - 1}`, title: '⬅️ Previous', description: `Back to page ${safePage} of ${totalPages}` });
+  }
+  if (safePage < totalPages - 1) {
+    rows.push({ id: `cartpage_next_${safePage + 1}`, title: '➡️ Next', description: `Go to page ${safePage + 2} of ${totalPages}` });
+  }
+  rows.push({ id: 'cart_clear_all', title: '🧹 Clear Cart', description: 'Remove all items from cart' });
+
+  return { rows, totalPages, page: safePage };
+}
+
+// Render one page of the Manage Cart list.
+async function showCartManage(phone, session, env, page = 0) {
+  if (!session.cart.length) return showCart(phone, session, env);
+
+  session.state = 'cart_manage';
+  await saveSession(phone, session, env);
+
+  const { rows, totalPages, page: safePage } = buildCartManageRows(session.cart, page);
+  const pageLabel = totalPages > 1 ? ` — Page ${safePage + 1}/${totalPages}` : '';
+
+  return sendList(
+    phone,
+    `✏️ *Manage Cart*${pageLabel}\nSelect an item to change or remove:`,
+    'Manage Items',
+    [{ title: 'Your Items', rows }],
+    env
+  );
+}
+
 async function showItemsForCategory(phone, categoryId, categoryName, session, env, page = 0) {
   const menu  = await getMenuCached(env);
   const items = menu.itemsByCategory[categoryId] || [];
@@ -1394,6 +1549,11 @@ async function showItemDetail(phone, itemId, session, env) {
 
   session.tempItemId = item.id;
   session.state      = 'item_detail';
+  // WRONG-ITEM FIX: opening a menu item ends any pending cart-line edit. A
+  // "change qty for cart line N" intent left over from Manage Cart must never
+  // be applied to the quantity the user picks for THIS item.
+  delete session.cartQtyEdit;
+  delete session.tempCartIdx;
   await saveSession(phone, session, env);
 
   const buttons = [
@@ -1728,24 +1888,29 @@ async function reorder(phone, session, orderId, env) {
     return showOrderHistory(phone, session, env);
   }
 
-  const cart = [];
+  // REORDER-WIPE FIX: merge into the live cart instead of replacing it. This
+  // used to assign session.cart outright, silently discarding whatever the user
+  // had already added — while the message claimed the items were "added".
+  // addToCart merges by itemId+notes, so repeats bump the quantity.
   const skipped = [];
+  let added = 0;
   for (const oi of order.items) {
     const item = await getAvailableMenuItem(oi.menu_item_id, env);
     if (!item) {
       skipped.push(oi.name);
       continue;
     }
-    addToCart(cart, {
+    addToCart(session.cart, {
       itemId:    item.id,
       name:      item.name,
       qty:       oi.quantity,
       unitPrice: item.price, // re-price live
       notes:     oi.notes || '',
     });
+    added += 1;
   }
 
-  if (!cart.length) {
+  if (!added) {
     await sendText(
       phone,
       '⚠️ None of the items from that order are available right now.',
@@ -1754,7 +1919,6 @@ async function reorder(phone, session, orderId, env) {
     return showMenuCategories(phone, session, env);
   }
 
-  session.cart  = cart;
   session.state = 'cart_review';
   await saveSession(phone, session, env);
 
