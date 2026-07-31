@@ -41,16 +41,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # tests/ may be empty on a fresh checkout (the test suite lands
-      # in a sibling change). Skip gracefully rather than fail CI when
-      # there is nothing to run yet.
+      # Run the suite through npm so package.json stays the single source of
+      # truth for the glob. The previous inline guard looked for tests/*.test.js
+      # while every test file is .test.mjs, so it always fell through to
+      # "skipping" — the deploy job below was gated on a job that never ran a
+      # single test.
       - name: Run tests
-        run: |
-          if ls tests/*.test.js >/dev/null 2>&1 || ls tests/**/*.test.js >/dev/null 2>&1; then
-            node --test tests/
-          else
-            echo "No test files found under tests/ — skipping."
-          fi
+        run: npm test
 
       # Dry-run build: validates wrangler.toml + bundles the Worker into
       # dist/ without deploying. No Cloudflare credentials required.
