@@ -3,6 +3,8 @@
 # ============================================================
 
 name               = "whatsapp-food-bot"
+# Pinned so deploys don't need to list memberships (the CI token can't).
+account_id         = "ce6ba1de4efa7a193f9ac480e0774ddc"
 main               = "src/index.js"
 compatibility_date = "2024-09-23"
 # nodejs_compat intentionally removed — codebase uses zero Node APIs.
