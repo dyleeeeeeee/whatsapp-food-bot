@@ -10,6 +10,7 @@ import { verifyFlutterwaveWebhookSignature, verifyFlutterwaveTransaction } from 
 import { getOrderByReference, updateOrderPayment, markOrderPaidAtomic, persistTransactionId, logRefund } from '../db.js';
 import { sendText } from '../whatsapp.js';
 import { alertAdmin } from '../lib/alert.js';
+import { notifyAdminsNewOrder } from '../handlers/admin.js';
 
 export async function handleFlutterwaveWebhook(request, env, ctx) {
   const signature = request.headers.get('verif-hash');
@@ -153,6 +154,9 @@ async function processPaymentSuccess(txRef, amount, status, txId, env) {
     } catch (err) {
       console.error(`[Flutterwave] Failed to persist transaction id for order #${order.id}:`, err);
     }
+
+    // 5c. Ping admins so they can confirm the order (never throws).
+    await notifyAdminsNewOrder(order.id, env);
 
     // 6. Notify customer — only on the delivery that actually changed the row.
     await sendText(

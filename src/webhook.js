@@ -60,6 +60,12 @@ export async function handleWebhookPost(body, env) {
     // observe earlier ones' state changes within a single webhook delivery.
     const sessions = new Map(); // from -> session object (shared across batch)
 
+    // WhatsApp sends the sender's profile name alongside the messages; keep
+    // it on the session so placeOrder can record who ordered.
+    const profileNames = new Map(
+      (value.contacts || []).map(c => [c.wa_id, c.profile?.name])
+    );
+
     for (const message of messages) {
       const from = message.from;
       let preSession = null;
@@ -68,6 +74,8 @@ export async function handleWebhookPost(body, env) {
           sessions.set(from, await getSession(from, env));
         }
         preSession = sessions.get(from);
+        const profileName = profileNames.get(from);
+        if (profileName) preSession.profileName = profileName;
       }
       // Isolate each message: a thrown (poison) message deletes its own dedup
       // key and re-throws so a re-delivery can retry it — but it must NOT abort

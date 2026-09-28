@@ -657,6 +657,28 @@ export async function getCustomerAddress(phone, env) {
   return env.SESSION_KV.get('addr:' + phone);
 }
 
+// WhatsApp profile name, saved at order placement so admins can see who
+// ordered. Same KV + TTL as the saved address; purely informational, so
+// both calls swallow errors rather than break checkout or the admin view.
+export async function saveCustomerName(phone, name, env) {
+  try {
+    await env.SESSION_KV.put('name:' + phone, name, {
+      expirationTtl: ADDRESS_TTL_SECONDS,
+    });
+  } catch (err) {
+    console.error('[DB] saveCustomerName failed:', err);
+  }
+}
+
+export async function getCustomerName(phone, env) {
+  try {
+    return await env.SESSION_KV.get('name:' + phone);
+  } catch (err) {
+    console.error('[DB] getCustomerName failed:', err);
+    return null;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Bulk Actions
 // ─────────────────────────────────────────────────────────────
@@ -813,7 +835,7 @@ export async function getMenuItemsPaginated(env, limit = 8, offset = 0) {
 
 export async function getActiveOrdersPaginated(env, limit = 8, offset = 0) {
   const result = await env.DB.prepare(
-    `SELECT id, user_phone, total_price, status, payment_status, created_at
+    `SELECT id, user_phone, total_price, status, payment_status, address, created_at
      FROM Orders
      WHERE status IN ('pending','confirmed','preparing','ready')
      ORDER BY created_at ASC LIMIT ? OFFSET ?`

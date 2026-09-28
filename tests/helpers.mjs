@@ -46,7 +46,8 @@ export function makeKV(initial = {}) {
 export function makeD1(seed = {}) {
   const db = {
     orders: seed.orders ? seed.orders.map(o => ({ ...o })) : [],
-    orderItems: [],
+    orderItems: seed.orderItems ? seed.orderItems.map(i => ({ ...i })) : [],
+    admins: seed.admins || [],
     _nextId: seed.nextId || 1,
     // capture of statements run (for assertions)
     log: [],
@@ -155,6 +156,30 @@ export function makeD1(seed = {}) {
       const [ref] = p;
       const o = db.orders.find(x => x.payment_reference === ref);
       return { _first: o || null };
+    }
+
+    // getOrder: order row by id, then its items
+    if (/^SELECT id, user_phone, total_price/i.test(sql) && /FROM Orders WHERE id = \?/i.test(sql)) {
+      const [id] = p;
+      const o = db.orders.find(x => x.id === id);
+      return { _first: o ? { ...o } : null };
+    }
+    if (/FROM OrderItems WHERE order_id = \?/i.test(sql)) {
+      const [orderId] = p;
+      return { results: db.orderItems.filter(i => i.order_id === orderId) };
+    }
+
+    // getActiveOrdersPaginated: page of active orders + total count
+    if (/FROM Orders WHERE status IN \('pending','confirmed','preparing','ready'\)/i.test(sql)) {
+      const active = db.orders.filter(o => ['pending', 'confirmed', 'preparing', 'ready'].includes(o.status));
+      if (/^SELECT COUNT\(\*\) as total/i.test(sql)) return { _first: { total: active.length } };
+      const [limit, offset] = p;
+      return { results: active.slice(offset, offset + limit).map(o => ({ ...o })) };
+    }
+
+    // getAdminPhones
+    if (/^SELECT phone_number FROM AdminUsers/i.test(sql)) {
+      return { results: db.admins.map(phone_number => ({ phone_number })) };
     }
 
     throw new Error(`mock D1: unhandled SQL: ${sql}`);

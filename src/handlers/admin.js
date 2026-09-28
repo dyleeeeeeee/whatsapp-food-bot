@@ -49,7 +49,7 @@ import {
   bulkCreateCategories, bulkDeleteCategoriesWithItems,
   moveAllItemsFromCategory, bulkMoveItemsToCategory,
   getItemCountsByCategory,
-  logRefund, getStats,
+  logRefund, getStats, getAdminPhones, getCustomerName,
 } from '../db.js';
 import { sanitize, isValidHttpsUrl } from '../security.js';
 import { alertAdmin } from '../lib/alert.js';
@@ -1522,6 +1522,78 @@ async function handleToggleItemSelect(phone, msg, session, env) {
 // total never exceeds WhatsApp's 10-row cap (no orders are silently lost).
 const ORDERS_PAGE_SIZE = 8;
 
+/**
+ * Build the order summary an admin needs before changing its status:
+ * who ordered, where to deliver, what they ordered, and payment state.
+ * Takes the object returned by getOrder() (order row + items[]).
+ */
+export function formatOrderDetails(order) {
+  const items = order.items || [];
+  const itemLines = items.length
+    ? items.map(i => {
+        const line = `• ${i.name} ×${i.quantity} — ${formatPrice(i.unit_price * i.quantity)}`;
+        return i.notes ? `${line}\n   _${i.notes}_` : line;
+      }).join('\n')
+    : '• (no items recorded)';
+
+  const who = order.customer_name
+    ? `${order.customer_name} (+${order.user_phone})`
+    : `+${order.user_phone}`;
+  const lines = [
+    `🧾 *Order #${order.id}* — ${order.status.toUpperCase()}`,
+    '',
+    `📱 *Customer:* ${who}`,
+    `📍 *Address:* ${order.address || '(none given)'}`,
+  ];
+  if (order.notes) lines.push(`📝 *Notes:* ${order.notes}`);
+  lines.push(
+    '',
+    '*Items:*',
+    itemLines,
+    '',
+    `💰 *Total:* ${formatPrice(order.total_price)}`,
+    `💳 *Payment:* ${order.payment_status.toUpperCase()}`,
+    `🕒 *Placed:* ${order.created_at} UTC`,
+  );
+  return lines.join('\n');
+}
+
+// getOrder() plus the customer's saved WhatsApp name, for admin display.
+async function getOrderForAdmin(orderId, env) {
+  const order = await getOrder(orderId, env);
+  if (order) order.customer_name = await getCustomerName(order.user_phone, env);
+  return order;
+}
+
+/**
+ * Tell every admin that an order has just been paid, with its full details
+ * and a shortcut to the status picker. Called only by the request that
+ * actually flipped the order to paid, so admins get one ping per order.
+ * Best-effort: never throws, so it can't disturb the payment path.
+ */
+export async function notifyAdminsNewOrder(orderId, env) {
+  try {
+    const order = await getOrderForAdmin(orderId, env);
+    if (!order) return;
+    const details = `🔔 *New paid order!*\n\n${formatOrderDetails(order)}`;
+    for (const admin of await getAdminPhones(env)) {
+      try {
+        await sendText(admin, details, env);
+        await sendButtons(
+          admin,
+          `Confirm order #${order.id} when you're ready.`,
+          [{ id: 'admin_update_status', title: '📦 Update Status' }],
+          env
+        );
+      } catch (err) {
+        console.error('[Admin] new-order ping failed for', String(admin).slice(-4), err);
+      }
+    }
+  } catch (err) {
+    console.error(`[Admin] notifyAdminsNewOrder failed for order #${orderId}:`, err);
+  }
+}
+
 async function viewOrders(phone, session, env) {
   const page   = Math.max(0, session.adminCtx.ordersPage || 0);
   const offset = page * ORDERS_PAGE_SIZE;
@@ -1591,7 +1663,7 @@ async function handleAdminOrdersList(phone, msg, session, env) {
 
   if (msg.type === 'list_reply' && msg.id?.startsWith('astat_')) {
     const orderId = parseInt(msg.id.replace('astat_', ''), 10);
-    const order = await getOrder(orderId, env);
+    const order = await getOrderForAdmin(orderId, env);
     if (!order) return viewOrders(phone, session, env);
 
     session.adminCtx.updateOrderId = orderId;
@@ -1601,6 +1673,7 @@ async function handleAdminOrdersList(phone, msg, session, env) {
     session.state = 'admin_update_status_value';
     await saveSession(phone, session, env);
 
+    await sendText(phone, formatOrderDetails(order), env);
     const rows = VALID_STATUSES.map(s => ({ id: `status_${s}`, title: s.toUpperCase() }));
     return sendList(
       phone,
@@ -1669,7 +1742,7 @@ async function handleUpdateStatusId(phone, msg, session, env) {
     );
   }
 
-  const order = await getOrder(orderId, env);
+  const order = await getOrderForAdmin(orderId, env);
   if (!order) {
     return sendText(phone, `⚠️ Order #${orderId} not found.`, env);
   }
@@ -1681,6 +1754,7 @@ async function handleUpdateStatusId(phone, msg, session, env) {
   session.state = 'admin_update_status_value';
   await saveSession(phone, session, env);
 
+  await sendText(phone, formatOrderDetails(order), env);
   const rows = VALID_STATUSES.map(s => ({ id: `status_${s}`, title: s.toUpperCase() }));
   return sendList(
     phone,

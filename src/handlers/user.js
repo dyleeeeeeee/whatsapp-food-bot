@@ -33,7 +33,7 @@ import {
 import {
   getFullMenu, getMenuItem, getAvailableMenuItem, createOrder, getUserOrders, getOrder,
   updateOrderPayment, markOrderPaidAtomic, getOrderByReference, persistTransactionId,
-  saveCustomerAddress, getCustomerAddress,
+  saveCustomerAddress, getCustomerAddress, saveCustomerName,
 } from '../db.js';
 import { initializeFlutterwaveTransaction } from '../payments/flutterwave.js';
 import { sanitize, hasMinAlphaNum } from '../security.js';
@@ -1162,6 +1162,9 @@ async function placeOrder(phone, session, env) {
     if (placedAddress) {
       await saveCustomerAddress(phone, placedAddress, env);
     }
+    if (session.profileName) {
+      await saveCustomerName(phone, session.profileName, env);
+    }
 
     // Order is committed. Clear cart + checkout id so the next order is fresh,
     // and so a future Place Order can't re-collide on this reference.
@@ -1714,6 +1717,10 @@ async function recoverPaymentIfNeeded(order, env) {
       const { changed } = await markOrderPaidAtomic(order.id, new Date().toISOString(), env);
       if (changed && data.id != null) {
         await persistTransactionId(order.id, data.id, env).catch(() => {});
+      }
+      if (changed) {
+        const { notifyAdminsNewOrder } = await import('./admin.js');
+        await notifyAdminsNewOrder(order.id, env);
       }
       order.payment_status = 'paid';
     }

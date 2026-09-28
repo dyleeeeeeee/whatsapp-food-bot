@@ -229,3 +229,39 @@ test('currency other than NGN is not confirmed', async () => {
   assert.equal(summary.confirmed, 0);
   assert.equal(env.DB.orders[0].payment_status, 'pending');
 });
+
+test('a reconciled payment pings each admin once; a re-run does not re-ping', async () => {
+  const env = baseEnv([{
+    id: 1,
+    user_phone: '2348000000010',
+    total_price: 6500,
+    status: 'pending',
+    address: '5 Broad St',
+    notes: '',
+    payment_status: 'pending',
+    payment_reference: 'ref-ok',
+    paid_at: null,
+    created_at: '2026-09-28 10:00:00',
+  }]);
+  env.DB.admins.push('2340000000001');
+
+  const sent = [];
+  const route = fetchRouter({
+    'ref-ok': { id: 555, status: 'successful', amount: 6500, currency: 'NGN', tx_ref: 'ref-ok' },
+  });
+  const restore = installFetch((url, opts) => {
+    if (url.includes('/messages')) sent.push(JSON.parse(opts.body));
+    return route(url);
+  });
+  try {
+    await reconcilePendingPayments(env);
+    await reconcilePendingPayments(env);
+  } finally {
+    restore();
+  }
+
+  const pings = sent.filter(m => m.to === '2340000000001' && m.type === 'text');
+  assert.equal(pings.length, 1, 'exactly one new-order ping');
+  assert.ok(pings[0].text.body.includes('Order #1'));
+  assert.ok(pings[0].text.body.includes('5 Broad St'));
+});

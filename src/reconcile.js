@@ -22,6 +22,7 @@ import { markOrderPaidAtomic } from './db.js';
 import { verifyFlutterwaveTransaction } from './payments/flutterwave.js';
 import { alertAdmin } from './lib/alert.js';
 import { sendText } from './whatsapp.js';
+import { notifyAdminsNewOrder } from './handlers/admin.js';
 
 const PENDING_SCAN_LIMIT = 50;
 // Amount tolerance in NGN — matches the webhook handler's float comparison.
@@ -84,6 +85,7 @@ export async function reconcilePendingPayments(env) {
           } catch (notifyErr) {
             console.error(`[Reconcile] notify failed for order #${order.id}:`, notifyErr);
           }
+          await notifyAdminsNewOrder(order.id, env);
         }
         continue;
       }
