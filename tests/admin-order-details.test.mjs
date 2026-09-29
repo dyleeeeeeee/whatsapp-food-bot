@@ -164,7 +164,7 @@ test('notifyAdminsNewOrder sends each admin the details and an Update Status but
       assert.ok(body.includes(needle), `ping includes "${needle}"`);
     }
     const btn = mine[1].interactive.action.buttons[0].reply;
-    assert.equal(btn.id, 'admin_update_status');
+    assert.deepEqual(mine[1].interactive.action.buttons.map(b => b.reply.id), ['nstat_7_confirmed', 'astat_7'], 'Confirm first, then open the order');
   }
   assert.equal(sent.filter(m => m.to === ORDER.user_phone).length, 0, 'customer not messaged');
 });

@@ -823,29 +823,45 @@ export async function getItemCountsByCategory(env) {
   return map;
 }
 
-export async function getMenuItemsPaginated(env, limit = 8, offset = 0) {
+// `query` (optional) narrows to items whose name contains it, case-insensitive.
+export async function getMenuItemsPaginated(env, limit = 8, offset = 0, query = '') {
+  const where = query ? 'WHERE instr(lower(name), lower(?)) > 0' : '';
+  const args  = query ? [query] : [];
   const result = await env.DB.prepare(
-    `SELECT id, name, price, is_available FROM MenuItems ORDER BY name LIMIT ? OFFSET ?`
-  ).bind(limit, offset).all();
-  
-  const count = await env.DB.prepare(`SELECT COUNT(*) as total FROM MenuItems`).first('total');
-  
+    `SELECT id, name, price, is_available FROM MenuItems ${where} ORDER BY name LIMIT ? OFFSET ?`
+  ).bind(...args, limit, offset).all();
+
+  const count = await env.DB.prepare(
+    `SELECT COUNT(*) as total FROM MenuItems ${where}`
+  ).bind(...args).first('total');
+
   return { items: result.results, total: count };
 }
 
-export async function getActiveOrdersPaginated(env, limit = 8, offset = 0) {
+// Active = not yet delivered or cancelled. With paidOnly, unpaid orders are
+// left out (nothing to fulfil) and counted in `unpaidHidden` instead.
+export async function getActiveOrdersPaginated(env, limit = 8, offset = 0, { paidOnly = false } = {}) {
+  const active = `status IN ('pending','confirmed','preparing','ready')`;
+  const where  = paidOnly ? `${active} AND payment_status = 'paid'` : active;
   const result = await env.DB.prepare(
     `SELECT id, user_phone, total_price, status, payment_status, address, created_at
      FROM Orders
-     WHERE status IN ('pending','confirmed','preparing','ready')
+     WHERE ${where}
      ORDER BY created_at ASC LIMIT ? OFFSET ?`
   ).bind(limit, offset).all();
 
   const count = await env.DB.prepare(
-    `SELECT COUNT(*) as total FROM Orders WHERE status IN ('pending','confirmed','preparing','ready')`
+    `SELECT COUNT(*) as total FROM Orders WHERE ${where}`
   ).first('total');
 
-  return { orders: result.results, total: count };
+  let unpaidHidden = 0;
+  if (paidOnly) {
+    unpaidHidden = await env.DB.prepare(
+      `SELECT COUNT(*) as total FROM Orders WHERE ${active} AND payment_status != 'paid'`
+    ).first('total');
+  }
+
+  return { orders: result.results, total: count, unpaidHidden };
 }
 
 // ─────────────────────────────────────────────────────────────

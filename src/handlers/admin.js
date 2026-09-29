@@ -38,7 +38,7 @@ import {
   getSession, saveSession, bustMenuCache, formatPrice, parsePrice, MAX_PRICE, CURRENCY_SYMBOL,
 } from '../session.js';
 import {
-  getAllMenuItems, getMenuItem, getCategories, getFullMenu,
+  getAllMenuItems, getMenuItem, getCategories,
   createMenuItem, updateMenuItem, deleteMenuItem,
   getOrder, updateOrderStatus,
   bulkUpdateOrderStatus, bulkUpdateMenuAvailability,
@@ -73,6 +73,30 @@ function isAllowedTransition(current, next) {
   // Unknown current status — be permissive rather than strand the admin.
   if (!allowed) return true;
   return allowed.includes(next);
+}
+
+// Labels for the status picker (list rows allow 24-char titles) and the
+// one-tap next-step buttons (reply buttons allow 20).
+const STATUS_INFO = {
+  pending:   { row: '⏳ Pending',         desc: 'Waiting to be accepted',              button: '⏳ Pending'   },
+  confirmed: { row: '✅ Confirmed',       desc: 'Accept the order',                    button: '✅ Confirm'   },
+  preparing: { row: '👨‍🍳 Preparing',       desc: 'Food is being made',                  button: '👨‍🍳 Preparing' },
+  ready:     { row: '🛵 Ready / On its way', desc: 'Customer is told it is on its way', button: '🛵 Ready'     },
+  delivered: { row: '🎉 Delivered',       desc: 'Order complete',                      button: '🎉 Delivered' },
+  cancelled: { row: '❌ Cancelled',       desc: 'Cancel it (paid orders get refunded)', button: '❌ Cancel'    },
+};
+
+// The usual next step for an order, offered as a one-tap button.
+const NEXT_STATUS = { pending: 'confirmed', confirmed: 'preparing', preparing: 'ready', ready: 'delivered' };
+
+// Statuses an admin may move an order to. An unpaid order has nothing to
+// fulfil, so the only thing to do with it is cancel it.
+function statusChoices(current, paymentStatus) {
+  return VALID_STATUSES.filter(s =>
+    s !== current &&
+    isAllowedTransition(current, s) &&
+    (paymentStatus === 'paid' || s === 'cancelled')
+  );
 }
 
 // GAP (admin selectedIds race): bulk selections live under their OWN KV key —
@@ -263,6 +287,26 @@ export async function handleAdminMessage(phone, msg, env, preSession = null) {
   if (msg.id === 'admin_bulk_menu') {
     return showBulkMenu(phone, session, env);
   }
+
+  // Order buttons in alerts and after status updates work from any state:
+  // astat_<id> opens the order, nstat_<id>_<status> moves it to that status.
+  if (msg.id?.startsWith('astat_')) {
+    session.state = 'admin_orders_list';
+    return handleAdminOrdersList(phone, msg, session, env);
+  }
+  const quick = /^nstat_(\d+)_([a-z]+)$/.exec(msg.id || '');
+  if (quick) {
+    const order = await getOrderForAdmin(parseInt(quick[1], 10), env);
+    if (!order) return sendAdminError(phone, `⚠️ Order #${quick[1]} not found.`, env);
+    session.adminCtx = {
+      updateOrderId:      order.id,
+      orderPhone:         order.user_phone,
+      orderCurrentStatus: order.status,
+      orderPaymentStatus: order.payment_status,
+    };
+    session.state = 'admin_update_status_value';
+    return handleUpdateStatusValue(phone, { type: 'button_reply', id: `status_${quick[2]}` }, session, env);
+  }
   if (msg.id?.startsWith('ba_os_')) {
     if (!session.adminCtx.bulk?.selectedIds) {
       session.adminCtx.bulk = { type: 'orders', selectedIds: [], page: 0 };
@@ -342,31 +386,31 @@ async function showAdminMenu(phone, env) {
     phone,
     '🔧 *Admin Panel*\nWhat would you like to manage?\n\n_Anytime: type ADMIN to return here, BACK to go back, CANCEL to abort._',
     'Admin Actions',
+    // WhatsApp shows at most 10 rows in total — keep this list at 10.
     [
       {
-        title: 'Menu Management',
+        title: 'Orders',
         rows: [
-          { id: 'admin_add_item',    title: 'Add Item',      description: 'Add a new menu item'          },
-          { id: 'admin_edit_item',   title: 'Edit Item',     description: 'Update price, name, etc.'     },
-          { id: 'admin_delete_item', title: 'Delete Item',   description: 'Remove item from menu'        },
-          { id: 'admin_add_cat',     title: 'Add Category',  description: 'Create a new menu category'   },
-          { id: 'admin_view_cats',   title: 'View Categories', description: 'List all categories'         },
-          { id: 'admin_toggle_item', title: 'Toggle Avail.', description: 'Mark item available/unavail.' },
+          { id: 'admin_update_status', title: '📦 Orders',     description: 'Paid orders to confirm & deliver' },
+          { id: 'admin_stats',       title: '📊 Stats',        description: "Today's orders & paid rate" },
         ],
       },
       {
-        title: 'Operations',
+        title: 'Menu',
         rows: [
-          { id: 'admin_view_orders',   title: 'View Orders',   description: 'See pending/active orders' },
-          { id: 'admin_update_status', title: 'Update Status', description: 'Change an order status'    },
-          { id: 'admin_bulk_menu',     title: 'Bulk Actions',  description: 'Manage multiple items/orders' },
-          { id: 'admin_stats',         title: 'Stats',         description: "Today's orders & paid rate" },
+          { id: 'admin_toggle_item', title: '🔄 In/Out of Stock', description: 'Mark an item available or not' },
+          { id: 'admin_edit_item',   title: '✏️ Edit Item',       description: 'Name, price, description…' },
+          { id: 'admin_add_item',    title: '➕ Add Item',        description: 'Add a new menu item' },
+          { id: 'admin_delete_item', title: '🗑️ Delete Item',     description: 'Remove an item from the menu' },
+          { id: 'admin_view_cats',   title: '📂 Categories',      description: 'Browse categories and items' },
+          { id: 'admin_add_cat',     title: '📁 Add Category',    description: 'Create a new menu category' },
         ],
       },
       {
-        title: 'Testing',
+        title: 'More',
         rows: [
-          { id: 'admin_user_mode',    title: '👤 User Mode',   description: 'Experience app as a customer' },
+          { id: 'admin_bulk_menu', title: '🏗️ Bulk Actions', description: 'Change many items or orders at once' },
+          { id: 'admin_user_mode', title: '👤 User Mode',    description: 'Try the bot as a customer' },
         ],
       },
     ],
@@ -389,7 +433,7 @@ async function showStats(phone, env) {
     `Paid today: *${s.paidToday}* (${pct}%)\n` +
     `Pending payment: *${s.pendingCount}*`,
     [
-      { id: 'admin_view_orders', title: '📦 View Orders' },
+      { id: 'admin_update_status', title: '📦 Orders' },
       { id: 'admin_home',        title: '🔧 Admin Menu' },
     ],
     env
@@ -525,8 +569,7 @@ async function handleBackNavigation(phone, session, env) {
 // ─────────────────────────────────────────────────────────────
 
 async function showCategoriesList(phone, session, env) {
-  const categories = await getCategories(env);
-  const menu = await getFullMenu(env);
+  const [categories, items] = await Promise.all([getCategories(env), getAllMenuItems(env)]);
 
   if (!categories.length) {
     return sendButtons(
@@ -537,11 +580,15 @@ async function showCategoriesList(phone, session, env) {
     );
   }
 
-  const rows = categories.map(cat => ({
-    id: `cat_${cat.id}`,
-    title: cat.name,
-    description: `${(menu.itemsByCategory[cat.id] || []).length} items`
-  }));
+  const rows = categories.map(cat => {
+    const inCat = items.filter(i => i.category_id === cat.id);
+    const off = inCat.filter(i => !i.is_available).length;
+    return {
+      id: `cat_${cat.id}`,
+      title: cat.name,
+      description: `${inCat.length} items` + (off ? ` · ${off} unavailable` : ''),
+    };
+  });
 
   return sendList(
     phone,
@@ -561,7 +608,6 @@ async function handleViewCategories(phone, msg, session, env) {
 
   if (msg.type === 'list_reply' && msg.id?.startsWith('cat_')) {
     const categoryId = parseInt(msg.id.replace('cat_', ''), 10);
-    const menu = await getFullMenu(env);
     const category = await env.DB.prepare(
       'SELECT id, name FROM MenuCategories WHERE id = ?'
     ).bind(categoryId).first();
@@ -570,7 +616,7 @@ async function handleViewCategories(phone, msg, session, env) {
       return showCategoriesList(phone, session, env);
     }
 
-    const items = menu.itemsByCategory[categoryId] || [];
+    const items = (await getAllMenuItems(env)).filter(i => i.category_id === categoryId);
     if (!items.length) {
       return sendButtons(
         phone,
@@ -584,18 +630,18 @@ async function handleViewCategories(phone, msg, session, env) {
     }
 
     const itemText = items.map(i =>
-      `• *${i.name}*\n  ${formatPrice(i.price)}${i.is_available ? '' : ' (unavailable)'}`
-    ).join('\n\n');
+      `• ${i.name} — ${formatPrice(i.price)}${i.is_available ? '' : ' ❌ _unavailable_'}`
+    ).join('\n');
 
+    await sendText(phone, `📂 *${category.name}* (${items.length} items)\n\n${itemText}`, env);
     return sendButtons(
       phone,
-      `📂 *${category.name}*\n\n${itemText}`,
+      'To change an item, use *In/Out of Stock* or *Edit Item* — you can type its name there to find it.',
       [
-        { id: 'admin_view_cats', title: '📂 View Categories' },
-        { id: 'admin_home', title: '🔧 Admin Menu' },
+        { id: 'admin_view_cats', title: '📂 Categories'  },
+        { id: 'admin_home',      title: '🔧 Admin Menu'  },
       ],
-      env,
-      category.name
+      env
     );
   }
 
@@ -849,7 +895,9 @@ async function showCategoryListForItem(phone, itemName, env) {
       env
     );
   }
-  const rows = cats.map(c => ({ id: `acat_${c.id}`, title: c.name }));
+  // 9 categories + "New Category" keeps within WhatsApp's 10-row limit.
+  const rows = cats.slice(0, 9).map(c => ({ id: `acat_${c.id}`, title: c.name }));
+  rows.push({ id: 'admin_add_cat', title: '➕ New Category', description: 'Create one and use it' });
   return sendList(
     phone,
     `📂 Choose a *category* for *${itemName || 'this item'}*:\n\nSend *CANCEL* to abort.`,
@@ -1039,7 +1087,7 @@ async function handleAddItemImage(phone, msg, session, env) {
 
   return sendButtons(
     phone,
-    `✅ *${item.name}* added to menu!\n💰 ₦${item.price.toFixed(2)}`,
+    `✅ *${item.name}* added to menu!\n💰 ${formatPrice(item.price)}`,
     [
       { id: 'admin_add_item',  title: '➕ Add Another Item' },
       { id: 'admin_home',      title: '🔧 Admin Menu'       },
@@ -1064,8 +1112,16 @@ async function showItemPicker(phone, session, env, opts) {
   const { prefix, prevId, nextId, body, btnLabel, sectionTitle, descFor } = opts;
   const page   = Math.max(0, session.adminCtx.pickerPage || 0);
   const offset = page * ITEM_PICKER_PAGE_SIZE;
-  const { items, total } = await getMenuItemsPaginated(env, ITEM_PICKER_PAGE_SIZE, offset);
+  const query  = session.adminCtx.pickerQuery || '';
+  const { items, total } = await getMenuItemsPaginated(env, ITEM_PICKER_PAGE_SIZE, offset, query);
 
+  if (!items.length && page === 0 && query) {
+    return sendText(
+      phone,
+      `🔍 No items match "${query}".\n\nType another name, or send *ALL* to see every item.`,
+      env
+    );
+  }
   if (!items.length && page === 0) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
@@ -1094,17 +1150,43 @@ async function showItemPicker(phone, session, env, opts) {
   const totalPages = Math.max(1, Math.ceil(total / ITEM_PICKER_PAGE_SIZE));
   await saveSession(phone, session, env);
 
+  const searchLine = query
+    ? `🔍 Matching "${query}" — send *ALL* to see every item.`
+    : '🔍 Or type part of a name to search.';
   return sendList(
     phone,
-    `${body} — Page ${page + 1} of ${totalPages}`,
+    `${body}\nPage ${page + 1} of ${totalPages}\n\n${searchLine}`,
     btnLabel,
     [{ title: sectionTitle, rows }],
     env
   );
 }
 
+/**
+ * Paging and name search shared by the Edit / Delete / Toggle item pickers.
+ * Returns true when msg was a page tap or a typed search, so the caller only
+ * has to re-show its picker. Typing ALL clears the search.
+ */
+async function handlePickerInput(phone, msg, session, env, kind) {
+  const ctx = session.adminCtx;
+  if (msg.id === `${kind}_page_next`) {
+    ctx.pickerPage = (ctx.pickerPage || 0) + 1;
+  } else if (msg.id === `${kind}_page_prev`) {
+    ctx.pickerPage = Math.max(0, (ctx.pickerPage || 0) - 1);
+  } else if (msg.type === 'text' && (msg.text || '').trim()) {
+    const q = sanitize(msg.text, 50);
+    ctx.pickerQuery = q.toUpperCase() === 'ALL' ? '' : q;
+    ctx.pickerPage  = 0;
+  } else {
+    return false;
+  }
+  await saveSession(phone, session, env);
+  return true;
+}
+
 async function startEditFlow(phone, session, env) {
   session.adminCtx.pickerPage = 0;
+  session.adminCtx.pickerQuery = '';
   session.state = 'admin_edit_item_select';
   return showEditItemPicker(phone, session, env);
 }
@@ -1119,15 +1201,8 @@ async function showEditItemPicker(phone, session, env) {
 }
 
 async function handleEditItemSelect(phone, msg, session, env) {
-  // UX-11: pagination navigation.
-  if (msg.id === 'edit_page_next') {
-    session.adminCtx.pickerPage = (session.adminCtx.pickerPage || 0) + 1;
-    await saveSession(phone, session, env);
-    return showEditItemPicker(phone, session, env);
-  }
-  if (msg.id === 'edit_page_prev') {
-    session.adminCtx.pickerPage = Math.max(0, (session.adminCtx.pickerPage || 0) - 1);
-    await saveSession(phone, session, env);
+  // UX-11: pagination navigation, plus typed name search.
+  if (await handlePickerInput(phone, msg, session, env, 'edit')) {
     return showEditItemPicker(phone, session, env);
   }
   if (!msg.id?.startsWith('edit_')) return showEditItemPicker(phone, session, env);
@@ -1143,13 +1218,13 @@ async function handleEditItemSelect(phone, msg, session, env) {
   const availLabel = item.is_available ? '✅ Available' : '❌ Unavailable';
   return sendList(
     phone,
-    `✏️ Editing *${item.name}* (₦${item.price.toFixed(2)})\nWhich field to update?`,
+    `✏️ Editing *${item.name}* (${formatPrice(item.price)})\nWhich field to update?`,
     'Edit Field',
     [{
       title: 'Fields',
       rows: [
         { id: 'ef_name',         title: 'Name',         description: `Current: ${item.name.slice(0, 40)}` },
-        { id: 'ef_price',        title: 'Price',        description: `Current: ₦${item.price.toFixed(2)}` },
+        { id: 'ef_price',        title: 'Price',        description: `Current: ${formatPrice(item.price)}` },
         { id: 'ef_description',  title: 'Description',  description: `Current: ${(item.description || '(none)').slice(0, 40)}` },
         { id: 'ef_image_url',    title: 'Image URL',    description: `Current: ${(item.image_url || '(none)').slice(0, 40)}` },
         { id: 'ef_availability', title: 'Availability', description: `Currently ${availLabel}` },
@@ -1228,7 +1303,7 @@ async function handleEditItemField(phone, msg, session, env) {
         title: 'Fields',
         rows: [
           { id: 'ef_name',         title: 'Name',         description: `Current: ${item.name.slice(0, 40)}` },
-          { id: 'ef_price',        title: 'Price',        description: `Current: ₦${item.price.toFixed(2)}` },
+          { id: 'ef_price',        title: 'Price',        description: `Current: ${formatPrice(item.price)}` },
           { id: 'ef_description',  title: 'Description',  description: `Current: ${(item.description || '(none)').slice(0, 40)}` },
           { id: 'ef_image_url',    title: 'Image URL',    description: `Current: ${(item.image_url || '(none)').slice(0, 40)}` },
           { id: 'ef_availability', title: 'Availability', description: `Currently ${availLabel}` },
@@ -1339,10 +1414,11 @@ async function handleEditItemValue(phone, msg, session, env) {
   session.adminCtx = {};
   await saveSession(phone, session, env);
 
-  const displayVal = editField === 'price' ? formatPrice(value) : String(value).slice(0, 40);
+  const fieldLabel = { name: 'Name', price: 'Price', description: 'Description', image_url: 'Image' }[editField] || editField;
+  const displayVal = editField === 'price' ? formatPrice(value) : (String(value).slice(0, 40) || '(empty)');
   return sendButtons(
     phone,
-    `✅ *${editField}* updated → ${displayVal}`,
+    `✅ ${fieldLabel} updated → ${displayVal}`,
     [
       { id: 'admin_edit_item', title: '✏️ Edit Another' },
       { id: 'admin_home',      title: '🔧 Admin Menu'        },
@@ -1357,6 +1433,7 @@ async function handleEditItemValue(phone, msg, session, env) {
 
 async function startDeleteFlow(phone, session, env) {
   session.adminCtx.pickerPage = 0;
+  session.adminCtx.pickerQuery = '';
   session.state = 'admin_delete_item_select';
   return showDeleteItemPicker(phone, session, env);
 }
@@ -1371,15 +1448,8 @@ async function showDeleteItemPicker(phone, session, env) {
 }
 
 async function handleDeleteItemSelect(phone, msg, session, env) {
-  // UX-11: pagination navigation.
-  if (msg.id === 'del_page_next') {
-    session.adminCtx.pickerPage = (session.adminCtx.pickerPage || 0) + 1;
-    await saveSession(phone, session, env);
-    return showDeleteItemPicker(phone, session, env);
-  }
-  if (msg.id === 'del_page_prev') {
-    session.adminCtx.pickerPage = Math.max(0, (session.adminCtx.pickerPage || 0) - 1);
-    await saveSession(phone, session, env);
+  // UX-11: pagination navigation, plus typed name search.
+  if (await handlePickerInput(phone, msg, session, env, 'del')) {
     return showDeleteItemPicker(phone, session, env);
   }
   if (!msg.id?.startsWith('del_')) return showDeleteItemPicker(phone, session, env);
@@ -1461,6 +1531,7 @@ async function handleDeleteItemConfirm(phone, msg, session, env) {
 
 async function startToggleFlow(phone, session, env) {
   session.adminCtx.pickerPage = 0;
+  session.adminCtx.pickerQuery = '';
   session.state = 'admin_toggle_item_select';
   return showToggleItemPicker(phone, session, env);
 }
@@ -1475,15 +1546,8 @@ async function showToggleItemPicker(phone, session, env) {
 }
 
 async function handleToggleItemSelect(phone, msg, session, env) {
-  // UX-11: pagination navigation.
-  if (msg.id === 'tog_page_next') {
-    session.adminCtx.pickerPage = (session.adminCtx.pickerPage || 0) + 1;
-    await saveSession(phone, session, env);
-    return showToggleItemPicker(phone, session, env);
-  }
-  if (msg.id === 'tog_page_prev') {
-    session.adminCtx.pickerPage = Math.max(0, (session.adminCtx.pickerPage || 0) - 1);
-    await saveSession(phone, session, env);
+  // UX-11: pagination navigation, plus typed name search.
+  if (await handlePickerInput(phone, msg, session, env, 'tog')) {
     return showToggleItemPicker(phone, session, env);
   }
   if (!msg.id?.startsWith('tog_')) return showToggleItemPicker(phone, session, env);
@@ -1527,6 +1591,15 @@ const ORDERS_PAGE_SIZE = 8;
  * who ordered, where to deliver, what they ordered, and payment state.
  * Takes the object returned by getOrder() (order row + items[]).
  */
+// The total includes a service fee the items don't show; spell it out so
+// the numbers add up for the admin.
+function feeLines(order, items) {
+  const itemsCents = items.reduce((sum, i) => sum + Math.round(i.unit_price * 100) * i.quantity, 0);
+  const feeCents = Math.round(order.total_price * 100) - itemsCents;
+  if (!items.length || feeCents <= 0) return [];
+  return [`🧾 *Service fee:* ${formatPrice(feeCents / 100)}`];
+}
+
 export function formatOrderDetails(order) {
   const items = order.items || [];
   const itemLines = items.length
@@ -1551,6 +1624,7 @@ export function formatOrderDetails(order) {
     '*Items:*',
     itemLines,
     '',
+    ...feeLines(order, items),
     `💰 *Total:* ${formatPrice(order.total_price)}`,
     `💳 *Payment:* ${order.payment_status.toUpperCase()}`,
     `🕒 *Placed:* ${order.created_at} UTC`,
@@ -1579,10 +1653,15 @@ export async function notifyAdminsNewOrder(orderId, env) {
     for (const admin of await getAdminPhones(env)) {
       try {
         await sendText(admin, details, env);
+        const buttons = [{ id: `astat_${order.id}`, title: `📦 Order #${order.id}` }];
+        if (order.status === 'pending') {
+          buttons.unshift({ id: `nstat_${order.id}_confirmed`, title: STATUS_INFO.confirmed.button });
+        }
         await sendButtons(
           admin,
-          `Confirm order #${order.id} when you're ready.`,
-          [{ id: 'admin_update_status', title: '📦 Update Status' }],
+          `Tap *Confirm* to accept order #${order.id} (the customer is told), ` +
+          'or open it to choose another status.',
+          buttons,
           env
         );
       } catch (err) {
@@ -1594,18 +1673,84 @@ export async function notifyAdminsNewOrder(orderId, env) {
   }
 }
 
+// "5m ago" / "3h ago" / "2d ago" from a D1 UTC datetime string.
+function ageLabel(createdAt) {
+  const then = Date.parse(String(createdAt).replace(' ', 'T') + 'Z');
+  if (isNaN(then)) return '';
+  const mins = Math.max(0, Math.round((Date.now() - then) / 60000));
+  if (mins < 60) return `${mins}m ago`;
+  if (mins < 60 * 24) return `${Math.round(mins / 60)}h ago`;
+  return `${Math.round(mins / (60 * 24))}d ago`;
+}
+
+function unpaidNote(count) {
+  if (!count) return '';
+  return `\n\n_${count} unpaid order${count === 1 ? '' : 's'} not shown. ` +
+    'To clear them: Bulk Actions → Orders → Cancelled._';
+}
+
+// Send the order's details, then the statuses it can move to.
+async function openOrder(phone, order, session, env) {
+  session.adminCtx.updateOrderId      = order.id;
+  session.adminCtx.orderPhone         = order.user_phone;
+  session.adminCtx.orderCurrentStatus = order.status;
+  session.adminCtx.orderPaymentStatus = order.payment_status;
+  session.state = 'admin_update_status_value';
+  await saveSession(phone, session, env);
+
+  await sendText(phone, formatOrderDetails(order), env);
+  return showStatusPicker(phone, session, env);
+}
+
+async function showStatusPicker(phone, session, env) {
+  const { updateOrderId: id, orderCurrentStatus: current, orderPaymentStatus: paid } = session.adminCtx;
+  const choices = statusChoices(current, paid);
+
+  if (!choices.length) {
+    session.state    = 'admin_idle';
+    session.adminCtx = {};
+    await saveSession(phone, session, env);
+    return sendButtons(
+      phone,
+      `ℹ️ Order #${id} is *${current.toUpperCase()}* — nothing more to change.`,
+      [
+        { id: 'admin_update_status', title: '📦 Orders'      },
+        { id: 'admin_home',          title: '🔧 Admin Menu'  },
+      ],
+      env
+    );
+  }
+
+  const unpaidWarn = paid === 'paid'
+    ? ''
+    : `\n\n⚠️ Payment is *${String(paid).toUpperCase()}* — this order can only be cancelled.`;
+  const rows = choices.map(s => ({ id: `status_${s}`, title: STATUS_INFO[s].row, description: STATUS_INFO[s].desc }));
+  return sendList(
+    phone,
+    `📦 *Order #${id}* — now *${current.toUpperCase()}*\nChoose the new status:${unpaidWarn}`,
+    'Choose Status',
+    [{ title: 'Move order to', rows }],
+    env
+  );
+}
+
 async function viewOrders(phone, session, env) {
   const page   = Math.max(0, session.adminCtx.ordersPage || 0);
   const offset = page * ORDERS_PAGE_SIZE;
-  const { orders, total } = await getActiveOrdersPaginated(env, ORDERS_PAGE_SIZE, offset);
+  const { orders, total, unpaidHidden } = await getActiveOrdersPaginated(
+    env, ORDERS_PAGE_SIZE, offset, { paidOnly: true }
+  );
 
   if (!orders.length && page === 0) {
     session.state = 'admin_idle';
     await saveSession(phone, session, env);
     return sendButtons(
       phone,
-      '📭 No pending orders right now.',
-      [{ id: 'admin_home', title: '🔧 Admin Menu' }],
+      `📭 No paid orders waiting right now.${unpaidNote(unpaidHidden)}`,
+      [
+        { id: 'admin_bulk_menu', title: '🏗️ Bulk Actions' },
+        { id: 'admin_home',      title: '🔧 Admin Menu'  },
+      ],
       env
     );
   }
@@ -1623,8 +1768,8 @@ async function viewOrders(phone, session, env) {
   // Show ALL fetched orders — never trim them (orders must not be silently lost).
   const rows = orders.map(o => ({
     id: `astat_${o.id}`,
-    title: `#${o.id} - ${o.status.toUpperCase()} (${formatPrice(o.total_price)})`,
-    description: `💳 ${o.payment_status.toUpperCase()} | 📱 ${o.user_phone} | 📍 ${(o.address || '').slice(0, 20)}`
+    title: `#${o.id} · ${formatPrice(o.total_price)}`,
+    description: `${o.status.toUpperCase()} · ${ageLabel(o.created_at)} · 📍 ${o.address || 'no address'}`,
   }));
 
   if (hasPrev) rows.push({ id: 'orders_page_prev', title: '⬅️ Prev Page' });
@@ -1641,9 +1786,10 @@ async function viewOrders(phone, session, env) {
 
   return sendList(
     phone,
-    `📦 *Active Orders* — Page ${page + 1} of ${totalPages}\nSelect an order to update its status:`,
+    `📦 *Orders to fulfil* — page ${page + 1} of ${totalPages}\n` +
+    `Oldest first. Tap one to see its details and update it.${unpaidNote(unpaidHidden)}`,
     'Select Order',
-    [{ title: 'Pending/Active', rows }],
+    [{ title: 'Paid orders', rows }],
     env
   );
 }
@@ -1661,27 +1807,11 @@ async function handleAdminOrdersList(phone, msg, session, env) {
     return viewOrders(phone, session, env);
   }
 
-  if (msg.type === 'list_reply' && msg.id?.startsWith('astat_')) {
+  if (msg.id?.startsWith('astat_')) {
     const orderId = parseInt(msg.id.replace('astat_', ''), 10);
     const order = await getOrderForAdmin(orderId, env);
     if (!order) return viewOrders(phone, session, env);
-
-    session.adminCtx.updateOrderId = orderId;
-    session.adminCtx.orderPhone    = order.user_phone;
-    session.adminCtx.orderCurrentStatus = order.status;
-    session.adminCtx.orderPaymentStatus = order.payment_status;
-    session.state = 'admin_update_status_value';
-    await saveSession(phone, session, env);
-
-    await sendText(phone, formatOrderDetails(order), env);
-    const rows = VALID_STATUSES.map(s => ({ id: `status_${s}`, title: s.toUpperCase() }));
-    return sendList(
-      phone,
-      `📦 *Order #${orderId}* - Current: ${order.status.toUpperCase()}\n\nSelect new status:`,
-      'Choose Status',
-      [{ title: 'Order Statuses', rows }],
-      env
-    );
+    return openOrder(phone, order, session, env);
   }
 
   // UX-12: typed-numeric-ID fallback.
@@ -1714,7 +1844,7 @@ async function handleUpdateStatusId(phone, msg, session, env) {
       phone,
       '❌ Status update cancelled.',
       [
-        { id: 'admin_update_status', title: '📦 Update Status' },
+        { id: 'admin_update_status', title: '📦 Orders' },
         { id: 'admin_home', title: '🔧 Admin Menu' },
       ],
       env
@@ -1744,25 +1874,9 @@ async function handleUpdateStatusId(phone, msg, session, env) {
 
   const order = await getOrderForAdmin(orderId, env);
   if (!order) {
-    return sendText(phone, `⚠️ Order #${orderId} not found.`, env);
+    return sendText(phone, `⚠️ Order #${orderId} not found. Check the number, or send *CANCEL*.`, env);
   }
-
-  session.adminCtx.updateOrderId = orderId;
-  session.adminCtx.orderPhone    = order.user_phone;
-  session.adminCtx.orderCurrentStatus = order.status;
-  session.adminCtx.orderPaymentStatus = order.payment_status;
-  session.state = 'admin_update_status_value';
-  await saveSession(phone, session, env);
-
-  await sendText(phone, formatOrderDetails(order), env);
-  const rows = VALID_STATUSES.map(s => ({ id: `status_${s}`, title: s.toUpperCase() }));
-  return sendList(
-    phone,
-    `📦 Order #${orderId} — Current: *${order.status.toUpperCase()}*\n\nSelect new status:`,
-    'Choose Status',
-    [{ title: 'Order Statuses', rows }],
-    env
-  );
+  return openOrder(phone, order, session, env);
 }
 
 async function handleUpdateStatusValue(phone, msg, session, env) {
@@ -1776,17 +1890,25 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
       await saveSession(phone, session, env);
       return showAdminMenu(phone, env);
     }
-    const rows = VALID_STATUSES.map(s => ({ id: `status_${s}`, title: s.toUpperCase() }));
-    return sendList(
-      phone,
-      `📦 *Order #${orderId}*\nPlease tap a status from the list:`,
-      'Choose Status',
-      [{ title: 'Order Statuses', rows }],
-      env
-    );
+    return showStatusPicker(phone, session, env);
   }
 
   const newStatus = msg.id.replace('status_', '');
+
+  // Nothing to cook or deliver until the customer has paid.
+  const payment = session.adminCtx.orderPaymentStatus;
+  if (payment && payment !== 'paid' && newStatus !== 'cancelled' && newStatus !== current) {
+    return sendButtons(
+      phone,
+      `🚫 Order #${orderId} isn't paid (payment: *${payment.toUpperCase()}*), ` +
+      'so it can only be cancelled.',
+      [
+        { id: 'admin_update_status', title: '📦 Orders'     },
+        { id: 'admin_home',          title: '🔧 Admin Menu' },
+      ],
+      env
+    );
+  }
 
   // EDGE-07: skip work (and the customer notification) when nothing changes.
   if (current && newStatus === current) {
@@ -1797,7 +1919,7 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
       phone,
       `ℹ️ Order #${orderId} is already *${newStatus.toUpperCase()}* — no change made.`,
       [
-        { id: 'admin_update_status', title: '📦 Update Status' },
+        { id: 'admin_update_status', title: '📦 Orders' },
         { id: 'admin_home',          title: '🔧 Admin Menu'   },
       ],
       env
@@ -1811,7 +1933,7 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
       `🚫 Cannot change order #${orderId} from *${current.toUpperCase()}* to *${newStatus.toUpperCase()}*.\n\n` +
       'Delivered and cancelled orders are final.',
       [
-        { id: 'admin_view_orders', title: '📦 View Orders' },
+        { id: 'admin_update_status', title: '📦 Orders' },
         { id: 'admin_home',        title: '🔧 Admin Menu' },
       ],
       env
@@ -1825,11 +1947,10 @@ async function handleUpdateStatusValue(phone, msg, session, env) {
     session.state = 'admin_update_status_confirm';
     await saveSession(phone, session, env);
 
-    // EDGE-08: warn the admin when cancelling a PAID order — manual refund needed.
+    // EDGE-08: warn the admin when cancelling a PAID order — money goes back.
     let warn = '';
     if (newStatus === 'cancelled' && session.adminCtx.orderPaymentStatus === 'paid') {
-      warn = '\n\n⚠️ This order is PAID — a manual refund is required.';
-      console.warn(`[Admin] Cancelling PAID order #${orderId} — manual refund required.`);
+      warn = '\n\n⚠️ This order is PAID — the customer will be refunded through Flutterwave.';
     }
 
     return sendButtons(
@@ -1872,7 +1993,7 @@ async function performStatusUpdate(phone, session, env) {
       phone,
       `ℹ️ Order #${updateOrderId} is already *${newStatus.toUpperCase()}* — no change made.`,
       [
-        { id: 'admin_update_status', title: '📦 Update Status' },
+        { id: 'admin_update_status', title: '📦 Orders' },
         { id: 'admin_home',          title: '🔧 Admin Menu'   },
       ],
       env
@@ -1914,13 +2035,17 @@ async function performStatusUpdate(phone, session, env) {
   session.adminCtx = {};
   await saveSession(phone, session, env);
 
+  const buttons = [
+    { id: 'admin_update_status', title: '📦 Orders'     },
+    { id: 'admin_home',          title: '🔧 Admin Menu' },
+  ];
+  const next = NEXT_STATUS[newStatus];
+  if (next) buttons.unshift({ id: `nstat_${updateOrderId}_${next}`, title: STATUS_INFO[next].button });
+
   return sendButtons(
     phone,
-    `✅ Order #${updateOrderId} status updated to *${newStatus.toUpperCase()}*.\n\n${notifyLine}${refundLine}`,
-    [
-      { id: 'admin_update_status', title: '📦 Update Status' },
-      { id: 'admin_home', title: '🔧 Admin Menu' },
-    ],
+    `✅ Order #${updateOrderId} is now *${newStatus.toUpperCase()}*.\n\n${notifyLine}${refundLine}`,
+    buttons,
     env
   );
 }
@@ -2122,8 +2247,16 @@ async function handleBulkMenu(phone, msg, session, env) {
     session.state = 'admin_bulk_orders_action';
     session.adminCtx.bulk = { type: 'orders', selectedIds: [], page: 0 };
     await saveSession(phone, session, env);
-    const rows = VALID_STATUSES.map(s => ({ id: `ba_os_${s}`, title: s.toUpperCase() }));
-    return sendList(phone, '📦 *Bulk Orders*\nWhich status to apply?', 'Choose Status', [{ title: 'Statuses', rows }], env);
+    const rows = VALID_STATUSES.filter(s => s !== 'pending')
+      .map(s => ({ id: `ba_os_${s}`, title: STATUS_INFO[s].row, description: STATUS_INFO[s].desc }));
+    return sendList(
+      phone,
+      '📦 *Bulk Orders*\nWhich status should the selected orders get?\n\n' +
+      '_Tip: to clear out abandoned unpaid orders, choose Cancelled._',
+      'Choose Status',
+      [{ title: 'Statuses', rows }],
+      env
+    );
   }
 
   // ── admin_bulk_menu re-entry button ───────────────────────────
@@ -2168,7 +2301,7 @@ async function showBulkOrdersList(phone, session, env) {
     return {
       id: `bs_o_${o.id}`,
       title: `${isSelected ? '✅' : '⬜'} #${o.id} - ${o.status.toUpperCase()}`,
-      description: `💳 ${o.payment_status.toUpperCase()} | ₦${o.total_price.toFixed(2)} | 📱 ${o.user_phone}`
+      description: `${o.payment_status.toUpperCase()} · ${formatPrice(o.total_price)} · ${ageLabel(o.created_at)}`
     };
   });
 
@@ -2244,6 +2377,7 @@ async function handleBulkOrdersSelect(phone, msg, session, env) {
 
   if (msg.id === 'bulk_clear') {
     bulk.selectedIds = [];
+    await resetSelection(phone, env);
     await saveSession(phone, session, env);
     return showBulkOrdersList(phone, session, env);
   }
@@ -2469,7 +2603,8 @@ async function executeBulkOrders(phone, session, env) {
     `✅ *Bulk Action Complete*\n\n` +
     `Action: *${status.toUpperCase()}*\n` +
     `Updated: ${successCount}\n` +
-    `Skipped: ${skippedCount}\n` +
+    `Skipped: ${skippedCount}` +
+    (skippedCount ? ' _(already that status, final, or unpaid)_' : '') + '\n' +
     `Failed: ${failureCount}\n` +
     `Notified: ${bulk.notifyCustomers ? successCount : 0}${paidWarn}\n\n` +
     `Log ID: ${logId}`;
@@ -2516,7 +2651,7 @@ async function showBulkItemsList(phone, session, env) {
     return {
       id: `bs_i_${i.id}`,
       title: `${isSelected ? '✅' : '⬜'} ${i.name}`,
-      description: `${i.is_available ? 'Available' : 'Unavailable'} | ₦${i.price.toFixed(2)}`
+      description: `${i.is_available ? 'Available' : 'Unavailable'} | ${formatPrice(i.price)}`
     };
   });
 
@@ -2578,6 +2713,7 @@ async function handleBulkItemsSelect(phone, msg, session, env) {
 
   if (msg.id === 'bulk_clear') {
     bulk.selectedIds = [];
+    await resetSelection(phone, env);
     await saveSession(phone, session, env);
     return showBulkItemsList(phone, session, env);
   }
@@ -2985,10 +3121,37 @@ async function handleBulkItemsAddReview(phone, msg, session, env) {
 
 const BULK_PAGE_SIZE = 7; // 7 items + up to 3 control rows = ≤10 per section
 
+function bulkSearchLine(bulk) {
+  return bulk.query
+    ? `\n🔍 Matching "${bulk.query}" — send *ALL* to see every item.`
+    : '\n🔍 Type part of a name to search. Selections are kept.';
+}
+
+function sendNoBulkMatch(phone, bulk, env) {
+  return sendText(
+    phone,
+    `🔍 No items match "${bulk.query}".\n\nType another name, or send *ALL* to see every item.`,
+    env
+  );
+}
+
+// Typed text in a bulk item list is a name search (ALL clears it).
+// Returns true when handled, so the caller re-shows its list.
+async function handleBulkSearch(phone, msg, session, env) {
+  if (msg.type !== 'text' || !(msg.text || '').trim()) return false;
+  const bulk = session.adminCtx.bulk;
+  const q = sanitize(msg.text, 50);
+  bulk.query = q.toUpperCase() === 'ALL' ? '' : q;
+  bulk.page  = 0;
+  await saveSession(phone, session, env);
+  return true;
+}
+
 async function showBulkItemsRemoveList(phone, session, env) {
   const { bulk } = session.adminCtx;
   const offset = bulk.page * BULK_PAGE_SIZE;
-  const { items, total } = await getMenuItemsPaginated(env, BULK_PAGE_SIZE, offset);
+  const { items, total } = await getMenuItemsPaginated(env, BULK_PAGE_SIZE, offset, bulk.query || '');
+  if (!items.length && bulk.page === 0 && bulk.query) return sendNoBulkMatch(phone, bulk, env);
 
   if (!items.length && bulk.page === 0) {
     session.state = 'admin_idle';
@@ -3000,7 +3163,7 @@ async function showBulkItemsRemoveList(phone, session, env) {
   const rows = items.map(i => ({
     id: `bsr_${i.id}`,
     title: `${bulk.selectedIds.includes(i.id) ? '✅' : '⬜'} ${i.name}`.slice(0, 24),
-    description: `${i.is_available ? 'Available' : 'Unavailable'} | ₦${i.price.toFixed(2)}`,
+    description: `${i.is_available ? 'Available' : 'Unavailable'} | ${formatPrice(i.price)}`,
   }));
 
   if (bulk.page > 0) rows.push({ id: 'bulk_page_prev', title: '⬅️ Prev Page' });
@@ -3008,7 +3171,7 @@ async function showBulkItemsRemoveList(phone, session, env) {
   rows.push({ id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length} sel.)`, description: 'Proceed to review' });
 
   const footer = `Page ${bulk.page + 1}/${Math.ceil(total / BULK_PAGE_SIZE)} | ${bulk.selectedIds.length} selected`;
-  return sendList(phone, `🗑️ *Remove Items*\nTap to select/deselect.\n${footer}`, 'Select Items', [{ title: 'Menu Items', rows }], env);
+  return sendList(phone, `🗑️ *Remove Items*\nTap to select/deselect.\n${footer}${bulkSearchLine(bulk)}`, 'Select Items', [{ title: 'Menu Items', rows }], env);
 }
 
 async function handleBulkItemsRemoveSelect(phone, msg, session, env) {
@@ -3042,6 +3205,8 @@ async function handleBulkItemsRemoveSelect(phone, msg, session, env) {
       env
     );
   }
+
+  if (await handleBulkSearch(phone, msg, session, env)) return showBulkItemsRemoveList(phone, session, env);
 
   return sendButtons(
     phone,
@@ -3266,7 +3431,8 @@ async function handleBulkItemsEditValue(phone, msg, session, env) {
 async function showBulkItemsEditList(phone, session, env) {
   const { bulk } = session.adminCtx;
   const offset = bulk.page * BULK_PAGE_SIZE;
-  const { items, total } = await getMenuItemsPaginated(env, BULK_PAGE_SIZE, offset);
+  const { items, total } = await getMenuItemsPaginated(env, BULK_PAGE_SIZE, offset, bulk.query || '');
+  if (!items.length && bulk.page === 0 && bulk.query) return sendNoBulkMatch(phone, bulk, env);
 
   if (!items.length && bulk.page === 0) {
     session.state = 'admin_idle'; session.adminCtx = {};
@@ -3280,7 +3446,7 @@ async function showBulkItemsEditList(phone, session, env) {
   const rows = items.map(i => ({
     id: `bie_${i.id}`,
     title: `${bulk.selectedIds.includes(i.id) ? '✅' : '⬜'} ${i.name}`.slice(0, 24),
-    description: `${i.is_available ? 'Avail' : 'Unavail'} | ₦${i.price.toFixed(2)}`,
+    description: `${i.is_available ? 'Avail' : 'Unavail'} | ${formatPrice(i.price)}`,
   }));
 
   if (bulk.page > 0) rows.push({ id: 'bulk_page_prev', title: '⬅️ Prev Page' });
@@ -3288,7 +3454,7 @@ async function showBulkItemsEditList(phone, session, env) {
   rows.push({ id: 'bulk_review', title: `✅ Done (${bulk.selectedIds.length} sel.)`, description: 'Review & confirm' });
 
   const footer = `Page ${bulk.page + 1}/${Math.ceil(total / BULK_PAGE_SIZE)} | ${bulk.selectedIds.length} selected`;
-  return sendList(phone, `✏️ *Edit: ${actionLabel}*\nTap to select items.\n${footer}`, 'Select Items', [{ title: 'Menu Items', rows }], env);
+  return sendList(phone, `✏️ *Edit: ${actionLabel}*\nTap to select items.\n${footer}${bulkSearchLine(bulk)}`, 'Select Items', [{ title: 'Menu Items', rows }], env);
 }
 
 async function handleBulkItemsEditSelect(phone, msg, session, env) {
@@ -3322,6 +3488,8 @@ async function handleBulkItemsEditSelect(phone, msg, session, env) {
       env
     );
   }
+
+  if (await handleBulkSearch(phone, msg, session, env)) return showBulkItemsEditList(phone, session, env);
 
   return sendButtons(
     phone,
@@ -3374,7 +3542,7 @@ async function handleBulkItemsEditConfirm(phone, msg, session, env) {
       else if (bulk.editPriceType === 'dec_pct')   newPrice = item.price * (1 - v / 100);
       newPrice = Math.round(newPrice * 100) / 100;
       if (newPrice < 0 || newPrice > MAX_PRICE) {
-        failureDetails.push({ id: item.id, name: item.name, error: `result ₦${newPrice.toFixed(2)} out of range` });
+        failureDetails.push({ id: item.id, name: item.name, error: `result ${formatPrice(newPrice)} out of range` });
         continue;
       }
       try { await updateMenuItem(item.id, { price: newPrice }, env); successCount++; }
@@ -3485,13 +3653,14 @@ async function handleBulkCatsAddPaste(phone, msg, session, env) {
 async function handleBulkCatsAddReview(phone, msg, session, env) {
   const { bulk } = session.adminCtx;
 
-  if (msg.id === 'bulk_cat_repaste' || msg.text) {
+  const reviewText = (msg.text || '').trim().toUpperCase();
+  if (msg.id === 'bulk_cat_repaste' || reviewText === 'REPASTE') {
     session.state = 'admin_bulk_cats_add_paste';
     await saveSession(phone, session, env);
     return showBulkCatAddTemplate(phone, env);
   }
 
-  if (msg.id === 'bulk_cats_add_confirm') {
+  if (msg.id === 'bulk_cats_add_confirm' || reviewText === 'CONFIRM') {
     const entries = bulk.parsedCats || [];
     if (!entries.length) {
       session.state = 'admin_bulk_cats_add_paste';
