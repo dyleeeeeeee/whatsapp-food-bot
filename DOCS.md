@@ -2,50 +2,81 @@
 
 This document provides guidance for restaurant operators and quality assurance testing.
 
-## Operator Checklist
+## Admin Guide
 
-### 🔑 User Management
-- **Add Admin**: Run `node scripts/add-admin.js <phone> "<name>"` to grant admin access.
-- **Verify Admins**: Run `wrangler d1 execute food-bot-db --remote --command="SELECT * FROM AdminUsers;"`.
+Admins are the phone numbers in the `AdminUsers` table. Sending **ADMIN** from
+one opens the admin panel. Anytime: **ADMIN** returns to the panel, **BACK**
+goes back a step, **CANCEL** aborts.
 
-### 🍽️ Menu Management
-- **Add Item**: Admin Panel → Add Item. Follow the multi-step prompt (Name, Category, Price, Description, Image).
-- **Edit Item**: Admin Panel → Edit Item. Select item and then the specific field to change.
-- **Toggle Availability**: Admin Panel → Toggle Avail. Tap an item to flip it between Available and Unavailable.
-- **Add Category**: Admin Panel → Add Category.
+### 🔑 Admins
+- **Add an admin:** `node scripts/add-admin.js 2348012345678 "Name"`
+  (international format, no `+`). Takes effect within a minute; admin status
+  is cached for 60 seconds.
+- **List admins:**
+  `npx wrangler d1 execute food-bot-db --remote --command="SELECT * FROM AdminUsers;"`
+- **Remove an admin:**
+  `npx wrangler d1 execute food-bot-db --remote --command="DELETE FROM AdminUsers WHERE phone_number='234...';"`
 
-### 📦 Order Management
-- **View Orders**: Admin Panel → View Orders. Shows a list of pending, confirmed, and preparing orders with payment status.
-- **Update Status**: 
-  1. Go to View Orders.
-  2. Select the order from the list.
-  3. Choose the new status (Confirmed, Preparing, Ready, Delivered, Cancelled).
-  4. Note: Setting an order to `Delivered` or `Cancelled` requires a confirmation tap.
+### 📦 Orders (daily work)
+- **New order alert.** When a customer pays, every admin gets the order
+  details (customer name and phone, address, notes, items, service fee, total)
+  and two buttons: **✅ Confirm** (accepts it and tells the customer) and
+  **📦 Order #N** (opens it).
+- **Orders list:** Admin panel → **📦 Orders**. Shows paid orders that are not
+  yet delivered or cancelled, oldest first. Unpaid orders are hidden; the
+  screen says how many and how to clear them. **⌨️ Type Order ID** opens any
+  order, paid or not.
+- **Updating an order.** Opening an order shows its full details, then only
+  the statuses it can move to:
+  Confirmed → Preparing → Ready / On its way → Delivered, or Cancelled. After
+  each change the customer gets a WhatsApp message, and the admin gets a
+  one-tap button for the next step.
+  - **Delivered** and **Cancelled** ask for confirmation and are final.
+  - **Unpaid orders can only be cancelled.**
+  - **Cancelling a paid order refunds it** through Flutterwave automatically.
+    Admins get an alert with the result; check the Flutterwave dashboard.
+
+### 🍽️ Menu
+- **🔄 In/Out of Stock:** tap an item to flip it between available and
+  unavailable. Unavailable items are hidden from customers but keep their
+  history.
+- **✏️ Edit Item:** change name, price, description, image, availability or
+  category.
+- **➕ Add Item:** name, category, price, description, image. Uses a WhatsApp
+  form (Flow) when `ADD_ITEM_FLOW_ID` is set; otherwise a step-by-step chat.
+  The category step can also create a new category.
+- **🗑️ Delete Item:** items that appear in past orders can't be deleted. Mark
+  them out of stock instead.
+- **📂 Categories:** every item per category, with unavailable ones marked.
+- **Search:** in In/Out of Stock, Edit, Delete and the bulk item lists, type
+  part of an item's name to filter. Send **ALL** to show everything again.
+
+> ⚠️ After adding, renaming or deleting a **category**, the WhatsApp Add-Item
+> form's category dropdown is out of date until `flows/add-item.json` is
+> updated and re-published in Meta. The bot warns about this. The chat-based
+> Add Item always works.
 
 ### 🏗️ Bulk Actions
-- **Bulk Orders**: Admin Panel → Bulk Actions → Bulk Orders.
-  1. Choose a status to apply.
-  2. Select multiple orders from the paginated list.
-  3. Review selection and choose notification behavior.
-  4. If cancelling, provide a reason.
-  5. Note: Unpaid Flutterwave orders are excluded from kitchen statuses (Confirmed, Preparing, Ready) by default.
-- **Bulk Menu**: Admin Panel → Bulk Actions → Bulk Menu.
-  1. Choose "Mark Available" or "Mark Unavailable".
-  2. Select multiple menu items.
-  3. Confirm to apply and bust the menu cache.
+- **Orders:** pick a status, tick orders (all active orders are listed here,
+  including unpaid ones), review, then choose whether customers are notified.
+  Cancelling asks for a reason shown to the customer. Orders that are already
+  in that status, final, or unpaid (for kitchen statuses) are skipped and
+  counted. **Use this to clear abandoned unpaid orders:** Cancelled → select →
+  No, Silent.
+- **Menu items:** paste many items at once, remove several, or edit several
+  (availability, set or adjust price by ₦ or %, move category, description,
+  image).
+- **Categories:** add several, rename, delete (deleting or moving their
+  items), or move all items from one category to another.
+- Every bulk action is recorded in `BulkActionLogs` with a log ID.
 
-### 💳 Flutterwave Integration
-- **Setup**:
-  1. Set `FLUTTERWAVE_SECRET_KEY` and `FLUTTERWAVE_WEBHOOK_SECRET` as Worker secrets (`FLUTTERWAVE_WEBHOOK_SECRET` is required — the webhook returns 401 without it). There is no public key.
-  2. Configure the Flutterwave Webhook URL to `https://<your-worker-domain>/flutterwave/webhook` and set a **Secret hash** equal to `FLUTTERWAVE_WEBHOOK_SECRET`.
-  3. Enable the `charge.completed` event in the Flutterwave dashboard.
-- **Workflow**:
-  - Orders are created as `unpaid`.
-  - Customers receive a Flutterwave payment link immediately after placing an order.
-  - The webhook is verified by comparing the `verif-hash` header against `FLUTTERWAVE_WEBHOOK_SECRET` (constant-time).
-  - Payment status updates to `paid` automatically via webhook (atomic and idempotent — a duplicate webhook confirms once).
-  - Customers receive a WhatsApp confirmation once paid.
-  - Admins see `PAID` or `UNPAID` status in order lists.
+### 💳 Payments (summary)
+- Orders are created `unpaid`; the customer gets a Flutterwave payment link.
+- An order becomes `paid` through the Flutterwave webhook, the 5-minute
+  reconciliation sweep, or the customer checking their order, whichever comes
+  first. It happens exactly once, and that is when the customer's receipt and
+  the admin alert are sent.
+- Details and setup: [FLUTTERWAVE_DEPLOYMENT.md](FLUTTERWAVE_DEPLOYMENT.md).
 
 
 ---
@@ -72,6 +103,8 @@ Adds the `RefundLog` table (+ `idx_refundlog_order` index) used for best-effort 
 **Order placement does NOT depend on this migration.** Idempotency for order creation reuses the existing `payment_reference TEXT UNIQUE` column on `Orders` — no new column or table is on the critical path. `RefundLog` is written only inside `db.logRefund` under try/catch, so if the migration hasn't been applied yet the write degrades gracefully (logs and continues) instead of breaking a flow. This means code can deploy before or after the migration runs, in either order.
 
 > **Note:** There is no automatic migration runner or applied-version tracking table — migrations are applied manually and ordering is by filename. Keep new files strictly additive/idempotent so re-running the whole folder stays safe.
+>
+> `migration_001.sql` and `migration_002.sql` in the repo root are historical and already part of `schema.sql`; don't re-run them. Always pass `--remote` for production — without it Wrangler v3 targets the **local** database and appears to succeed.
 
 ---
 
@@ -118,7 +151,8 @@ Common production incidents and how to resolve them.
 
 - It selects recent `payment_status='pending'` orders with a `payment_reference`, re-verifies each against Flutterwave, and confirms (via `markOrderPaidAtomic`) only when status is `successful`, currency is `NGN`, and the amount matches the order total.
 - Stale `pending` orders older than ~1 day with no successful transaction are aged out to `failed`.
-- It never throws (per-order try/catch) and alerts the admin (`ADMIN_ALERT_PHONE`, if set) on amount mismatches or systemic failures.
+- It never throws (per-order try/catch). On amount mismatches or systemic failures it alerts every admin in `AdminUsers`, plus `ADMIN_ALERT_PHONE` if set, at most once an hour per issue.
+- When it confirms a payment, the customer gets the receipt and every admin gets the new-order alert, the same as via the webhook.
 
 **If payments are not auto-confirming:** first fix the webhook secret (above); the cron is the safety net, not the primary path. Check `wrangler tail` for cron invocation logs and any `alertAdmin` messages.
 
@@ -183,10 +217,12 @@ Common production incidents and how to resolve them.
 4. Verify the "⬅️ Order History" button returns to the order list.
 
 ### 👤 Persona: The Restaurant Manager (Admin)
-1. Send "ADMIN" from a registered admin number.
-2. Tap "View Orders".
-3. Select a "PENDING" order.
-4. Update status to "CONFIRMED".
-5. Verify the admin gets a success message.
-6. (If possible) Verify the customer receives a status update notification.
-7. Try to delete an item that has active orders (verify system handles it gracefully).
+1. Place and pay for a small order as a customer (or from an admin number via 👤 User Mode).
+2. Verify every admin receives "🔔 New paid order!" with name, address, items, service fee and total, plus **✅ Confirm** and **📦 Order #N** buttons.
+3. Tap **✅ Confirm**. Verify the customer gets "Order #N confirmed" and the admin gets a **👨‍🍳 Preparing** button.
+4. Tap through Preparing → Ready → Delivered (Delivered asks for confirmation).
+5. Tap the old **✅ Confirm** button again. Verify "already …, no change made" and that the customer is not messaged again.
+6. Send "ADMIN" → **📦 Orders**. Verify only paid, unfinished orders are listed, with a note on how many unpaid orders are hidden.
+7. Open an unpaid order via **⌨️ Type Order ID**. Verify only **Cancelled** is offered.
+8. **🔄 In/Out of Stock** → type "rice". Verify only matching items are listed; send "ALL" to see everything.
+9. Try to delete an item that appears in past orders. Verify the bot refuses and suggests marking it out of stock.

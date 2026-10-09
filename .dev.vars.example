@@ -1,0 +1,20 @@
+# Local settings for `npm run dev` (wrangler dev). Copy to .dev.vars, which
+# is git-ignored, and fill in. Never commit real values.
+# Production values are Worker secrets: `npx wrangler secret put NAME`.
+
+# Meta / WhatsApp — use a test app and number, not production.
+WHATSAPP_TOKEN=""
+PHONE_NUMBER_ID=""
+VERIFY_TOKEN="any-string-you-also-enter-in-meta"
+# Leave empty to skip signature checks locally (only with ENVIRONMENT=development).
+WHATSAPP_APP_SECRET=""
+
+# Flutterwave — use a test-mode key (FLWSECK_TEST-...).
+FLUTTERWAVE_SECRET_KEY=""
+FLUTTERWAVE_WEBHOOK_SECRET="any-string-matching-the-dashboard-secret-hash"
+
+ENVIRONMENT="development"
+
+# Optional
+# ADMIN_API_KEY=""            # enables GET /stats
+# ORDER_STATUS_TEMPLATE=""    # approved WhatsApp template name
